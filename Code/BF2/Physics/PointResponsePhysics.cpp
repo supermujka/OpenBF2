@@ -14,6 +14,7 @@
 #include "CollisionStats.h"                           // the per-frame terrain-query counter
 #include "CollisionManager.h"
 #include "GeomUtil.h"
+#include "HitregTelemetry.h"
 #include "ICollisionMesh.h"
 #include "LatencyCompensation.h"
 #include "../Math/Mat4.h"
@@ -306,6 +307,10 @@ void PointResponsePhysics::solveImpulse(IPhysicsNode* node)
     penetration.z = m_contactPoint.z - m_contactPosition.z;
 
     IObject* const object = getObject();                                  // +0x40
+    // [CHOSEN, not recovered] Log final contact arbitration (delivered vs wall/terrain override).
+    if (HitregTelemetry::isEnabled())
+        HitregTelemetry::noteProjectileContactDelivered(
+            object, m_contactObject, m_contactDepthSq, m_contactMaterial);
     CollisionFaceInfo* const faceInfo =
         m_hasFaceInfo == true ? reinterpret_cast<CollisionFaceInfo*>(&m_faceInfo) : 0;
     object->handleCollision(m_contactObject, m_contactSpeed, m_contactNormal, penetration,

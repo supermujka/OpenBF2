@@ -64,6 +64,10 @@ public:
     virtual IPhysicsNode* getRootNode();                     // getRootParent(m_object)'s node
 
     // Non-virtual.
+    // [CHOSEN, not recovered] Reentrant, side-effect-free historical transform sampler for telemetry.
+    void sampleLatencyTransform(float latency, bool simulateVanillaUnfilled,
+                                Mat4& outTransform, int* outPose,
+                                int* outValidSamples, int* outTicksSinceReseed) const;
     void setCollidingMeshTangentSpeed(const Vec3&);
     void getCollidingMeshTangentSpeed(Vec3& out);
     void printDebug() const;                                 // empty

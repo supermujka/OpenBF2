@@ -18,6 +18,22 @@ namespace anim {
 
 class BoneAnimation;
 
+// [CHOSEN, not recovered] Read-only ray-vs-skeleton probe result for hitreg telemetry.
+struct RaySkeletonProbe
+{
+    bool  hitClosest;
+    int   closestBone;
+    int   closestPart;
+    float closestT;
+    bool  hitFirst;
+    int   firstBone;
+    int   firstPart;
+    float firstT;
+    float minSurfaceDist;
+    int   nearestBone;
+    int   nearestPart;
+};
+
 class Skeleton
 {
 public:
@@ -145,6 +161,11 @@ public:
                             int* hitPart, int* hitBone, float* fraction,
                             const hfe::Vec3& start, const hfe::Vec3& end,
                             const hfe::Mat4& transformation);
+    // [CHOSEN, not recovered] Side-effect-free probe returning closest/first hits & miss distance.
+    void probeRayVsSkeleton(const hfe::Vec3& start, const hfe::Vec3& end,
+                            const hfe::Mat4& transformation,
+                            RaySkeletonProbe& out) const;
+    const char* getBoneNameSafe(int boneIndex) const;
     // and it is what Soldier::resetInstance calls on the collision rig.
     void clearAllIk();
     // solves and distributes the two-bone rotation over the three preceding

@@ -32,7 +32,12 @@ static const float EPS = 0.000001f;
 namespace {
 // [CHOSEN, not recovered] Tracks whether the vehicle/body latency ring has received at least one
 // live sample since init/reset(true) so spawn rewinds never blend toward (0,0,0).
-std::unordered_map<const PhysicsNode*, int> g_physicsLatencyValidSamples;
+std::unordered_map<const PhysicsNode*, int>& physicsLatencyValidSamples()
+{
+    static std::unordered_map<const PhysicsNode*, int>* const map =
+        new std::unordered_map<const PhysicsNode*, int>();
+    return *map;
+}
 const float kVehicleTeleportDistSq = 2500.0f; // > 50 m in a single 33 ms tick
 }
 
@@ -135,7 +140,7 @@ PhysicsNode::PhysicsNode()
 // the two rings, then the base.
 PhysicsNode::~PhysicsNode()
 {
-    g_physicsLatencyValidSamples.erase(this);
+    physicsLatencyValidSamples().erase(this);
     if (m_latencyPositions)
         delete[] m_latencyPositions;
     if (m_latencyRotations)
@@ -563,7 +568,7 @@ void PhysicsNode::reset(bool full)
     m_isInAir = true;
     if (full)
     {
-        g_physicsLatencyValidSamples.erase(this);
+        physicsLatencyValidSamples().erase(this);
         m_prevTransformationIsObjects = true;
         m_latencyIndex = 0;
         if (m_latencyPositions)
@@ -585,7 +590,7 @@ bool PhysicsNode::getIsPoint() const { return false; }
 // the two rings - positions zeroed, rotations identity.
 void PhysicsNode::initLatencyCompensation()
 {
-    g_physicsLatencyValidSamples.erase(this);
+    physicsLatencyValidSamples().erase(this);
     Vec3* positions = new Vec3[16];
     for (int i = 0; i < 16; ++i)
         positions[i].x = positions[i].y = positions[i].z = 0.0f;
@@ -621,7 +626,7 @@ void PhysicsNode::updateLatencyState()
 
     if (LatencyCompensation::isSpawnRingFixEnabled())
     {
-        int& valid = g_physicsLatencyValidSamples[this];
+        int& valid = physicsLatencyValidSamples()[this];
         bool reseed = (valid <= 0);
         if (!reseed)
         {
@@ -670,9 +675,9 @@ const Mat4& PhysicsNode::getLatencyCompensatedTransformation(float latency, int*
 
     if (LatencyCompensation::isSpawnRingFixEnabled())
     {
-        std::unordered_map<const PhysicsNode*, int>::const_iterator it =
-            g_physicsLatencyValidSamples.find(this);
-        if (it == g_physicsLatencyValidSamples.end() || it->second <= 0)
+        const std::unordered_map<const PhysicsNode*, int>& map = physicsLatencyValidSamples();
+        std::unordered_map<const PhysicsNode*, int>::const_iterator it = map.find(this);
+        if (it == map.end() || it->second <= 0)
             return getAbsoluteTransformation();
     }
 

@@ -61,8 +61,20 @@ struct PlayerQueueState
     PlayerQueueState() : activeDelaySec(0.0f) {}
 };
 
-std::unordered_map<const IPlayer*, PlayerQueueState> g_playerQueues;
-std::unordered_map<const IObject*, float> g_projectileLatencies;
+std::unordered_map<const IPlayer*, PlayerQueueState>& playerQueues()
+{
+    static std::unordered_map<const IPlayer*, PlayerQueueState>* const map =
+        new std::unordered_map<const IPlayer*, PlayerQueueState>();
+    return *map;
+}
+
+std::unordered_map<const IObject*, float>& projectileLatencies()
+{
+    static std::unordered_map<const IObject*, float>* const map =
+        new std::unordered_map<const IObject*, float>();
+    return *map;
+}
+
 const float kServerTickPeriod = 0.033333335f;
 }
 
@@ -164,6 +176,46 @@ bool LatencyCompensation::isDebugLogEnabled()
     return *g_debugLog != 0;
 }
 
+bool LatencyCompensation::isQueueDelayEnabled()
+{
+    return *g_improved != 0 && *g_useQueueDelay != 0;
+}
+
+bool LatencyCompensation::isSnapshotProjectileEnabled()
+{
+    return *g_improved != 0 && *g_snapshotProjectile != 0;
+}
+
+bool LatencyCompensation::isUseClientWindowEnabled()
+{
+    return *g_useClientWindow != 0;
+}
+
+float LatencyCompensation::getPingFactor()
+{
+    return *g_pingFactor;
+}
+
+float LatencyCompensation::getDefaultLatency()
+{
+    return *g_defaultLatency;
+}
+
+float LatencyCompensation::getDebugLatency()
+{
+    return *g_debugLatency;
+}
+
+int LatencyCompensation::getMaxClientInterpMs()
+{
+    return *g_maxClientInterpMs;
+}
+
+int LatencyCompensation::getMaxQueueTicks()
+{
+    return *g_maxQueueTicks;
+}
+
 unsigned int LatencyCompensation::clampClientInterpolationTime(unsigned int ms)
 {
     if (ms > 0x200u)
@@ -189,14 +241,17 @@ void LatencyCompensation::notePlayerActionArrival(const IPlayer* player, int inp
     if (!player || !m_isEnabled || *g_improved == 0 || *g_useQueueDelay == 0)
         return;
 
-    std::vector<ActionArrival>& arrivals = g_playerQueues[player].arrivals;
+    std::vector<ActionArrival>& arrivals = playerQueues()[player].arrivals;
     ActionArrival entry;
     entry.inputIndex = inputIndex;
     entry.arrivalTick = serverTick;
     arrivals.push_back(entry);
 
     if (arrivals.size() > 16)
-        arrivals.erase(arrivals.begin(), arrivals.begin() + (arrivals.size() - 16));
+    {
+        const std::ptrdiff_t drop = static_cast<std::ptrdiff_t>(arrivals.size() - 16);
+        arrivals.erase(arrivals.begin(), arrivals.begin() + drop);
+    }
 }
 
 void LatencyCompensation::setPlayerActiveQueueDelay(const IPlayer* player, int inputIndex,
@@ -205,9 +260,9 @@ void LatencyCompensation::setPlayerActiveQueueDelay(const IPlayer* player, int i
     if (!player)
         return;
 
-    std::unordered_map<const IPlayer*, PlayerQueueState>::iterator it =
-        g_playerQueues.find(player);
-    if (it == g_playerQueues.end())
+    std::unordered_map<const IPlayer*, PlayerQueueState>& queues = playerQueues();
+    std::unordered_map<const IPlayer*, PlayerQueueState>::iterator it = queues.find(player);
+    if (it == queues.end())
         return;
 
     std::vector<ActionArrival>& arrivals = it->second.arrivals;
@@ -250,16 +305,16 @@ void LatencyCompensation::clearPlayerActiveQueueDelay(const IPlayer* player)
     if (!player)
         return;
 
-    std::unordered_map<const IPlayer*, PlayerQueueState>::iterator it =
-        g_playerQueues.find(player);
-    if (it != g_playerQueues.end())
+    std::unordered_map<const IPlayer*, PlayerQueueState>& queues = playerQueues();
+    std::unordered_map<const IPlayer*, PlayerQueueState>::iterator it = queues.find(player);
+    if (it != queues.end())
         it->second.activeDelaySec = 0.0f;
 }
 
 void LatencyCompensation::forgetPlayer(const IPlayer* player)
 {
     if (player)
-        g_playerQueues.erase(player);
+        playerQueues().erase(player);
 }
 
 float LatencyCompensation::getPlayerQueueDelay(const IPlayer* player)
@@ -267,49 +322,63 @@ float LatencyCompensation::getPlayerQueueDelay(const IPlayer* player)
     if (!player || !m_isEnabled || *g_improved == 0 || *g_useQueueDelay == 0)
         return 0.0f;
 
-    std::unordered_map<const IPlayer*, PlayerQueueState>::const_iterator it =
-        g_playerQueues.find(player);
-    return it != g_playerQueues.end() ? it->second.activeDelaySec : 0.0f;
+    const std::unordered_map<const IPlayer*, PlayerQueueState>& queues = playerQueues();
+    std::unordered_map<const IPlayer*, PlayerQueueState>::const_iterator it = queues.find(player);
+    return it != queues.end() ? it->second.activeDelaySec : 0.0f;
 }
 
 void LatencyCompensation::snapshotProjectileLatency(const IObject* projectileObject,
                                                     IPlayer* owner)
 {
-    if (!projectileObject || !m_isEnabled || *g_improved == 0 || *g_snapshotProjectile == 0)
+    if (!projectileObject)
+        return;
+
+    if (!owner)
+    {
+        clearProjectileLatency(projectileObject);
+        return;
+    }
+
+    if (!m_isEnabled || *g_improved == 0 || *g_snapshotProjectile == 0)
         return;
 
     float latency = getLatency(owner);
-    if (*g_debugLatency <= 0.0f && owner && owner->getIsRemote() && *g_useQueueDelay != 0)
+    if (*g_debugLatency <= 0.0f && owner->getIsRemote() && *g_useQueueDelay != 0)
     {
         latency += getPlayerQueueDelay(owner);
         if (latency > *g_maxLatency)
             latency = *g_maxLatency;
     }
-    g_projectileLatencies[projectileObject] = latency;
+    projectileLatencies()[projectileObject] = latency;
 }
 
 void LatencyCompensation::clearProjectileLatency(const IObject* projectileObject)
 {
     if (projectileObject)
-        g_projectileLatencies.erase(projectileObject);
+        projectileLatencies().erase(projectileObject);
 }
 
 float LatencyCompensation::getProjectileLatency(const IObject* projectileObject, IPlayer* owner)
 {
-    if (!m_isEnabled)
+    if (*g_debugLatency > 0.0f)
+        return getLatency(owner);
+
+    if (!m_isEnabled || !owner)
         return 0.0f;
 
-    if (*g_improved != 0 && *g_snapshotProjectile != 0 && projectileObject)
+    if (*g_improved == 0)
+        return getLatency(owner);
+
+    if (*g_snapshotProjectile != 0 && projectileObject)
     {
-        std::unordered_map<const IObject*, float>::const_iterator it =
-            g_projectileLatencies.find(projectileObject);
-        if (it != g_projectileLatencies.end())
+        const std::unordered_map<const IObject*, float>& map = projectileLatencies();
+        std::unordered_map<const IObject*, float>::const_iterator it = map.find(projectileObject);
+        if (it != map.end())
             return it->second;
     }
 
     float latency = getLatency(owner);
-    if (*g_improved != 0 && *g_useQueueDelay != 0 && *g_debugLatency <= 0.0f
-        && owner && owner->getIsRemote())
+    if (*g_useQueueDelay != 0 && owner->getIsRemote())
     {
         latency += getPlayerQueueDelay(owner);
         if (latency > *g_maxLatency)

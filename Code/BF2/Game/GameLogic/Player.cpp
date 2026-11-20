@@ -74,6 +74,7 @@
 #include "../../Scene/Object/ObjectTypes/Game/IPlayerControlObject.h"
 #include "ActionBuffer.h"                         // sizeof 0x2C - ditto
 #include "../../Physics/LatencyCompensation.h"    // [CHOSEN, not recovered] Version 1 interp clamp & queue cleanup
+#include "../../Physics/HitregTelemetry.h"        // [CHOSEN, not recovered] Version 1 net-health cleanup
 
 namespace dice {
 namespace hfe {
@@ -2357,8 +2358,9 @@ void releasePlayerWeakBlock(void* block)
 // interface is required. Release weak references without taking ownership of their targets.
 Player::~Player()
 {
-    // [CHOSEN, not recovered] Release queue-delay sidecar entry before base destruction.
+    // [CHOSEN, not recovered] Release queue-delay and telemetry sidecar entries before base destruction.
     world::LatencyCompensation::forgetPlayer(this);
+    world::HitregTelemetry::forgetPlayer(this);
 
     if (ai::g_aiInstance)                                                // ds:0x8AC37F8
         eventManager->postEvent(ECAI, 13, this, 0.0f);                   // +0x14
@@ -2651,12 +2653,12 @@ void Player::addTick()             { ++m_tickCount; }         // +0xD4
 void Player::subTick()             { --m_tickCount; }         // +0xD8
 void Player::resetTickCounter()    { m_tickCount = 0; }       // +0xDC
 
-// Clamp the interpolation delay to 512 milliseconds (and optional server cap).
+// Clamp the interpolation delay to 512 milliseconds.
+// [CHOSEN, not recovered] Preserve raw 0..512ms wire value here so LatencyCompensation::getLatency()
+// enforces phy-latencyComp-maxClientInterpMs dynamically and telemetry sees pre-clamp interp.
 void Player::setInterpolationTime(unsigned int time)
 {
-    const unsigned int clamped = time < 0x200u ? time : 0x200u;
-    // [CHOSEN, not recovered] Enforce server-side backtrack cap when improved lag comp is active.
-    m_interpolationTime = world::LatencyCompensation::clampClientInterpolationTime(clamped);
+    m_interpolationTime = time < 0x200u ? time : 0x200u;
 }
 
 unsigned int Player::getInterpolationTime() const

@@ -22,6 +22,7 @@
 #include "GhostManager.h"                       // the constructor is written now
 #include "../../IO/Network/NetworkManager.h"    // io::networkManager - transmitMsgs' local-latency arm
 #include "../../Physics/LatencyCompensation.h"  // world::LatencyCompensation::getLocalLatency (local only)
+#include "../../Physics/HitregTelemetry.h"      // [CHOSEN, not recovered] per-packet RTT/loss sampling
 #include "../GameServer/ServerSettings.h"       // sv.demoQuality - demoQualityFromSettings' single read
 
 namespace dice {
@@ -470,6 +471,10 @@ bool ClientConnection::handlePacketStatusNotification(bool& delivered)
         if ((1 << id) & packetStatusManagerMask(status))     // PacketStatus +0x1C
             m_streamManagers[i]->handlePacketStatus(status, delivered);           // vslot +0x1C
     }
+
+    // [CHOSEN, not recovered] Sample packet delivery and raw RTT for hitreg telemetry.
+    if (m_player && m_player->getIsRemote() && world::HitregTelemetry::isEnabled())
+        world::HitregTelemetry::notePacketDelivery(m_player, delivered, m_lastPingMs);
 
     if (delivered)
     {

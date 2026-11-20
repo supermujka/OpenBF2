@@ -30,7 +30,9 @@
 #include "../Scene/Object/ObjectPredicator.h"         // ObjectIgnoreInterfacePredicator
 #include "BasicPhysicsSystem.h"                       // IPhysicsSystem::getGravity - the buoyancy arm
 #include "CollisionStats.h"
+#include "GeomUtil.h"
 #include "HeightmapCluster.h"
+#include "HitregTelemetry.h"
 #include "ICollisionMesh.h"
 #include "IPhysicsNode.h"
 #include "LatencyCompensation.h"
@@ -1202,8 +1204,9 @@ void SoldierResponsePhysics::checkSoldierVsPoint(IObject* soldierObject,
     zero(hitPosition);
     Vec3 hitNormal;
     zero(hitNormal);
-    if (checkRayEntersSphere(&hitPosition, &hitNormal,
-                             start, end, soldierPosition, 2.0f))
+    const bool flyBy = checkRayEntersSphere(&hitPosition, &hitNormal,
+                                            start, end, soldierPosition, 2.0f);
+    if (flyBy)
         static_cast<Soldier*>(soldierObject)->bulletFlyBy(
             projectileObject, hitPosition, hitNormal);
 
@@ -1215,7 +1218,7 @@ void SoldierResponsePhysics::checkSoldierVsPoint(IObject* soldierObject,
         latency = LatencyCompensation::getProjectileLatency(projectileObject, owner);
 
     int stateIndex = 0;
-    const Mat4& collisionTransformation =
+    const Mat4 v1Transform =
         soldierNode->getLatencyCompensatedTransformation(latency, &stateIndex);
     anim::Skeleton* const skeleton = static_cast<anim::Skeleton*>(
         static_cast<Soldier*>(soldierObject)->getCollisionSkeleton(stateIndex));
@@ -1223,9 +1226,39 @@ void SoldierResponsePhysics::checkSoldierVsPoint(IObject* soldierObject,
         return;
 
     ++collisionStatsData->unknown10;
-    if (!skeleton->checkRayVsSkeleton(
-            &hitPosition, &hitNormal, &hitPart, &hitBone, &fraction,
-            start, end, collisionTransformation))
+    const bool v1Hit = skeleton->checkRayVsSkeleton(
+        &hitPosition, &hitNormal, &hitPart, &hitBone, &fraction,
+        start, end, v1Transform);
+
+    // [CHOSEN, not recovered] Shadow A/B & pingFactor sweep probe for hits and near-misses (<= 2 m).
+    if (HitregTelemetry::isEnabled() && LatencyCompensation::m_isEnabled && owner)
+    {
+        const float sweepSq = sweep.x * sweep.x + sweep.y * sweep.y + sweep.z * sweep.z;
+        float coarseDist = 0.0f;
+        if (sweepSq > 1e-8f)
+        {
+            coarseDist = getClosestDistanceToLine(soldierPosition, &start, &end);
+        }
+        else
+        {
+            const float dx = soldierPosition.x - start.x;
+            const float dy = soldierPosition.y - start.y;
+            const float dz = soldierPosition.z - start.z;
+            coarseDist = sqrtf(dx * dx + dy * dy + dz * dz);
+        }
+
+        if (v1Hit || flyBy || coarseDist <= 2.0f)
+        {
+            const bool targetInAir = !(m_byteFA || m_isFloating);
+            HitregTelemetry::recordSoldierProbe(
+                projectileObject, owner, soldierObject,
+                static_cast<const SoldierPhysicsNode*>(soldierNode), skeleton,
+                start, end, latency, stateIndex, v1Transform,
+                v1Hit, hitBone, hitPart, hitPosition, flyBy, coarseDist, targetInAir);
+        }
+    }
+
+    if (!v1Hit)
         return;
 
     // [CHOSEN, not recovered] Optional server-side hit-registration diagnostic log.

@@ -547,6 +547,110 @@ bool Skeleton::checkRayVsSkeleton(hfe::Vec3* hitPosition, hfe::Vec3* hitNormal,
     return true;
 }
 
+// [CHOSEN, not recovered] Side-effect-free ray-vs-skeleton probe for Shadow A/B & miss distance.
+void Skeleton::probeRayVsSkeleton(const hfe::Vec3& start, const hfe::Vec3& end,
+                                  const hfe::Mat4& transformation,
+                                  RaySkeletonProbe& out) const
+{
+    out.hitClosest = false;
+    out.closestBone = -1;
+    out.closestPart = 0;
+    out.closestT = FLT_MAX;
+    out.hitFirst = false;
+    out.firstBone = -1;
+    out.firstPart = 0;
+    out.firstT = FLT_MAX;
+    out.minSurfaceDist = FLT_MAX;
+    out.nearestBone = -1;
+    out.nearestPart = 0;
+
+    hfe::Vec3 rayAxis;
+    rayAxis.x = end.x - start.x;
+    rayAxis.y = end.y - start.y;
+    rayAxis.z = end.z - start.z;
+
+    for (unsigned int i = 0; i < m_vector24.size(); ++i)
+    {
+        const int candBoneIndex = m_vector24[i];
+        const BoneTemplate* const candTemplate = &m_boneTemplates[candBoneIndex];
+        hfe::Mat4 candTransform = hfe::Mat4::getIdentity();
+        getCollisionBoneTransform(
+            &candTransform, transformation, candBoneIndex, m_bones[candBoneIndex]);
+
+        const float capsuleLength = fabsf(candTemplate->m_float18);
+        hfe::Vec3 capsuleAxis;
+        capsuleAxis.x = candTransform.m[8] * capsuleLength;
+        capsuleAxis.y = candTransform.m[9] * capsuleLength;
+        capsuleAxis.z = candTransform.m[10] * capsuleLength;
+
+        hfe::Vec3 capsuleStart;
+        capsuleStart.x = candTransform.m[12];
+        capsuleStart.y = candTransform.m[13];
+        capsuleStart.z = candTransform.m[14];
+
+        hfe::Vec3 capsuleEnd;
+        capsuleEnd.x = capsuleStart.x + capsuleAxis.x;
+        capsuleEnd.y = capsuleStart.y + capsuleAxis.y;
+        capsuleEnd.z = capsuleStart.z + capsuleAxis.z;
+
+        const float radius = candTemplate->m_float1C;
+        float paramS = 0.0f;
+        float paramT = 0.0f;
+        const float segDist = hfe::world::getClosestDistanceBetweenLines(
+            start, end, capsuleStart, capsuleEnd, paramS, paramT);
+        float surfDist = segDist - radius;
+        if (surfDist < 0.0f)
+            surfDist = 0.0f;
+
+        if (surfDist < out.minSurfaceDist)
+        {
+            out.minSurfaceDist = surfDist;
+            out.nearestBone = candBoneIndex;
+            out.nearestPart = candTemplate->m_dword20;
+        }
+
+        if (segDist <= radius + 0.01f)
+        {
+            hfe::Vec3 candPoints[2] = {};
+            float candTimes[2];
+            const int candCount = hfe::world::getIntersectionOfCapsAndEdgeNew(
+                start, rayAxis, capsuleStart, capsuleAxis, radius, candTimes, candPoints);
+            if (candCount > 0)
+            {
+                int candSelected = 0;
+                if (candCount == 2)
+                    candSelected = candTimes[1] <= candTimes[0];
+                const float candTime = candTimes[candSelected];
+
+                if (!out.hitFirst)
+                {
+                    out.hitFirst = true;
+                    out.firstBone = candBoneIndex;
+                    out.firstPart = candTemplate->m_dword20;
+                    out.firstT = candTime;
+                }
+                if (!out.hitClosest || candTime < out.closestT)
+                {
+                    out.hitClosest = true;
+                    out.closestBone = candBoneIndex;
+                    out.closestPart = candTemplate->m_dword20;
+                    out.closestT = candTime;
+                }
+            }
+        }
+    }
+}
+
+const char* Skeleton::getBoneNameSafe(int boneIndex) const
+{
+    if (!m_hasLoadedArrays || !m_boneTemplates || boneIndex < 0 || boneIndex >= m_boneCount)
+        return "";
+    const short nameId = m_boneTemplates[boneIndex].m_nameId;
+    if (nameId < 0)
+        return "";
+    return BoneManager::getInstance().getBoneName(nameId).c_str();
+}
+
 
 // Evaluates a pose for usedBones and their ancestors under the optional parent transform.
 // Indices must be valid and parents must precede children in the bone array.

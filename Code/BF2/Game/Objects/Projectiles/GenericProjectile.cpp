@@ -41,6 +41,7 @@
 #include "../Fx/EffectBundleTemplate.h"              // activate samples the trail template
 #include "../../../Physics/PhysicsUtil.h"            // reset/disabled/reenable launch sequence
 #include "../../../Physics/LatencyCompensation.h"    // [CHOSEN, not recovered] Version 1 fire-time latency snapshot
+#include "../../../Physics/HitregTelemetry.h"        // [CHOSEN, not recovered] Version 1 per-shot telemetry
 #include "../../../Scene/Object/ObjectManager.h"     // objectManager - resetProjectile's weak targets
 #include "../../../Scene/Object/ObjectUtil.h"        // world::setNetworkableComp
 #include "../../../Scene/Object/PlayerManager.h"
@@ -307,6 +308,7 @@ GenericProjectile::~GenericProjectile()
 {
     // [CHOSEN, not recovered] Clear any cached fire-time rewind snapshot.
     LatencyCompensation::clearProjectileLatency(this);
+    HitregTelemetry::forgetProjectile(this);
     dropWeakBlock(m_interpolationProxyWeak);
     dropWeakBlock(m_localPredictedWeak);
     dropWeakBlock(m_associatedTracerWeak);
@@ -478,6 +480,7 @@ void GenericProjectile::resetProjectile(bool a2)
 {
     // [CHOSEN, not recovered] Clear cached fire-time rewind snapshot even for ObjectCache reuse.
     LatencyCompensation::clearProjectileLatency(this);
+    HitregTelemetry::forgetProjectile(this);
 
     if (m_localPredictedWeak)
     {
@@ -1369,6 +1372,26 @@ void GenericProjectile::handleVisualUpdate(float deltaTime, float interpolation)
 void GenericProjectile::initOnLaunch()
 {
     m_startPos = getAbsolutePosition();
+    // [CHOSEN, not recovered] Record shot launch context for hitreg telemetry (server shots only).
+    if (HitregTelemetry::isEnabled() && gameLogic && gameLogic->isServer() && !m_byte1FC)
+    {
+        IPlayer* const owner = getPlayer();
+        if (owner)
+        {
+            IObject* const weapon = getLauncherWeapon();
+            const char* weaponName = (weapon && weapon->getTemplate())
+                ? weapon->getTemplate()->getName().c_str()
+                : (getTemplate() ? getTemplate()->getName().c_str() : "");
+            IPhysicsNode* const pNode = objectPhysicsNode(this);
+            float muzzleSpeed = 0.0f;
+            if (pNode)
+            {
+                const Vec3& vel = pNode->getPositionalSpeed();
+                muzzleSpeed = sqrtf(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
+            }
+            HitregTelemetry::noteShotFired(this, owner, weaponName, m_startPos, muzzleSpeed);
+        }
+    }
     if (getPlayer() && gameLogic->isServer() && getNetworkable())
     {
         sendMissileInitEvent();
@@ -1809,9 +1832,15 @@ int  GenericProjectile::getTeam()           { return m_team; }
 void GenericProjectile::setPlayer(IPlayer* player)
 {
     m_player = player ? player->getWeakPtr() : WeakPtr<IPlayer>();
-    // [CHOSEN, not recovered] FireComp calls setPlayer() right after activate(); snapshot here too.
-    if (m_isActive && player)
-        LatencyCompensation::snapshotProjectileLatency(this, player);
+    // [CHOSEN, not recovered] FireComp calls setPlayer() right after activate(); clear stale
+    // ObjectCache latency if owner becomes null.
+    if (m_isActive)
+    {
+        if (player)
+            LatencyCompensation::snapshotProjectileLatency(this, player);
+        else
+            LatencyCompensation::clearProjectileLatency(this);
+    }
 }
 
 // getPlayer - 0x8282650, 23 B, the weak

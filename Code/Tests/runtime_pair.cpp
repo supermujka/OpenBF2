@@ -23,6 +23,7 @@
 #include "../BF2/Physics/CollisionStats.h"
 #include "../BF2/Physics/GeomUtil.h"
 #include "../BF2/Physics/ICollisionMesh.h"
+#include "../BF2/Physics/HitregTelemetry.h"
 #include "../BF2/Physics/LatencyCompensation.h"
 #include "../BF2/Physics/PhysicsNode.h"
 #include "../BF2/Physics/PhysicsType.h"
@@ -188,6 +189,14 @@ bool LatencyCompensation::isImprovedEnabled() { return false; }
 bool LatencyCompensation::isClosestBoneEnabled() { return false; }
 bool LatencyCompensation::isSpawnRingFixEnabled() { return false; }
 bool LatencyCompensation::isDebugLogEnabled() { return false; }
+bool LatencyCompensation::isQueueDelayEnabled() { return false; }
+bool LatencyCompensation::isSnapshotProjectileEnabled() { return false; }
+bool LatencyCompensation::isUseClientWindowEnabled() { return false; }
+float LatencyCompensation::getPingFactor() { return 0.5f; }
+float LatencyCompensation::getDefaultLatency() { return 0.05f; }
+float LatencyCompensation::getDebugLatency() { return -1.0f; }
+int LatencyCompensation::getMaxClientInterpMs() { return 133; }
+int LatencyCompensation::getMaxQueueTicks() { return 4; }
 unsigned int LatencyCompensation::clampClientInterpolationTime(unsigned int ms) { return ms; }
 float LatencyCompensation::getBroadphaseSoldierSpeedFloor() { return 0.0f; }
 void LatencyCompensation::notePlayerActionArrival(const IPlayer*, int, int) {}
@@ -198,6 +207,23 @@ float LatencyCompensation::getPlayerQueueDelay(const IPlayer*) { return 0.0f; }
 void LatencyCompensation::snapshotProjectileLatency(const IObject*, IPlayer*) {}
 void LatencyCompensation::clearProjectileLatency(const IObject*) {}
 float LatencyCompensation::getProjectileLatency(const IObject*, IPlayer*) { return 0.0f; }
+
+bool HitregTelemetry::isEnabled() { return false; }
+int HitregTelemetry::getLevel() { return 0; }
+void HitregTelemetry::notePacketDelivery(const IPlayer*, bool, int) {}
+void HitregTelemetry::notePlayerSimTick(const IPlayer*, int, int, bool) {}
+void HitregTelemetry::forgetPlayer(const IPlayer*) {}
+void HitregTelemetry::noteShotFired(const IObject*, IPlayer*, const char*, const Vec3&, float) {}
+void HitregTelemetry::forgetProjectile(const IObject*) {}
+void HitregTelemetry::recordSoldierProbe(IObject*, IPlayer*, IObject*, const SoldierPhysicsNode*,
+                                         const anim::Skeleton*, const Vec3&, const Vec3&,
+                                         float, int, const Mat4&, bool, int, int, const Vec3&,
+                                         bool, float, bool) {}
+void HitregTelemetry::noteProjectileContactDelivered(const IObject*, IObject*, float, int) {}
+void HitregTelemetry::noteProjectileDamageCalc(const IObject*, int, int, float, float, float) {}
+void HitregTelemetry::noteServerGiveDamage(const IObject*, float, float, float, bool) {}
+void HitregTelemetry::finishProjectileCollisionDamage(const IObject*, IObject*, bool) {}
+void HitregTelemetry::tickFlush() {}
 
 void Soldier::setHitByVehicleSpeed(const Vec3&) {}
 dice::anim::Skeleton* Soldier::getCollisionSkeleton(int) { return 0; }
@@ -222,6 +248,16 @@ bool Skeleton::checkRayVsSkeleton(hfe::Vec3*, hfe::Vec3*, int*, int*, float*,
                                   const hfe::Mat4&)
 {
     return false;
+}
+
+void Skeleton::probeRayVsSkeleton(const hfe::Vec3&, const hfe::Vec3&,
+                                  const hfe::Mat4&, RaySkeletonProbe&) const
+{
+}
+
+const char* Skeleton::getBoneNameSafe(int) const
+{
+    return "";
 }
 
 } // namespace anim

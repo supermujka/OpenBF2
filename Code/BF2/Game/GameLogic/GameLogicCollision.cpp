@@ -22,6 +22,7 @@
 #include "../../Physics/IPhysicsNode.h"                   // getPositionalSpeed (+0x60), getIsMobile (+0x134)
 #include "../../Physics/MaterialManager.h"                // getMaterialPtr / getDamageMod / getMaterialById
 #include "../../Physics/Material.h"                       // getHasWaterPhysics / getIsBarbwire / getName
+#include "../../Physics/HitregTelemetry.h"                // [CHOSEN, not recovered] damage & hitmarker telemetry
 #include "../../Scene/Object/ObjectTypes/Game/IPlayerControlObject.h"
 #include "../GameLogic/Player.h"                          // dice::hfe::getPlayer (the identity)
 #include "../../Core/StringUtil.h"                        // formatString
@@ -814,8 +815,11 @@ bool GameLogicCollision::serverHandleCollisionForProjectile(IObject* projectile,
                 t = 1.0f;
             const float angleTerm = 1.0f - (1.0f - t * t) * (*g_damageAngleModChoke);
 
-            const float damage =
-                materials()->getDamageMod(materialA, materialB) * (angleTerm * baseDamage);  // +0x58
+            const float matMod = materials()->getDamageMod(materialA, materialB);
+            const float damage = matMod * (angleTerm * baseDamage);                        // +0x58
+            if (HitregTelemetry::isEnabled())
+                HitregTelemetry::noteProjectileDamageCalc(
+                    projectile, materialA, materialB, baseDamage, matMod, angleTerm);
 
             if (damage > 0.0099999998f)
             {
@@ -906,10 +910,16 @@ bool GameLogicCollision::serverHandleCollisionForProjectile(IObject* projectile,
                     if (victim)
                     {
                         if (!victim->getIsAlive())                                        // +0x6C
+                        {
+                            if (HitregTelemetry::isEnabled())
+                                HitregTelemetry::finishProjectileCollisionDamage(projectile, hitObject, false);
                             return false;
+                        }
                         if (victim->getIsManDown()                                        // +0x100
                             && victim->getManDownAtTick() != WorldPref::getTickCount())    // +0x104
                         {
+                            if (HitregTelemetry::isEnabled())
+                                HitregTelemetry::finishProjectileCollisionDamage(projectile, hitObject, false);
                             return false;
                         }
                     }
@@ -917,6 +927,9 @@ bool GameLogicCollision::serverHandleCollisionForProjectile(IObject* projectile,
             }
         }
     }
+
+    if (HitregTelemetry::isEnabled())
+        HitregTelemetry::finishProjectileCollisionDamage(projectile, hitObject, damaged);
 
     return damaged;
 }

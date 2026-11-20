@@ -61,6 +61,7 @@
 #include "../Objects/Base/SimpleObjectTemplate.h"   // getRelativePositionOffset
 #include "../../Physics/PhysicsUtil.h"        // disablePhysics
 #include "../../Physics/LatencyCompensation.h" // [CHOSEN, not recovered] Version 1 queue-delay tracking
+#include "../../Physics/HitregTelemetry.h"     // [CHOSEN, not recovered] Version 1 hitreg telemetry CSV
 #include "../Python/PythonHost.h"             // buildArgs / handleEvent - the two script events
 #include "../../Core/Ids.h"                    // CID_SquadManager / IID_ISquadManager
 #include "../../Core/IProfilerClient.h"        // getEnable - startServer's profiler gate; retires
@@ -2428,6 +2429,8 @@ bool GameServer::update(int steps, float dt)
     VoipServerConnection::GetInstance()->Update(dt);
     clearPlayerActions();
     destroyPlayers();
+    // [CHOSEN, not recovered] Flush buffered hitreg telemetry & emit CONFIG changes.
+    world::HitregTelemetry::tickFlush();
 
     if (m_matchMakingServer)
     {
@@ -3378,6 +3381,8 @@ bool GameServer::simulatePlayerUpdate(world::IPlayer* player, float dt)
             world::LatencyCompensation::clearPlayerActiveQueueDelay(player);
             // nothing queued - replay m_current, see the header block
             const int replays = buffer->m_replayCount;
+            if (world::HitregTelemetry::isEnabled())
+                world::HitregTelemetry::notePlayerSimTick(player, 0, replays + 1, true);
             buffer->m_current.get(input);
 
             const int current = buffer->m_currentInputIndex;
@@ -3403,6 +3408,9 @@ bool GameServer::simulatePlayerUpdate(world::IPlayer* player, float dt)
             // simulatePlayersUpdate runs, so subtract 1 baseline tick to measure true extra wait.
             world::LatencyCompensation::setPlayerActiveQueueDelay(
                 player, front.m_inputIndex, WorldPref::getTickCount() - 1);
+            if (world::HitregTelemetry::isEnabled())
+                world::HitregTelemetry::notePlayerSimTick(
+                    player, static_cast<int>(buffer->m_entries.size()), 0, false);
 
             buffer->m_entries.erase(buffer->m_entries.begin());
             buffer->m_replayCount = 0;                  // a real action resets the run

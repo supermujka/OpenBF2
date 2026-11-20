@@ -32,6 +32,7 @@
 #include "../../AI/AIInterface/AIInstance.h"               // ai::g_aiInstance - the team-kill AI event gate
 #include "../../AI/AIInterface/BFKnowledge/BFCollisionHandler.h"
 #include "../../AI/AIDLL/AI/Main/CommonSingletonServer.h"
+#include "../../Physics/HitregTelemetry.h"                // [CHOSEN, not recovered] confirmed soldier damage log
 
 namespace dice {
 namespace hfe {
@@ -285,6 +286,12 @@ void GameLogicDamage::serverGiveDamage(IObject* object, float damage, IPlayer* a
             const float after = armor->getHitPoints() - damage;
             if (-armor->getMaxWreckHitPoints() >= after)                          // +0x88
                 wreckDies = true;
+            if (sourceObject && HitregTelemetry::isEnabled())
+            {
+                const float hpBefore = armor->getHitPoints();
+                HitregTelemetry::noteServerGiveDamage(
+                    sourceObject, damage, hpBefore, after, dies);
+            }
         }
 
         for (std::map<int, IPlayerControlObject*>::iterator it = pcos->begin(); it != pcos->end(); ++it)

@@ -321,6 +321,8 @@ if errorlevel 1 set /a RC+=1
 cl %FLAGS% "%~dp0..\BF2\Physics\CollisionManager.cpp"
 cl %FLAGS% "%~dp0..\BF2\Physics\LatencyCompensation.cpp"
 if errorlevel 1 set /a RC+=1
+cl %FLAGS% "%~dp0..\BF2\Physics\HitregTelemetry.cpp"
+if errorlevel 1 set /a RC+=1
 cl %FLAGS% "%~dp0..\BF2\Game\Objects\Game\PlayerControlObject.cpp"
 if errorlevel 1 set /a RC+=1
 cl %FLAGS% "%~dp0..\BF2\Game\Objects\Projectiles\GenericProjectile.cpp"
