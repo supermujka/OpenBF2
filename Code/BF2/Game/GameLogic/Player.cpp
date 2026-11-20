@@ -73,6 +73,7 @@
 #include "../Objects/GameLogicComp/IArmorGLComp.h"   // getDefaultMaterial
 #include "../../Scene/Object/ObjectTypes/Game/IPlayerControlObject.h"
 #include "ActionBuffer.h"                         // sizeof 0x2C - ditto
+#include "../../Physics/LatencyCompensation.h"    // [CHOSEN, not recovered] Version 1 interp clamp & queue cleanup
 
 namespace dice {
 namespace hfe {
@@ -2356,6 +2357,9 @@ void releasePlayerWeakBlock(void* block)
 // interface is required. Release weak references without taking ownership of their targets.
 Player::~Player()
 {
+    // [CHOSEN, not recovered] Release queue-delay sidecar entry before base destruction.
+    world::LatencyCompensation::forgetPlayer(this);
+
     if (ai::g_aiInstance)                                                // ds:0x8AC37F8
         eventManager->postEvent(ECAI, 13, this, 0.0f);                   // +0x14
 
@@ -2647,10 +2651,12 @@ void Player::addTick()             { ++m_tickCount; }         // +0xD4
 void Player::subTick()             { --m_tickCount; }         // +0xD8
 void Player::resetTickCounter()    { m_tickCount = 0; }       // +0xDC
 
-// Clamp the interpolation delay to 512 milliseconds.
+// Clamp the interpolation delay to 512 milliseconds (and optional server cap).
 void Player::setInterpolationTime(unsigned int time)
 {
-    m_interpolationTime = time < 0x200u ? time : 0x200u;
+    const unsigned int clamped = time < 0x200u ? time : 0x200u;
+    // [CHOSEN, not recovered] Enforce server-side backtrack cap when improved lag comp is active.
+    m_interpolationTime = world::LatencyCompensation::clampClientInterpolationTime(clamped);
 }
 
 unsigned int Player::getInterpolationTime() const

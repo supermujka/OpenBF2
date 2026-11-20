@@ -60,6 +60,7 @@
 #include "../Objects/Base/Camera.h"            // enterVehicle's RotationalBundle rotation state
 #include "../Objects/Base/SimpleObjectTemplate.h"   // getRelativePositionOffset
 #include "../../Physics/PhysicsUtil.h"        // disablePhysics
+#include "../../Physics/LatencyCompensation.h" // [CHOSEN, not recovered] Version 1 queue-delay tracking
 #include "../Python/PythonHost.h"             // buildArgs / handleEvent - the two script events
 #include "../../Core/Ids.h"                    // CID_SquadManager / IID_ISquadManager
 #include "../../Core/IProfilerClient.h"        // getEnable - startServer's profiler gate; retires
@@ -3362,6 +3363,8 @@ bool GameServer::simulatePlayerUpdate(world::IPlayer* player, float dt)
     io::PlayerInput* chosen;
     if (player->getIsAIPlayer())
     {
+        // [CHOSEN, not recovered] AI inputs are generated inline without network queue delay.
+        world::LatencyCompensation::clearPlayerActiveQueueDelay(player);
         // The AI slot exposes its PlayerInput through an opaque interface result.
         chosen = static_cast<io::PlayerInput*>(player->getAIPlayerInput());
     }
@@ -3371,6 +3374,8 @@ bool GameServer::simulatePlayerUpdate(world::IPlayer* player, float dt)
 
         if (buffer->m_entries.empty())
         {
+            // [CHOSEN, not recovered] Replayed ticks have no fresh packet arrival queue wait.
+            world::LatencyCompensation::clearPlayerActiveQueueDelay(player);
             // nothing queued - replay m_current, see the header block
             const int replays = buffer->m_replayCount;
             buffer->m_current.get(input);
@@ -3393,6 +3398,11 @@ bool GameServer::simulatePlayerUpdate(world::IPlayer* player, float dt)
             m_currentInputIndex         = front.m_inputIndex;
             buffer->m_currentInputIndex = front.m_inputIndex;
             buffer->m_current           = front;
+
+            // [CHOSEN, not recovered] uPlaying increments WorldPref::mTickCount before
+            // simulatePlayersUpdate runs, so subtract 1 baseline tick to measure true extra wait.
+            world::LatencyCompensation::setPlayerActiveQueueDelay(
+                player, front.m_inputIndex, WorldPref::getTickCount() - 1);
 
             buffer->m_entries.erase(buffer->m_entries.begin());
             buffer->m_replayCount = 0;                  // a real action resets the run

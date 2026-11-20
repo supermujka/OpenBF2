@@ -230,6 +230,22 @@ inline float objectSpeed(IObject* object)
     return static_cast<float>(std::sqrt(speed.x * speed.x + speed.y * speed.y + speed.z * speed.z));
 }
 
+// [CHOSEN, not recovered] Computes broadphase culler radius, keeping stopped/crouched soldiers in range.
+inline float latencyBroadphaseRadius(IObject* object)
+{
+    float speed = objectSpeed(object);
+    if (LatencyCompensation::isImprovedEnabled()
+        && object->getTemplate()
+        && object->getTemplate()->getClassID() == CID_SoldierTemplate)
+    {
+        const float floorSpeed = LatencyCompensation::getBroadphaseSoldierSpeedFloor();
+        if (speed < floorSpeed)
+            speed = floorSpeed;
+    }
+    const float latencyDistance = LatencyCompensation::getMaxLatency() * speed;
+    return object->getPhysicBoundingRadius() + latencyDistance + 0.5f;
+}
+
 inline bool hasNonIdentityScale(IObject* object)
 {
     IBase* geometry = static_cast<IBase*>(object_detail::LayoutAccess::geometry(object));
@@ -2315,9 +2331,7 @@ void ObjectManager::addObjectToCuller(IObject* object)
         && (object->getNetworkable()
             || object->queryInterface(IID_IPlayerControlObject)))
     {
-        const float speed = objectSpeed(object);
-        const float latencyDistance = LatencyCompensation::getMaxLatency() * speed;
-        const float radius = object->getPhysicBoundingRadius() + latencyDistance + 0.5f;
+        const float radius = latencyBroadphaseRadius(object);
         const Vec3 latencyPosition = objectPosition(object);
         object->setLatencyCullerObject(
             m_latencyCompensationCuller->createObject(latencyPosition, radius, object));
@@ -2340,9 +2354,7 @@ void ObjectManager::updateObjectInCuller(IObject* object)
     CullerObject* latencyObject = object->getLatencyCullerObject();
     if (latencyObject)
     {
-        const float speed = objectSpeed(object);
-        const float latencyDistance = LatencyCompensation::getMaxLatency() * speed;
-        const float radius = object->getPhysicBoundingRadius() + latencyDistance + 0.5f;
+        const float radius = latencyBroadphaseRadius(object);
         const Vec3 latencyPosition = objectPosition(object);
         object->setLatencyCullerObject(latencyObject->updateObject(latencyPosition, radius));
     }

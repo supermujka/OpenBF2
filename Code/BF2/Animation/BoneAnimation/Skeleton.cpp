@@ -22,6 +22,7 @@
 #include "../../Math/Quat.h"             // Quat::toMat / fromMat / slerp
 #include "../../Math/Vec3.h"             // Quat::toMat - one call per bone
 #include "../../Physics/GeomUtil.h"       // getIntersectionOfCapsAndEdgeNew
+#include "../../Physics/LatencyCompensation.h" // [CHOSEN, not recovered] closest-capsule toggle
 
 namespace dice {
 namespace anim {
@@ -409,71 +410,88 @@ bool Skeleton::checkRayVsSkeleton(hfe::Vec3* hitPosition, hfe::Vec3* hitNormal,
                                   const hfe::Vec3& start, const hfe::Vec3& end,
                                   const hfe::Mat4& transformation)
 {
-    hfe::Vec3 hitPoints[2] = {};
-    float hitTimes[2];
-    int intersectionCount = 0;
-    int boneIndex = 0;
-    BoneTemplate* collisionTemplate = 0;
-    hfe::Mat4 boneTransform;
+    const bool findClosest = hfe::world::LatencyCompensation::isClosestBoneEnabled();
+    hfe::Vec3 rayAxis;
+    rayAxis.x = end.x - start.x;
+    rayAxis.y = end.y - start.y;
+    rayAxis.z = end.z - start.z;
+
+    bool foundHit = false;
+    float bestTime = FLT_MAX;
+    hfe::Vec3 bestPoint = {};
+    hfe::Mat4 bestTransform = hfe::Mat4::getIdentity();
+    int bestBoneIndex = 0;
+    BoneTemplate* bestTemplate = 0;
 
     for (unsigned int i = 0; i < m_vector24.size(); ++i)
     {
-        boneTransform = hfe::Mat4::getIdentity();
-        boneIndex = m_vector24[i];
-        collisionTemplate = &m_boneTemplates[boneIndex];
+        hfe::Vec3 candPoints[2] = {};
+        float candTimes[2];
+        hfe::Mat4 candTransform = hfe::Mat4::getIdentity();
+        const int candBoneIndex = m_vector24[i];
+        BoneTemplate* const candTemplate = &m_boneTemplates[candBoneIndex];
         getCollisionBoneTransform(
-            &boneTransform, transformation, boneIndex, m_bones[boneIndex]);
+            &candTransform, transformation, candBoneIndex, m_bones[candBoneIndex]);
 
-        const float capsuleLength = fabsf(collisionTemplate->m_float18);
+        const float capsuleLength = fabsf(candTemplate->m_float18);
         hfe::Vec3 capsuleAxis;
-        capsuleAxis.x = boneTransform.m[8] * capsuleLength;
-        capsuleAxis.y = boneTransform.m[9] * capsuleLength;
-        capsuleAxis.z = boneTransform.m[10] * capsuleLength;
-
-        hfe::Vec3 rayAxis;
-        rayAxis.x = end.x - start.x;
-        rayAxis.y = end.y - start.y;
-        rayAxis.z = end.z - start.z;
+        capsuleAxis.x = candTransform.m[8] * capsuleLength;
+        capsuleAxis.y = candTransform.m[9] * capsuleLength;
+        capsuleAxis.z = candTransform.m[10] * capsuleLength;
 
         hfe::Vec3 capsuleStart;
-        capsuleStart.x = boneTransform.m[12];
-        capsuleStart.y = boneTransform.m[13];
-        capsuleStart.z = boneTransform.m[14];
+        capsuleStart.x = candTransform.m[12];
+        capsuleStart.y = candTransform.m[13];
+        capsuleStart.z = candTransform.m[14];
 
-        intersectionCount = hfe::world::getIntersectionOfCapsAndEdgeNew(
-            start, rayAxis, capsuleStart, capsuleAxis, collisionTemplate->m_float1C,
-            hitTimes, hitPoints);
-        if (intersectionCount > 0)
-            break;
+        const int candCount = hfe::world::getIntersectionOfCapsAndEdgeNew(
+            start, rayAxis, capsuleStart, capsuleAxis, candTemplate->m_float1C,
+            candTimes, candPoints);
+        if (candCount <= 0)
+            continue;
+
+        int candSelected = 0;
+        if (candCount == 2)
+            candSelected = candTimes[1] <= candTimes[0];
+        const float candTime = candTimes[candSelected];
+
+        if (!findClosest || !foundHit || candTime < bestTime)
+        {
+            foundHit = true;
+            bestTime = candTime;
+            bestPoint = candPoints[candSelected];
+            bestTransform = candTransform;
+            bestBoneIndex = candBoneIndex;
+            bestTemplate = candTemplate;
+
+            if (!findClosest)
+                break;
+        }
     }
 
-    if (intersectionCount <= 0)
+    if (!foundHit)
         return false;
 
-    int selected = 0;
-    if (intersectionCount == 2)
-        selected = hitTimes[1] <= hitTimes[0];
-
     if (hitPosition)
-        *hitPosition = hitPoints[selected];
+        *hitPosition = bestPoint;
 
     if (hitNormal)
     {
-        const float dx = hitPoints[selected].x - boneTransform.m[12];
-        const float dy = hitPoints[selected].y - boneTransform.m[13];
-        const float dz = hitPoints[selected].z - boneTransform.m[14];
+        const float dx = bestPoint.x - bestTransform.m[12];
+        const float dy = bestPoint.y - bestTransform.m[13];
+        const float dz = bestPoint.z - bestTransform.m[14];
 
         const float firstProjection =
-            dx * boneTransform.m[0] + dy * boneTransform.m[1] + dz * boneTransform.m[2];
+            dx * bestTransform.m[0] + dy * bestTransform.m[1] + dz * bestTransform.m[2];
         const float secondProjection =
-            dx * boneTransform.m[4] + dy * boneTransform.m[5] + dz * boneTransform.m[6];
+            dx * bestTransform.m[4] + dy * bestTransform.m[5] + dz * bestTransform.m[6];
 
-        hitNormal->x = boneTransform.m[0] * firstProjection
-                     + boneTransform.m[4] * secondProjection;
-        hitNormal->y = boneTransform.m[1] * firstProjection
-                     + boneTransform.m[5] * secondProjection;
-        hitNormal->z = boneTransform.m[2] * firstProjection
-                     + boneTransform.m[6] * secondProjection;
+        hitNormal->x = bestTransform.m[0] * firstProjection
+                     + bestTransform.m[4] * secondProjection;
+        hitNormal->y = bestTransform.m[1] * firstProjection
+                     + bestTransform.m[5] * secondProjection;
+        hitNormal->z = bestTransform.m[2] * firstProjection
+                     + bestTransform.m[6] * secondProjection;
 
         const float lengthSq = hitNormal->z * hitNormal->z
                              + hitNormal->y * hitNormal->y
@@ -503,9 +521,9 @@ bool Skeleton::checkRayVsSkeleton(hfe::Vec3* hitPosition, hfe::Vec3* hitNormal,
 
         if (fraction)
         {
-            float cosine = boneTransform.m[0] * hitNormal->x
-                         + boneTransform.m[1] * hitNormal->y
-                         + boneTransform.m[2] * hitNormal->z;
+            float cosine = bestTransform.m[0] * hitNormal->x
+                         + bestTransform.m[1] * hitNormal->y
+                         + bestTransform.m[2] * hitNormal->z;
             if (cosine < -1.0f)
                 cosine = -1.0f;
             else if (cosine > 1.0f)
@@ -513,9 +531,9 @@ bool Skeleton::checkRayVsSkeleton(hfe::Vec3* hitPosition, hfe::Vec3* hitNormal,
 
             const float angle = acosf(cosine) * 57.295776f;
             *fraction = angle;
-            if (boneTransform.m[4] * hitNormal->x
-                + boneTransform.m[5] * hitNormal->y
-                + boneTransform.m[6] * hitNormal->z > 0.0f)
+            if (bestTransform.m[4] * hitNormal->x
+                + bestTransform.m[5] * hitNormal->y
+                + bestTransform.m[6] * hitNormal->z > 0.0f)
             {
                 *fraction = 360.0f - angle;
             }
@@ -523,9 +541,9 @@ bool Skeleton::checkRayVsSkeleton(hfe::Vec3* hitPosition, hfe::Vec3* hitNormal,
     }
 
     if (hitPart)
-        *hitPart = collisionTemplate->m_dword20;
+        *hitPart = bestTemplate->m_dword20;
     if (hitBone)
-        *hitBone = boneIndex;
+        *hitBone = bestBoneIndex;
     return true;
 }
 

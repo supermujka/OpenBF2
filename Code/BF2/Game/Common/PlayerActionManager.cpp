@@ -8,6 +8,8 @@
 #include "../../IO/BitStream.h"
 #include "../GameLogic/ActionBuffer.h"           // pushBack - where received input lands
 #include "../Objects/IPlayer.h"
+#include "../../Core/System.h"
+#include "../../Physics/LatencyCompensation.h"
 
 #include <cstring>                               // memmove - add()'s slide
 
@@ -179,6 +181,10 @@ bool PlayerActionManager::processRcvdPlayerActions(int count)
         {
             m_recvActionHighWater = inputIndex;
             buffer->pushBack(m_recvActions[i]);
+            // [CHOSEN, not recovered] Record arrival tick for standing-queue lag compensation.
+            if (world::LatencyCompensation::m_isEnabled)
+                world::LatencyCompensation::notePlayerActionArrival(
+                    m_player, inputIndex, WorldPref::getTickCount());
         }
     }
     return true;

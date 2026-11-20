@@ -40,6 +40,7 @@
 #include "../../../Physics/Material.h"               // handleCollision reads getHasWaterPhysics
 #include "../Fx/EffectBundleTemplate.h"              // activate samples the trail template
 #include "../../../Physics/PhysicsUtil.h"            // reset/disabled/reenable launch sequence
+#include "../../../Physics/LatencyCompensation.h"    // [CHOSEN, not recovered] Version 1 fire-time latency snapshot
 #include "../../../Scene/Object/ObjectManager.h"     // objectManager - resetProjectile's weak targets
 #include "../../../Scene/Object/ObjectUtil.h"        // world::setNetworkableComp
 #include "../../../Scene/Object/PlayerManager.h"
@@ -304,6 +305,8 @@ IBase* createTracerGeometry(IObjectTemplate* erasedTemplate)
 
 GenericProjectile::~GenericProjectile()
 {
+    // [CHOSEN, not recovered] Clear any cached fire-time rewind snapshot.
+    LatencyCompensation::clearProjectileLatency(this);
     dropWeakBlock(m_interpolationProxyWeak);
     dropWeakBlock(m_localPredictedWeak);
     dropWeakBlock(m_associatedTracerWeak);
@@ -473,6 +476,9 @@ void GenericProjectile::enableCachedObject()
 // untyped non-null callback remains a branch-local stop rather than an ABI guess.
 void GenericProjectile::resetProjectile(bool a2)
 {
+    // [CHOSEN, not recovered] Clear cached fire-time rewind snapshot even for ObjectCache reuse.
+    LatencyCompensation::clearProjectileLatency(this);
+
     if (m_localPredictedWeak)
     {
         IObject* const target =
@@ -1130,6 +1136,9 @@ void GenericProjectile::activate()
         m_detonationComp->activate();
 
     m_dword1BC = WorldPref::getTickCount();
+    // [CHOSEN, not recovered] Snapshot fire-time rewind if owner is already bound at activate().
+    if (IPlayer* const owner = getPlayer())
+        LatencyCompensation::snapshotProjectileLatency(this, owner);
     m_tick1C8 = -1000;
     m_dword1C4 = 0;
     m_damage = m_template->m_projectileDamage;
@@ -1800,6 +1809,9 @@ int  GenericProjectile::getTeam()           { return m_team; }
 void GenericProjectile::setPlayer(IPlayer* player)
 {
     m_player = player ? player->getWeakPtr() : WeakPtr<IPlayer>();
+    // [CHOSEN, not recovered] FireComp calls setPlayer() right after activate(); snapshot here too.
+    if (m_isActive && player)
+        LatencyCompensation::snapshotProjectileLatency(this, player);
 }
 
 // getPlayer - 0x8282650, 23 B, the weak

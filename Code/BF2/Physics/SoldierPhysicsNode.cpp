@@ -3,8 +3,10 @@
 #include "SoldierPhysicsNode.h"
 
 #include <math.h>
+#include <unordered_map>
 
 #include "BasicPhysicsSystem.h"
+#include "LatencyCompensation.h"
 #include "../Core/Ids.h"
 #include "../Game/Utility/Vars.h"          // the three tuning vars updatePositionalPhysics reads
 #include "../Game/Objects/IObject.h"
@@ -25,6 +27,13 @@ int*   const g_phyPrintVar     = Vars::getInt("phy-print", -1);                 
 typedef object_detail::LayoutAccess L;
 
 static const float EPS = 0.000001f;
+
+namespace {
+// [CHOSEN, not recovered] Tracks whether the soldier latency ring has received at least one
+// live sample since init/reset(true) so spawn/vehicle-exit rewinds never blend toward (0,0,0).
+std::unordered_map<const SoldierPhysicsNode*, int> g_soldierLatencyValidSamples;
+const float kSoldierTeleportDistSq = 9.0f; // > 3.0 m in a single 33 ms tick
+}
 
 static inline void snapSmall(Vec3& v)
 {
@@ -90,6 +99,7 @@ SoldierPhysicsNode::SoldierPhysicsNode()
 
 SoldierPhysicsNode::~SoldierPhysicsNode()
 {
+    g_soldierLatencyValidSamples.erase(this);
     if (m_latency)
         delete[] m_latency;
 }
@@ -374,6 +384,7 @@ void SoldierPhysicsNode::reset(bool full)
     m_tangentSpeedTtl = 0;
     if (full)
     {
+        g_soldierLatencyValidSamples.erase(this);
         m_prevTransformationIsObjects = true;
         m_latencyIndex = 0;
         if (m_latency)
@@ -403,6 +414,7 @@ bool SoldierPhysicsNode::getIsPoint() const    { return false; }
 // one ring of sixteen {0, (0,0,0,1), 0}.
 void SoldierPhysicsNode::initLatencyCompensation()
 {
+    g_soldierLatencyValidSamples.erase(this);
     LatencyEntry* ring = new LatencyEntry[16];
     for (int i = 0; i < 16; ++i)
     {
@@ -426,20 +438,54 @@ void SoldierPhysicsNode::updateLatencyState()
 
     const Mat4& transform = getAbsoluteTransformation();                   // vslot +0x3C
 
-    LatencyEntry& entry = m_latency[m_latencyIndex];                       // +0x108, entries of 32 B
-    entry.position.x = transform.m[12];
-    entry.position.y = transform.m[13];
-    entry.position.z = transform.m[14];
+    Vec3 position;
+    position.x = transform.m[12];
+    position.y = transform.m[13];
+    position.z = transform.m[14];
 
     Quat rotation;
     rotation.x = 0.0f;
     rotation.y = 0.0f;
     rotation.z = 0.0f;                                                     // dead, as compiled
     rotation.fromMat(transform);
-    entry.rotation = rotation;
 
-    entry.pose = static_cast<unsigned char>(
+    const unsigned char pose = static_cast<unsigned char>(
         static_cast<Soldier*>(m_object)->getPose());                       // Soldier +0x278
+
+    if (LatencyCompensation::isSpawnRingFixEnabled())
+    {
+        int& valid = g_soldierLatencyValidSamples[this];
+        bool reseed = (valid <= 0);
+        if (!reseed)
+        {
+            const int prevIdx = (m_latencyIndex + 15) & 15;
+            const float dx = position.x - m_latency[prevIdx].position.x;
+            const float dy = position.y - m_latency[prevIdx].position.y;
+            const float dz = position.z - m_latency[prevIdx].position.z;
+            if (dx * dx + dy * dy + dz * dz > kSoldierTeleportDistSq)
+                reseed = true;
+        }
+        if (reseed)
+        {
+            for (int i = 0; i < 16; ++i)
+            {
+                m_latency[i].position = position;
+                m_latency[i].rotation = rotation;
+                m_latency[i].pose = pose;
+                m_latency[i].pad[0] = m_latency[i].pad[1] = m_latency[i].pad[2] = 0;
+            }
+            m_latencyIndex = 1;
+            valid = 1;
+            return;
+        }
+        if (valid < 16)
+            ++valid;
+    }
+
+    LatencyEntry& entry = m_latency[m_latencyIndex];                       // +0x108, entries of 32 B
+    entry.position = position;
+    entry.rotation = rotation;
+    entry.pose = pose;
 
     ++m_latencyIndex;
     if (m_latencyIndex == 16)
@@ -457,6 +503,18 @@ const Mat4& SoldierPhysicsNode::getLatencyCompensatedTransformation(float latenc
         if (pose)
             *pose = -1;
         return getAbsoluteTransformation();
+    }
+
+    if (LatencyCompensation::isSpawnRingFixEnabled())
+    {
+        std::unordered_map<const SoldierPhysicsNode*, int>::const_iterator it =
+            g_soldierLatencyValidSamples.find(this);
+        if (it == g_soldierLatencyValidSamples.end() || it->second <= 0)
+        {
+            if (pose)
+                *pose = -1;
+            return getAbsoluteTransformation();
+        }
     }
 
     float integralSamples = 0.0f;

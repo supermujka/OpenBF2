@@ -781,7 +781,8 @@ bool GameLogicExplosion::serverHandleExplosion(
         queryProjectile = projectileFromObject(sourceProjectile);
 
     if (queryProjectile
-        && LatencyCompensation::getLatency(queryProjectile->getPlayer()) > 0.0f)
+        && LatencyCompensation::getProjectileLatency(sourceProjectile,
+                                                       queryProjectile->getPlayer()) > 0.0f)
     {
         objectManager->getObjectsFromGridWithLatency(position, radius, objects, &rootsOnly);
     }
@@ -814,7 +815,9 @@ bool GameLogicExplosion::serverHandleExplosion(
             {
                 GenericProjectile* const projectile = projectileFromObject(sourceProjectile);
                 const float latency = projectile
-                    ? LatencyCompensation::getLatency(projectile->getPlayer()) : 0.0f;
+                    ? LatencyCompensation::getProjectileLatency(sourceProjectile,
+                                                                projectile->getPlayer())
+                    : 0.0f;
                 const Mat4& transform = node->getLatencyCompensatedTransformation(latency, 0);
                 objectPosition.x = transform.m[12];
                 objectPosition.y = transform.m[13];

@@ -8,6 +8,7 @@ namespace dice {
 namespace hfe {
 namespace world {
 
+class IObject;
 class IPlayer;
 
 class LatencyCompensation
@@ -19,6 +20,22 @@ public:
     static float getLocalLatency(IPlayer* player);
     static float getLatency(IPlayer* player);
     static float convertLatency(float latency);
+
+    // [CHOSEN, not recovered] Version 1 hit-detection & lag-compensation controls and sidecars.
+    static bool isImprovedEnabled();
+    static bool isClosestBoneEnabled();
+    static bool isSpawnRingFixEnabled();
+    static bool isDebugLogEnabled();
+    static unsigned int clampClientInterpolationTime(unsigned int ms);
+    static float getBroadphaseSoldierSpeedFloor();
+    static void notePlayerActionArrival(const IPlayer* player, int inputIndex, int serverTick);
+    static void setPlayerActiveQueueDelay(const IPlayer* player, int inputIndex, int consumeTick);
+    static void clearPlayerActiveQueueDelay(const IPlayer* player);
+    static void forgetPlayer(const IPlayer* player);
+    static float getPlayerQueueDelay(const IPlayer* player);
+    static void snapshotProjectileLatency(const IObject* projectileObject, IPlayer* owner);
+    static void clearProjectileLatency(const IObject* projectileObject);
+    static float getProjectileLatency(const IObject* projectileObject, IPlayer* owner);
 };
 
 } // namespace world

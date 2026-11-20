@@ -130,7 +130,7 @@ void PointResponsePhysics::checkObjectVsObject(IObject* object, IObject* other, 
         float latency = 0.0f;
         void* const projectile = object->queryInterface(IID_IProjectileObject);
         if (projectile)
-            latency = LatencyCompensation::getLatency(projectileOwner(projectile));
+            latency = LatencyCompensation::getProjectileLatency(object, projectileOwner(projectile));
         const Mat4& transform = otherNode->getLatencyCompensatedTransformation(latency, 0);
         Mat4 inverse = Mat4::getIdentity();
         inverse.setInverse(transform);

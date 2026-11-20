@@ -1212,7 +1212,7 @@ void SoldierResponsePhysics::checkSoldierVsPoint(IObject* soldierObject,
     int hitBone = -1;
     float latency = 0.0f;
     if (LatencyCompensation::m_isEnabled && owner)
-        latency = LatencyCompensation::getLatency(owner);
+        latency = LatencyCompensation::getProjectileLatency(projectileObject, owner);
 
     int stateIndex = 0;
     const Mat4& collisionTransformation =
@@ -1227,6 +1227,20 @@ void SoldierResponsePhysics::checkSoldierVsPoint(IObject* soldierObject,
             &hitPosition, &hitNormal, &hitPart, &hitBone, &fraction,
             start, end, collisionTransformation))
         return;
+
+    // [CHOSEN, not recovered] Optional server-side hit-registration diagnostic log.
+    if (LatencyCompensation::isDebugLogEnabled())
+    {
+        std::fprintf(
+            stderr,
+            "[HITREG] soldier_hit owner=%p target=%p ping=%u interp=%u qDelay=%.1fms rewind=%.1fms bone=%d part=%d\n",
+            static_cast<void*>(owner), static_cast<void*>(soldierObject),
+            owner ? static_cast<unsigned int>(owner->getPing()) : 0u,
+            owner ? static_cast<unsigned int>(owner->getInterpolationTime()) : 0u,
+            LatencyCompensation::getPlayerQueueDelay(owner) * 1000.0f,
+            latency * 1000.0f, hitBone, hitPart);
+        std::fflush(stderr);
+    }
 
     armor->setLastHitBoneIndex(hitBone, true);
     Vec3 hitDirection;

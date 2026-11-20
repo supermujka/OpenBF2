@@ -3,6 +3,7 @@
 #include "PhysicsNode.h"
 
 #include <math.h>
+#include <unordered_map>
 
 #include "../Core/Ids.h"
 #include "../Game/Objects/IObject.h"
@@ -16,6 +17,7 @@
 #include "../Game/Objects/Fx/ParticleTemplate.h"       // m_floaterMod (+0xA0)
 #include "../Math/Mat4.h"                              // setRotateAboutLine / rotMult
 #include "ResponsePhysics.h"                           // the +0xF4 resting-on block (the sleeping arm)
+#include "LatencyCompensation.h"                       // [CHOSEN, not recovered] spawn-ring fix gate
 
 namespace dice {
 namespace hfe {
@@ -26,6 +28,13 @@ extern IBase* basicPhysicsSystem;                             // ds:0x8B2784C - 
 typedef object_detail::LayoutAccess L;
 
 static const float EPS = 0.000001f;
+
+namespace {
+// [CHOSEN, not recovered] Tracks whether the vehicle/body latency ring has received at least one
+// live sample since init/reset(true) so spawn rewinds never blend toward (0,0,0).
+std::unordered_map<const PhysicsNode*, int> g_physicsLatencyValidSamples;
+const float kVehicleTeleportDistSq = 2500.0f; // > 50 m in a single 33 ms tick
+}
 
 static inline void snapSmall(Vec3& v)
 {
@@ -126,6 +135,7 @@ PhysicsNode::PhysicsNode()
 // the two rings, then the base.
 PhysicsNode::~PhysicsNode()
 {
+    g_physicsLatencyValidSamples.erase(this);
     if (m_latencyPositions)
         delete[] m_latencyPositions;
     if (m_latencyRotations)
@@ -553,6 +563,7 @@ void PhysicsNode::reset(bool full)
     m_isInAir = true;
     if (full)
     {
+        g_physicsLatencyValidSamples.erase(this);
         m_prevTransformationIsObjects = true;
         m_latencyIndex = 0;
         if (m_latencyPositions)
@@ -574,6 +585,7 @@ bool PhysicsNode::getIsPoint() const { return false; }
 // the two rings - positions zeroed, rotations identity.
 void PhysicsNode::initLatencyCompensation()
 {
+    g_physicsLatencyValidSamples.erase(this);
     Vec3* positions = new Vec3[16];
     for (int i = 0; i < 16; ++i)
         positions[i].x = positions[i].y = positions[i].z = 0.0f;
@@ -598,7 +610,7 @@ void PhysicsNode::updateLatencyState()
 
     const Mat4& transform = getAbsoluteTransformation();                             // vslot +0x3C
 
-    Vec3& position = m_latencyPositions[m_latencyIndex];                             // +0x128
+    Vec3 position;
     position.x = transform.m[12];
     position.y = transform.m[13];
     position.z = transform.m[14];
@@ -606,6 +618,36 @@ void PhysicsNode::updateLatencyState()
     Quat rotation;
     rotation.x = 0.0f; rotation.y = 0.0f; rotation.z = 0.0f;                         // dead, as compiled
     rotation.fromMat(transform);
+
+    if (LatencyCompensation::isSpawnRingFixEnabled())
+    {
+        int& valid = g_physicsLatencyValidSamples[this];
+        bool reseed = (valid <= 0);
+        if (!reseed)
+        {
+            const int prevIdx = (m_latencyIndex + 15) & 15;
+            const float dx = position.x - m_latencyPositions[prevIdx].x;
+            const float dy = position.y - m_latencyPositions[prevIdx].y;
+            const float dz = position.z - m_latencyPositions[prevIdx].z;
+            if (dx * dx + dy * dy + dz * dz > kVehicleTeleportDistSq)
+                reseed = true;
+        }
+        if (reseed)
+        {
+            for (int i = 0; i < 16; ++i)
+            {
+                m_latencyPositions[i] = position;
+                m_latencyRotations[i] = rotation;
+            }
+            m_latencyIndex = 1;
+            valid = 1;
+            return;
+        }
+        if (valid < 16)
+            ++valid;
+    }
+
+    m_latencyPositions[m_latencyIndex] = position;
     m_latencyRotations[m_latencyIndex] = rotation;                                   // +0x124
 
     ++m_latencyIndex;
@@ -625,6 +667,14 @@ const Mat4& PhysicsNode::getLatencyCompensatedTransformation(float latency, int*
     const float samplePeriod = 0.033333335f;
     if (!m_latencyPositions || latency <= samplePeriod)
         return getAbsoluteTransformation();
+
+    if (LatencyCompensation::isSpawnRingFixEnabled())
+    {
+        std::unordered_map<const PhysicsNode*, int>::const_iterator it =
+            g_physicsLatencyValidSamples.find(this);
+        if (it == g_physicsLatencyValidSamples.end() || it->second <= 0)
+            return getAbsoluteTransformation();
+    }
 
     float integralSamples = 0.0f;
     const float fractionalSamples = modff(latency / samplePeriod, &integralSamples);

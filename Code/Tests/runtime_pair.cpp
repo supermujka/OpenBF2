@@ -184,6 +184,20 @@ float PhysicsSpring::getWheelRadius() const { return 0.1f; }
 
 bool LatencyCompensation::m_isEnabled = false;
 float LatencyCompensation::getLatency(IPlayer*) { return 0.0f; }
+bool LatencyCompensation::isImprovedEnabled() { return false; }
+bool LatencyCompensation::isClosestBoneEnabled() { return false; }
+bool LatencyCompensation::isSpawnRingFixEnabled() { return false; }
+bool LatencyCompensation::isDebugLogEnabled() { return false; }
+unsigned int LatencyCompensation::clampClientInterpolationTime(unsigned int ms) { return ms; }
+float LatencyCompensation::getBroadphaseSoldierSpeedFloor() { return 0.0f; }
+void LatencyCompensation::notePlayerActionArrival(const IPlayer*, int, int) {}
+void LatencyCompensation::setPlayerActiveQueueDelay(const IPlayer*, int, int) {}
+void LatencyCompensation::clearPlayerActiveQueueDelay(const IPlayer*) {}
+void LatencyCompensation::forgetPlayer(const IPlayer*) {}
+float LatencyCompensation::getPlayerQueueDelay(const IPlayer*) { return 0.0f; }
+void LatencyCompensation::snapshotProjectileLatency(const IObject*, IPlayer*) {}
+void LatencyCompensation::clearProjectileLatency(const IObject*) {}
+float LatencyCompensation::getProjectileLatency(const IObject*, IPlayer*) { return 0.0f; }
 
 void Soldier::setHitByVehicleSpeed(const Vec3&) {}
 dice::anim::Skeleton* Soldier::getCollisionSkeleton(int) { return 0; }

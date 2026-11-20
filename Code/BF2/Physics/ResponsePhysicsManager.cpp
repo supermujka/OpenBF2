@@ -409,7 +409,8 @@ void ResponsePhysicsManager::getCollisionObjects(IObject* obj, float radius, flo
     if (LatencyCompensation::m_isEnabled)
     {
         void* projectile = obj ? obj->queryInterface(IID_IProjectileObject) : 0;
-        if (projectile && LatencyCompensation::getLatency(projectileOwner(projectile)) > 0.0f)
+        if (projectile
+            && LatencyCompensation::getProjectileLatency(obj, projectileOwner(projectile)) > 0.0f)
         {
             const Vec3& pos = obj->getAbsolutePosition();
             Vec3 from;

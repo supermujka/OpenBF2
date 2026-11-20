@@ -4,6 +4,10 @@
 #include "../Game/Objects/IPlayer.h"
 #include "../Game/Utility/Vars.h"
 
+#include <cstddef>
+#include <unordered_map>
+#include <vector>
+
 namespace dice {
 namespace hfe {
 
@@ -32,6 +36,34 @@ float* const g_pingFactor = Vars::getFloat("phy-latencyComp-pingFactor", 0.5f); 
 float* const g_defaultLatency = Vars::getFloat("phy-latencyComp-default", 0.05f);    // +0x464, used
 float* const g_maxLatency = Vars::getFloat("phy-latencyComp-max", 0.3f);             // +0x468, used
 float* const g_debugLatency = Vars::getFloat("phy-latencyComp-debug", -1.0f);        // +0x46C, used
+
+// [CHOSEN, not recovered] Version 1 hit-detection & lag-compensation cvars and sidecars.
+int*   const g_improved           = Vars::getInt("phy-latencyComp-improved", 1);
+int*   const g_maxClientInterpMs  = Vars::getInt("phy-latencyComp-maxClientInterpMs", 133);
+int*   const g_useQueueDelay      = Vars::getInt("phy-latencyComp-queueDelay", 1);
+int*   const g_maxQueueTicks      = Vars::getInt("phy-latencyComp-maxQueueTicks", 4);
+int*   const g_snapshotProjectile = Vars::getInt("phy-latencyComp-snapshotProjectile", 1);
+int*   const g_closestBone        = Vars::getInt("phy-latencyComp-closestBone", 1);
+int*   const g_spawnRingFix       = Vars::getInt("phy-latencyComp-spawnRingFix", 1);
+float* const g_broadphaseFloor    = Vars::getFloat("phy-latencyComp-broadphaseFloor", 8.0f);
+int*   const g_debugLog           = Vars::getInt("phy-latencyComp-debugLog", 0);
+
+struct ActionArrival
+{
+    int inputIndex;
+    int arrivalTick;
+};
+
+struct PlayerQueueState
+{
+    std::vector<ActionArrival> arrivals;
+    float activeDelaySec;
+    PlayerQueueState() : activeDelaySec(0.0f) {}
+};
+
+std::unordered_map<const IPlayer*, PlayerQueueState> g_playerQueues;
+std::unordered_map<const IObject*, float> g_projectileLatencies;
+const float kServerTickPeriod = 0.033333335f;
 }
 
 // one load of the cvar handle registered at static init, then its float.
@@ -92,7 +124,11 @@ float LatencyCompensation::getLatency(IPlayer* player)
         {
             latency = static_cast<float>(player->getPing()) * *g_pingFactor * 0.001f;
             if (*g_useClientWindow)
-                latency += static_cast<float>(player->getInterpolationTime()) * 0.001f;
+            {
+                const unsigned int interpMs =
+                    clampClientInterpolationTime(player->getInterpolationTime());
+                latency += static_cast<float>(interpMs) * 0.001f;
+            }
             else
                 latency += *g_defaultLatency;
         }
@@ -104,6 +140,181 @@ float LatencyCompensation::getLatency(IPlayer* player)
 
     if (latency > *g_maxLatency)
         return *g_maxLatency;
+    return latency;
+}
+
+// [CHOSEN, not recovered] Feature-gate and sidecar helpers for Version 1 hitreg fixes.
+bool LatencyCompensation::isImprovedEnabled()
+{
+    return *g_improved != 0;
+}
+
+bool LatencyCompensation::isClosestBoneEnabled()
+{
+    return *g_improved != 0 && *g_closestBone != 0;
+}
+
+bool LatencyCompensation::isSpawnRingFixEnabled()
+{
+    return *g_improved != 0 && *g_spawnRingFix != 0;
+}
+
+bool LatencyCompensation::isDebugLogEnabled()
+{
+    return *g_debugLog != 0;
+}
+
+unsigned int LatencyCompensation::clampClientInterpolationTime(unsigned int ms)
+{
+    if (ms > 0x200u)
+        ms = 0x200u;
+
+    if (m_isEnabled && *g_improved != 0 && *g_maxClientInterpMs > 0)
+    {
+        const unsigned int cap = static_cast<unsigned int>(*g_maxClientInterpMs);
+        if (ms > cap)
+            ms = cap;
+    }
+    return ms;
+}
+
+float LatencyCompensation::getBroadphaseSoldierSpeedFloor()
+{
+    return (*g_improved != 0 && *g_broadphaseFloor > 0.0f) ? *g_broadphaseFloor : 0.0f;
+}
+
+void LatencyCompensation::notePlayerActionArrival(const IPlayer* player, int inputIndex,
+                                                  int serverTick)
+{
+    if (!player || !m_isEnabled || *g_improved == 0 || *g_useQueueDelay == 0)
+        return;
+
+    std::vector<ActionArrival>& arrivals = g_playerQueues[player].arrivals;
+    ActionArrival entry;
+    entry.inputIndex = inputIndex;
+    entry.arrivalTick = serverTick;
+    arrivals.push_back(entry);
+
+    if (arrivals.size() > 16)
+        arrivals.erase(arrivals.begin(), arrivals.begin() + (arrivals.size() - 16));
+}
+
+void LatencyCompensation::setPlayerActiveQueueDelay(const IPlayer* player, int inputIndex,
+                                                    int consumeTick)
+{
+    if (!player)
+        return;
+
+    std::unordered_map<const IPlayer*, PlayerQueueState>::iterator it =
+        g_playerQueues.find(player);
+    if (it == g_playerQueues.end())
+        return;
+
+    std::vector<ActionArrival>& arrivals = it->second.arrivals;
+    std::size_t writeIdx = 0;
+    bool found = false;
+    int arrivalTick = 0;
+
+    for (std::size_t i = 0; i < arrivals.size(); ++i)
+    {
+        if (arrivals[i].inputIndex == inputIndex)
+        {
+            found = true;
+            arrivalTick = arrivals[i].arrivalTick;
+        }
+        else if (arrivals[i].inputIndex > inputIndex)
+        {
+            arrivals[writeIdx++] = arrivals[i];
+        }
+    }
+    arrivals.resize(writeIdx);
+
+    if (found && m_isEnabled && *g_improved != 0 && *g_useQueueDelay != 0)
+    {
+        int waitedTicks = consumeTick - arrivalTick;
+        if (waitedTicks < 0)
+            waitedTicks = 0;
+        const int maxTicks = *g_maxQueueTicks > 0 ? *g_maxQueueTicks : 0;
+        if (waitedTicks > maxTicks)
+            waitedTicks = maxTicks;
+        it->second.activeDelaySec = static_cast<float>(waitedTicks) * kServerTickPeriod;
+    }
+    else
+    {
+        it->second.activeDelaySec = 0.0f;
+    }
+}
+
+void LatencyCompensation::clearPlayerActiveQueueDelay(const IPlayer* player)
+{
+    if (!player)
+        return;
+
+    std::unordered_map<const IPlayer*, PlayerQueueState>::iterator it =
+        g_playerQueues.find(player);
+    if (it != g_playerQueues.end())
+        it->second.activeDelaySec = 0.0f;
+}
+
+void LatencyCompensation::forgetPlayer(const IPlayer* player)
+{
+    if (player)
+        g_playerQueues.erase(player);
+}
+
+float LatencyCompensation::getPlayerQueueDelay(const IPlayer* player)
+{
+    if (!player || !m_isEnabled || *g_improved == 0 || *g_useQueueDelay == 0)
+        return 0.0f;
+
+    std::unordered_map<const IPlayer*, PlayerQueueState>::const_iterator it =
+        g_playerQueues.find(player);
+    return it != g_playerQueues.end() ? it->second.activeDelaySec : 0.0f;
+}
+
+void LatencyCompensation::snapshotProjectileLatency(const IObject* projectileObject,
+                                                    IPlayer* owner)
+{
+    if (!projectileObject || !m_isEnabled || *g_improved == 0 || *g_snapshotProjectile == 0)
+        return;
+
+    float latency = getLatency(owner);
+    if (*g_debugLatency <= 0.0f && owner && owner->getIsRemote() && *g_useQueueDelay != 0)
+    {
+        latency += getPlayerQueueDelay(owner);
+        if (latency > *g_maxLatency)
+            latency = *g_maxLatency;
+    }
+    g_projectileLatencies[projectileObject] = latency;
+}
+
+void LatencyCompensation::clearProjectileLatency(const IObject* projectileObject)
+{
+    if (projectileObject)
+        g_projectileLatencies.erase(projectileObject);
+}
+
+float LatencyCompensation::getProjectileLatency(const IObject* projectileObject, IPlayer* owner)
+{
+    if (!m_isEnabled)
+        return 0.0f;
+
+    if (*g_improved != 0 && *g_snapshotProjectile != 0 && projectileObject)
+    {
+        std::unordered_map<const IObject*, float>::const_iterator it =
+            g_projectileLatencies.find(projectileObject);
+        if (it != g_projectileLatencies.end())
+            return it->second;
+    }
+
+    float latency = getLatency(owner);
+    if (*g_improved != 0 && *g_useQueueDelay != 0 && *g_debugLatency <= 0.0f
+        && owner && owner->getIsRemote())
+    {
+        latency += getPlayerQueueDelay(owner);
+        if (latency > *g_maxLatency)
+            latency = *g_maxLatency;
+    }
     return latency;
 }
 
