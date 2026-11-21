@@ -40,7 +40,7 @@ const bool         g_telemetryFileRegistered =
     (Vars::getString("phy-latencyComp-telemetryFile", kDefaultTelemetryFile) != 0);
 int*         const g_telemetryFlush  = Vars::getInt("phy-latencyComp-telemetryFlushTicks", 30);
 int*         const g_telemetrySplitMatches = Vars::getInt("phy-latencyComp-telemetrySplitMatches", 1);
-int*         const g_netServerSendRate = Vars::getInt("net-serverSendRate", 0);
+int*         const g_netServerSendRate = Vars::getInt("net-serverSendRate", 30);
 
 const float kServerTickSec = 0.033333335f;
 

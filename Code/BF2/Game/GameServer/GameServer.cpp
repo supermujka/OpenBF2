@@ -2518,9 +2518,9 @@ int* const g_connPacketSizeOverride = Vars::getInt("conn-packetsize-override", 0
                                                         //   which is what places it in this TU. chokeBandwidth
                                                         //   is its only reader.
 // [CHOSEN, not recovered] Live server->client snapshot send-rate override (Hz).
-// 0 = vanilla per-connection tier rate (g_connectionTypes[type][1], max 20 Hz).
+// Default 30 (matches 30 Hz simulation); 0 = vanilla per-connection tier rate (max 20 Hz).
 // Positive values (clamped to [1, 30]) override the packet rate gate live via RCON/console.
-int* const g_netServerSendRate = Vars::getInt("net-serverSendRate", 0);
+int* const g_netServerSendRate = Vars::getInt("net-serverSendRate", 30);
 
 int effectiveServerSendRate(const ClientConnection* conn)
 {
