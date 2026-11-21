@@ -45,6 +45,8 @@ int*   const g_maxQueueTicks      = Vars::getInt("phy-latencyComp-maxQueueTicks"
 int*   const g_snapshotProjectile = Vars::getInt("phy-latencyComp-snapshotProjectile", 1);
 int*   const g_closestBone        = Vars::getInt("phy-latencyComp-closestBone", 1);
 int*   const g_spawnRingFix       = Vars::getInt("phy-latencyComp-spawnRingFix", 1);
+int*   const g_boneHistory        = Vars::getInt("phy-latencyComp-boneHistory", 1);
+int*   const g_qDelayMinInterpMs  = Vars::getInt("phy-latencyComp-qDelayMinInterpMs", 100);
 float* const g_broadphaseFloor    = Vars::getFloat("phy-latencyComp-broadphaseFloor", 8.0f);
 int*   const g_debugLog           = Vars::getInt("phy-latencyComp-debugLog", 0);
 
@@ -180,6 +182,11 @@ bool LatencyCompensation::isSpawnRingFixEnabled()
     return *g_improved != 0 && *g_spawnRingFix != 0;
 }
 
+bool LatencyCompensation::isBoneHistoryEnabled()
+{
+    return *g_improved != 0 && *g_boneHistory != 0;
+}
+
 bool LatencyCompensation::isDebugLogEnabled()
 {
     return *g_debugLog != 0;
@@ -223,6 +230,29 @@ int LatencyCompensation::getMaxClientInterpMs()
 int LatencyCompensation::getMaxQueueTicks()
 {
     return *g_maxQueueTicks;
+}
+
+int LatencyCompensation::getQueueDelayMinInterpMs()
+{
+    return *g_qDelayMinInterpMs;
+}
+
+float LatencyCompensation::computeEffectiveQueueDelay(unsigned int rawInterpMs,
+                                                      float rawQueueDelaySec)
+{
+    if (rawQueueDelaySec <= 0.0f)
+        return 0.0f;
+    const int minMs = *g_qDelayMinInterpMs;
+    const int maxMs = *g_maxClientInterpMs;
+    if (minMs <= 0 || maxMs <= minMs)
+        return rawQueueDelaySec;
+    if (static_cast<int>(rawInterpMs) <= minMs)
+        return 0.0f;
+    if (static_cast<int>(rawInterpMs) >= maxMs)
+        return rawQueueDelaySec;
+    const float scale = static_cast<float>(static_cast<int>(rawInterpMs) - minMs)
+                      / static_cast<float>(maxMs - minMs);
+    return rawQueueDelaySec * scale;
 }
 
 unsigned int LatencyCompensation::clampClientInterpolationTime(unsigned int ms)
@@ -353,7 +383,8 @@ void LatencyCompensation::snapshotProjectileLatency(const IObject* projectileObj
     float latency = getLatency(owner);
     if (owner->getIsRemote() && *g_useQueueDelay != 0)
     {
-        latency += getPlayerQueueDelay(owner);
+        latency += computeEffectiveQueueDelay(owner->getInterpolationTime(),
+                                              getPlayerQueueDelay(owner));
         if (latency > maxLat)
             latency = maxLat;
     }
@@ -389,7 +420,8 @@ float LatencyCompensation::getProjectileLatency(const IObject* projectileObject,
     float latency = getLatency(owner);
     if (*g_useQueueDelay != 0 && owner->getIsRemote())
     {
-        latency += getPlayerQueueDelay(owner);
+        latency += computeEffectiveQueueDelay(owner->getInterpolationTime(),
+                                              getPlayerQueueDelay(owner));
         if (latency > maxLat)
             latency = maxLat;
     }

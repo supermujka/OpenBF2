@@ -1225,10 +1225,20 @@ void SoldierResponsePhysics::checkSoldierVsPoint(IObject* soldierObject,
     if (!skeleton)
         return;
 
+    anim::HistoricalBonePose v2BonePose;
+    const bool usedBoneHistory =
+        LatencyCompensation::isBoneHistoryEnabled()
+        && static_cast<const SoldierPhysicsNode*>(soldierNode)->sampleHistoricalBonePose(
+               latency, v2BonePose);
+
     ++collisionStatsData->unknown10;
-    const bool v1Hit = skeleton->checkRayVsSkeleton(
-        &hitPosition, &hitNormal, &hitPart, &hitBone, &fraction,
-        start, end, v1Transform);
+    const bool v1Hit = usedBoneHistory
+        ? skeleton->checkRayVsHistoricalPose(
+              &hitPosition, &hitNormal, &hitPart, &hitBone, &fraction,
+              start, end, v1Transform, v2BonePose)
+        : skeleton->checkRayVsSkeleton(
+              &hitPosition, &hitNormal, &hitPart, &hitBone, &fraction,
+              start, end, v1Transform);
 
     // [CHOSEN, not recovered] Shadow A/B & pingFactor sweep probe for hits and near-misses (<= 2 m).
     if (HitregTelemetry::isEnabled() && LatencyCompensation::m_isEnabled && owner)
@@ -1259,7 +1269,8 @@ void SoldierResponsePhysics::checkSoldierVsPoint(IObject* soldierObject,
                 projectileObject, owner, soldierObject,
                 static_cast<const SoldierPhysicsNode*>(soldierNode), skeleton,
                 start, end, latency, stateIndex, v1Transform,
-                v1Hit, hitBone, hitPart, hitPosition, flyBy, coarseDist, targetInAir);
+                v1Hit, hitBone, hitPart, hitPosition, flyBy, coarseDist, targetInAir,
+                usedBoneHistory, usedBoneHistory ? &v2BonePose : 0);
         }
     }
 
@@ -1271,12 +1282,12 @@ void SoldierResponsePhysics::checkSoldierVsPoint(IObject* soldierObject,
     {
         std::fprintf(
             stderr,
-            "[HITREG] soldier_hit owner=%p target=%p ping=%u interp=%u qDelay=%.1fms rewind=%.1fms bone=%d part=%d\n",
+            "[HITREG] soldier_hit owner=%p target=%p ping=%u interp=%u qDelay=%.1fms rewind=%.1fms bone=%d part=%d v2=%d\n",
             static_cast<void*>(owner), static_cast<void*>(soldierObject),
             owner ? static_cast<unsigned int>(owner->getPing()) : 0u,
             owner ? static_cast<unsigned int>(owner->getInterpolationTime()) : 0u,
             LatencyCompensation::getPlayerQueueDelay(owner) * 1000.0f,
-            latency * 1000.0f, hitBone, hitPart);
+            latency * 1000.0f, hitBone, hitPart, usedBoneHistory ? 1 : 0);
         std::fflush(stderr);
     }
 

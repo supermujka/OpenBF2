@@ -34,6 +34,18 @@ struct RaySkeletonProbe
     int   nearestPart;
 };
 
+// [CHOSEN, not recovered] Interpolated historical skeleton-local transforms for collision bones (V2).
+static const int kMaxHistoricalCollisionBones = 32;
+
+struct HistoricalBonePose
+{
+    int       boneCount;
+    int       boneIndices[kMaxHistoricalCollisionBones];
+    hfe::Mat4 boneTransforms[kMaxHistoricalCollisionBones];
+
+    HistoricalBonePose() : boneCount(0) {}
+};
+
 class Skeleton
 {
 public:
@@ -165,6 +177,19 @@ public:
     void probeRayVsSkeleton(const hfe::Vec3& start, const hfe::Vec3& end,
                             const hfe::Mat4& transformation,
                             RaySkeletonProbe& out) const;
+    // [CHOSEN, not recovered] Hitreg V2: ray test & read-only probe against historical bone transforms.
+    bool checkRayVsHistoricalPose(hfe::Vec3* hitPosition, hfe::Vec3* hitNormal,
+                                  int* hitPart, int* hitBone, float* fraction,
+                                  const hfe::Vec3& start, const hfe::Vec3& end,
+                                  const hfe::Mat4& transformation,
+                                  const HistoricalBonePose& pose) const;
+    void probeRayVsHistoricalPose(const hfe::Vec3& start, const hfe::Vec3& end,
+                                  const hfe::Mat4& transformation,
+                                  const HistoricalBonePose& pose,
+                                  RaySkeletonProbe& out) const;
+    void computePoseBoneShifts(const HistoricalBonePose& pose,
+                               float& outHeadShiftM,
+                               float& outMaxBoneShiftM) const;
     const char* getBoneNameSafe(int boneIndex) const;
     // and it is what Soldier::resetInstance calls on the collision rig.
     void clearAllIk();

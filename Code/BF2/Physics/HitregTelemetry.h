@@ -9,6 +9,7 @@
 namespace dice {
 namespace anim {
 class Skeleton;
+struct HistoricalBonePose;
 }
 namespace hfe {
 
@@ -46,7 +47,9 @@ public:
                                    float activeLatency, int v1StateIndex,
                                    const Mat4& v1Transform, bool v1Hit,
                                    int v1HitBone, int v1HitPart, const Vec3& v1HitPos,
-                                   bool flyBy, float coarseDist, bool targetInAir);
+                                   bool flyBy, float coarseDist, bool targetInAir,
+                                   bool usedBoneHistory,
+                                   const anim::HistoricalBonePose* activeBonePose);
 
     // Contact arbitration (delivered vs wall/terrain/other-soldier override).
     static void noteProjectileContactDelivered(const IObject* projectileObject,

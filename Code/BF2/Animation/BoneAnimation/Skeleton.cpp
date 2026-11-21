@@ -416,16 +416,66 @@ int hitPartPriority(int materialId)
         return 1;
     return 0;
 }
-} // namespace
 
-// Tests a ray against the skeleton's collision bones and writes hit information when found.
-
-bool Skeleton::checkRayVsSkeleton(hfe::Vec3* hitPosition, hfe::Vec3* hitNormal,
-                                  int* hitPart, int* hitBone, float* fraction,
-                                  const hfe::Vec3& start, const hfe::Vec3& end,
-                                  const hfe::Mat4& transformation)
+void buildCollisionBoneTransform(hfe::Mat4* out,
+                                 const Skeleton::BoneTemplate& collisionTemplate,
+                                 const hfe::Mat4& boneTransform,
+                                 const hfe::Mat4& transformation)
 {
-    if (!m_boneTemplates || !m_bones)
+    const bool flipped = collisionTemplate.m_float18 < 0.0f;
+
+    *out = hfe::Mat4::getIdentity();
+    const hfe::Vec3& offset = collisionTemplate.m_collisionOffset;             // +0x0C
+    if (flipped)
+    {
+        out->m[12] = offset.x + out->m[12];
+        out->m[13] = offset.y + out->m[13];
+        out->m[14] = offset.z + out->m[14];
+    }
+    else
+    {
+        out->m[12] = offset.x + out->m[12];
+        out->m[13] = offset.y + out->m[13];
+        out->m[14] = -offset.z + out->m[14];
+    }
+
+    hfe::Mat4 rotation = hfe::Mat4::getIdentity();
+    if (flipped)
+        hfe::setRotateXDeg(rotation, -90.0f);
+    else
+        hfe::setRotateXDeg(rotation, 90.0f);
+
+    {
+        hfe::Mat4 copy = *out;
+        out->mult(copy, rotation);
+    }
+    {
+        hfe::Mat4 copy = *out;
+        out->mult(copy, boneTransform);
+    }
+    {
+        hfe::Mat4 copy = *out;
+        out->mult(copy, transformation);
+    }
+}
+
+bool checkRayVsBoneList(const Skeleton::BoneTemplate* boneTemplates,
+                        int skeletonBoneCount,
+                        const hfe::Mat4* liveTransforms,
+                        const int* boneIndices,
+                        int indexCount,
+                        const hfe::Mat4* overrideTransforms,
+                        hfe::Vec3* hitPosition,
+                        hfe::Vec3* hitNormal,
+                        int* hitPart,
+                        int* hitBone,
+                        float* fraction,
+                        const hfe::Vec3& start,
+                        const hfe::Vec3& end,
+                        const hfe::Mat4& transformation)
+{
+    if (!boneTemplates || !boneIndices || indexCount <= 0
+        || (!overrideTransforms && !liveTransforms))
         return false;
 
     const int closestMode = hfe::world::LatencyCompensation::getClosestBoneMode();
@@ -440,19 +490,20 @@ bool Skeleton::checkRayVsSkeleton(hfe::Vec3* hitPosition, hfe::Vec3* hitNormal,
     hfe::Vec3 bestPoint = {};
     hfe::Mat4 bestTransform = hfe::Mat4::getIdentity();
     int bestBoneIndex = 0;
-    BoneTemplate* bestTemplate = 0;
+    const Skeleton::BoneTemplate* bestTemplate = 0;
 
-    for (unsigned int i = 0; i < m_vector24.size(); ++i)
+    for (int i = 0; i < indexCount; ++i)
     {
         hfe::Vec3 candPoints[2] = {};
         float candTimes[2];
         hfe::Mat4 candTransform = hfe::Mat4::getIdentity();
-        const int candBoneIndex = m_vector24[i];
-        if (candBoneIndex < 0 || candBoneIndex >= m_boneCount)
+        const int candBoneIndex = boneIndices[i];
+        if (candBoneIndex < 0 || candBoneIndex >= skeletonBoneCount)
             continue;
-        BoneTemplate* const candTemplate = &m_boneTemplates[candBoneIndex];
-        getCollisionBoneTransform(
-            &candTransform, transformation, candBoneIndex, m_bones[candBoneIndex]);
+        const Skeleton::BoneTemplate* const candTemplate = &boneTemplates[candBoneIndex];
+        const hfe::Mat4& localBone =
+            overrideTransforms ? overrideTransforms[i] : liveTransforms[candBoneIndex];
+        buildCollisionBoneTransform(&candTransform, *candTemplate, localBone, transformation);
 
         const float capsuleLength = fabsf(candTemplate->m_float18);
         hfe::Vec3 capsuleAxis;
@@ -586,10 +637,16 @@ bool Skeleton::checkRayVsSkeleton(hfe::Vec3* hitPosition, hfe::Vec3* hitNormal,
     return true;
 }
 
-// [CHOSEN, not recovered] Side-effect-free ray-vs-skeleton probe for Shadow A/B & miss distance.
-void Skeleton::probeRayVsSkeleton(const hfe::Vec3& start, const hfe::Vec3& end,
-                                  const hfe::Mat4& transformation,
-                                  RaySkeletonProbe& out) const
+void probeRayVsBoneList(const Skeleton::BoneTemplate* boneTemplates,
+                        int skeletonBoneCount,
+                        const hfe::Mat4* liveTransforms,
+                        const int* boneIndices,
+                        int indexCount,
+                        const hfe::Mat4* overrideTransforms,
+                        const hfe::Vec3& start,
+                        const hfe::Vec3& end,
+                        const hfe::Mat4& transformation,
+                        RaySkeletonProbe& out)
 {
     out.hitClosest = false;
     out.closestBone = -1;
@@ -603,7 +660,8 @@ void Skeleton::probeRayVsSkeleton(const hfe::Vec3& start, const hfe::Vec3& end,
     out.nearestBone = -1;
     out.nearestPart = 0;
 
-    if (!m_boneTemplates || !m_bones)
+    if (!boneTemplates || !boneIndices || indexCount <= 0
+        || (!overrideTransforms && !liveTransforms))
         return;
 
     const int closestMode = hfe::world::LatencyCompensation::getClosestBoneMode();
@@ -613,15 +671,16 @@ void Skeleton::probeRayVsSkeleton(const hfe::Vec3& start, const hfe::Vec3& end,
     rayAxis.z = end.z - start.z;
 
     int bestClosestPrio = -1;
-    for (unsigned int i = 0; i < m_vector24.size(); ++i)
+    for (int i = 0; i < indexCount; ++i)
     {
-        const int candBoneIndex = m_vector24[i];
-        if (candBoneIndex < 0 || candBoneIndex >= m_boneCount)
+        const int candBoneIndex = boneIndices[i];
+        if (candBoneIndex < 0 || candBoneIndex >= skeletonBoneCount)
             continue;
-        const BoneTemplate* const candTemplate = &m_boneTemplates[candBoneIndex];
+        const Skeleton::BoneTemplate* const candTemplate = &boneTemplates[candBoneIndex];
         hfe::Mat4 candTransform = hfe::Mat4::getIdentity();
-        getCollisionBoneTransform(
-            &candTransform, transformation, candBoneIndex, m_bones[candBoneIndex]);
+        const hfe::Mat4& localBone =
+            overrideTransforms ? overrideTransforms[i] : liveTransforms[candBoneIndex];
+        buildCollisionBoneTransform(&candTransform, *candTemplate, localBone, transformation);
 
         const float capsuleLength = fabsf(candTemplate->m_float18);
         hfe::Vec3 capsuleAxis;
@@ -702,6 +761,106 @@ void Skeleton::probeRayVsSkeleton(const hfe::Vec3& start, const hfe::Vec3& end,
                 }
             }
         }
+    }
+}
+} // namespace
+
+// Tests a ray against the skeleton's collision bones and writes hit information when found.
+
+bool Skeleton::checkRayVsSkeleton(hfe::Vec3* hitPosition, hfe::Vec3* hitNormal,
+                                  int* hitPart, int* hitBone, float* fraction,
+                                  const hfe::Vec3& start, const hfe::Vec3& end,
+                                  const hfe::Mat4& transformation)
+{
+    if (!m_boneTemplates || !m_bones || m_vector24.empty())
+        return false;
+    return checkRayVsBoneList(
+        m_boneTemplates, m_boneCount, m_transforms,
+        &m_vector24[0], static_cast<int>(m_vector24.size()), 0,
+        hitPosition, hitNormal, hitPart, hitBone, fraction, start, end, transformation);
+}
+
+bool Skeleton::checkRayVsHistoricalPose(hfe::Vec3* hitPosition, hfe::Vec3* hitNormal,
+                                        int* hitPart, int* hitBone, float* fraction,
+                                        const hfe::Vec3& start, const hfe::Vec3& end,
+                                        const hfe::Mat4& transformation,
+                                        const HistoricalBonePose& pose) const
+{
+    const int count =
+        pose.boneCount > kMaxHistoricalCollisionBones ? kMaxHistoricalCollisionBones : pose.boneCount;
+    return checkRayVsBoneList(
+        m_boneTemplates, m_boneCount, 0,
+        pose.boneIndices, count, pose.boneTransforms,
+        hitPosition, hitNormal, hitPart, hitBone, fraction, start, end, transformation);
+}
+
+// [CHOSEN, not recovered] Side-effect-free ray-vs-skeleton probe for Shadow A/B & miss distance.
+void Skeleton::probeRayVsSkeleton(const hfe::Vec3& start, const hfe::Vec3& end,
+                                  const hfe::Mat4& transformation,
+                                  RaySkeletonProbe& out) const
+{
+    probeRayVsBoneList(
+        m_boneTemplates, m_boneCount, m_transforms,
+        m_vector24.empty() ? 0 : &m_vector24[0], static_cast<int>(m_vector24.size()), 0,
+        start, end, transformation, out);
+}
+
+void Skeleton::probeRayVsHistoricalPose(const hfe::Vec3& start, const hfe::Vec3& end,
+                                        const hfe::Mat4& transformation,
+                                        const HistoricalBonePose& pose,
+                                        RaySkeletonProbe& out) const
+{
+    const int count =
+        pose.boneCount > kMaxHistoricalCollisionBones ? kMaxHistoricalCollisionBones : pose.boneCount;
+    probeRayVsBoneList(
+        m_boneTemplates, m_boneCount, 0,
+        pose.boneIndices, count, pose.boneTransforms,
+        start, end, transformation, out);
+}
+
+void Skeleton::computePoseBoneShifts(const HistoricalBonePose& pose,
+                                     float& outHeadShiftM,
+                                     float& outMaxBoneShiftM) const
+{
+    outHeadShiftM = 0.0f;
+    outMaxBoneShiftM = 0.0f;
+    if (!m_boneTemplates || !m_transforms || pose.boneCount <= 0)
+        return;
+
+    const int count =
+        pose.boneCount > kMaxHistoricalCollisionBones ? kMaxHistoricalCollisionBones : pose.boneCount;
+    const hfe::Mat4 identity = hfe::Mat4::getIdentity();
+
+    for (int i = 0; i < count; ++i)
+    {
+        const int candBoneIndex = pose.boneIndices[i];
+        if (candBoneIndex < 0 || candBoneIndex >= m_boneCount)
+            continue;
+        const BoneTemplate& tmpl = m_boneTemplates[candBoneIndex];
+        const float halfLen = 0.5f * fabsf(tmpl.m_float18);
+
+        hfe::Mat4 histMat = hfe::Mat4::getIdentity();
+        hfe::Mat4 liveMat = hfe::Mat4::getIdentity();
+        buildCollisionBoneTransform(&histMat, tmpl, pose.boneTransforms[i], identity);
+        buildCollisionBoneTransform(&liveMat, tmpl, m_transforms[candBoneIndex], identity);
+
+        const float hx = histMat.m[12] + histMat.m[8] * halfLen;
+        const float hy = histMat.m[13] + histMat.m[9] * halfLen;
+        const float hz = histMat.m[14] + histMat.m[10] * halfLen;
+
+        const float lx = liveMat.m[12] + liveMat.m[8] * halfLen;
+        const float ly = liveMat.m[13] + liveMat.m[9] * halfLen;
+        const float lz = liveMat.m[14] + liveMat.m[10] * halfLen;
+
+        const float dx = hx - lx;
+        const float dy = hy - ly;
+        const float dz = hz - lz;
+        const float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+
+        if (dist > outMaxBoneShiftM)
+            outMaxBoneShiftM = dist;
+        if (tmpl.m_dword20 == 25 && dist > outHeadShiftM)
+            outHeadShiftM = dist;
     }
 }
 
@@ -1491,43 +1650,9 @@ void Skeleton::getCollisionBoneTransform(hfe::Mat4* out, const hfe::Mat4& transf
                                          int boneIndex, const Bone& /*bone*/) const
 {
     const BoneTemplate& collisionTemplate = m_boneTemplates[boneIndex];        // +0x08 each
-    const bool flipped = collisionTemplate.m_float18 < 0.0f;
-
-    *out = hfe::Mat4::getIdentity();
-    const hfe::Vec3& offset = collisionTemplate.m_collisionOffset;             // +0x0C
-    if (flipped)
-    {
-        out->m[12] = offset.x + out->m[12];
-        out->m[13] = offset.y + out->m[13];
-        out->m[14] = offset.z + out->m[14];
-    }
-    else
-    {
-        out->m[12] = offset.x + out->m[12];
-        out->m[13] = offset.y + out->m[13];
-        out->m[14] = -offset.z + out->m[14];
-    }
-
-    hfe::Mat4 rotation = hfe::Mat4::getIdentity();
-    if (flipped)
-        hfe::setRotateXDeg(rotation, -90.0f);
-    else
-        hfe::setRotateXDeg(rotation, 90.0f);
-
-    {
-        hfe::Mat4 copy = *out;
-        out->mult(copy, rotation);
-    }
-    {
-        const hfe::Mat4& boneTransform = (boneIndex < 0) ? hfe::Mat4::getIdentity()
-                                                         : m_transforms[boneIndex];     // +0x10
-        hfe::Mat4 copy = *out;
-        out->mult(copy, boneTransform);
-    }
-    {
-        hfe::Mat4 copy = *out;
-        out->mult(copy, transformation);
-    }
+    const hfe::Mat4& boneTransform = (boneIndex < 0) ? hfe::Mat4::getIdentity()
+                                                     : m_transforms[boneIndex];     // +0x10
+    buildCollisionBoneTransform(out, collisionTemplate, boneTransform, transformation);
 }
 
 

@@ -194,11 +194,14 @@ bool LatencyCompensation::isDebugLogEnabled() { return false; }
 bool LatencyCompensation::isQueueDelayEnabled() { return false; }
 bool LatencyCompensation::isSnapshotProjectileEnabled() { return false; }
 bool LatencyCompensation::isUseClientWindowEnabled() { return false; }
+bool LatencyCompensation::isBoneHistoryEnabled() { return false; }
 float LatencyCompensation::getPingFactor() { return 0.5f; }
 float LatencyCompensation::getDefaultLatency() { return 0.05f; }
 float LatencyCompensation::getDebugLatency() { return -1.0f; }
 int LatencyCompensation::getMaxClientInterpMs() { return 133; }
 int LatencyCompensation::getMaxQueueTicks() { return 4; }
+int LatencyCompensation::getQueueDelayMinInterpMs() { return 100; }
+float LatencyCompensation::computeEffectiveQueueDelay(unsigned int, float q) { return q; }
 unsigned int LatencyCompensation::clampClientInterpolationTime(unsigned int ms) { return ms; }
 float LatencyCompensation::getBroadphaseSoldierSpeedFloor() { return 0.0f; }
 void LatencyCompensation::notePlayerActionArrival(const IPlayer*, int, int) {}
@@ -220,7 +223,8 @@ void HitregTelemetry::forgetProjectile(const IObject*) {}
 void HitregTelemetry::recordSoldierProbe(IObject*, IPlayer*, IObject*, const SoldierPhysicsNode*,
                                          const anim::Skeleton*, const Vec3&, const Vec3&,
                                          float, int, const Mat4&, bool, int, int, const Vec3&,
-                                         bool, float, bool) {}
+                                         bool, float, bool,
+                                         bool, const anim::HistoricalBonePose*) {}
 void HitregTelemetry::noteProjectileContactDelivered(const IObject*, IObject*, float, int) {}
 void HitregTelemetry::noteProjectileDamageCalc(const IObject*, int, int, float, float, float) {}
 void HitregTelemetry::noteServerGiveDamage(const IObject*, float, float, float, bool) {}
@@ -254,9 +258,30 @@ bool Skeleton::checkRayVsSkeleton(hfe::Vec3*, hfe::Vec3*, int*, int*, float*,
     return false;
 }
 
+bool Skeleton::checkRayVsHistoricalPose(hfe::Vec3*, hfe::Vec3*, int*, int*, float*,
+                                        const hfe::Vec3&, const hfe::Vec3&,
+                                        const hfe::Mat4&,
+                                        const HistoricalBonePose&) const
+{
+    return false;
+}
+
 void Skeleton::probeRayVsSkeleton(const hfe::Vec3&, const hfe::Vec3&,
                                   const hfe::Mat4&, RaySkeletonProbe&) const
 {
+}
+
+void Skeleton::probeRayVsHistoricalPose(const hfe::Vec3&, const hfe::Vec3&,
+                                        const hfe::Mat4&,
+                                        const HistoricalBonePose&,
+                                        RaySkeletonProbe&) const
+{
+}
+
+void Skeleton::computePoseBoneShifts(const HistoricalBonePose&, float& outHead, float& outMax) const
+{
+    outHead = 0.0f;
+    outMax = 0.0f;
 }
 
 const char* Skeleton::getBoneNameSafe(int) const

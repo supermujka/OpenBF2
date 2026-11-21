@@ -26,6 +26,7 @@ public:
     static bool isClosestBoneEnabled();
     static int getClosestBoneMode();
     static bool isSpawnRingFixEnabled();
+    static bool isBoneHistoryEnabled();
     static bool isDebugLogEnabled();
     static bool isQueueDelayEnabled();
     static bool isSnapshotProjectileEnabled();
@@ -35,6 +36,8 @@ public:
     static float getDebugLatency();
     static int getMaxClientInterpMs();
     static int getMaxQueueTicks();
+    static int getQueueDelayMinInterpMs();
+    static float computeEffectiveQueueDelay(unsigned int rawInterpMs, float rawQueueDelaySec);
     static unsigned int clampClientInterpolationTime(unsigned int ms);
     static float getBroadphaseSoldierSpeedFloor();
     static void notePlayerActionArrival(const IPlayer* player, int inputIndex, int serverTick);

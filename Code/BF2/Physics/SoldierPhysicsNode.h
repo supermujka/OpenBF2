@@ -10,6 +10,9 @@
 #include "../Math/Quat.h"
 
 namespace dice {
+namespace anim {
+struct HistoricalBonePose;
+}
 namespace hfe {
 namespace world {
 
@@ -69,6 +72,8 @@ public:
                                 Mat4& outTransform, int* outPose,
                                 int* outValidSamples, int* outTicksSinceReseed,
                                 bool* outVanillaUnfilled = 0) const;
+    // [CHOSEN, not recovered] Hitreg V2: samples & interpolates historical collision-bone transforms.
+    bool sampleHistoricalBonePose(float latency, anim::HistoricalBonePose& outPose) const;
     void setCollidingMeshTangentSpeed(const Vec3&);
     void getCollidingMeshTangentSpeed(Vec3& out);
     void printDebug() const;                                 // empty

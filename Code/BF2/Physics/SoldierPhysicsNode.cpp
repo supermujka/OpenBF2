@@ -6,7 +6,9 @@
 #include <unordered_map>
 
 #include "BasicPhysicsSystem.h"
+#include "HitregTelemetry.h"
 #include "LatencyCompensation.h"
+#include "../Animation/BoneAnimation/Skeleton.h"
 #include "../Core/Ids.h"
 #include "../Core/System.h"                // [CHOSEN, not recovered] WorldPref::getTickCount for spawn age
 #include "../Game/Utility/Vars.h"          // the three tuning vars updatePositionalPhysics reads
@@ -32,13 +34,100 @@ static const float EPS = 0.000001f;
 namespace {
 // [CHOSEN, not recovered] Tracks valid samples & reseed tick so spawn/vehicle-exit rewinds never
 // blend toward (0,0,0) and telemetry can measure time since spawn and shadow-simulate unfilled slots.
+struct BoneSample
+{
+    Vec3 pos;
+    Quat rot;
+};
+
+struct BoneRingFrame
+{
+    bool       valid;
+    int        boneCount;
+    int        boneIndices[anim::kMaxHistoricalCollisionBones];
+    BoneSample bones[anim::kMaxHistoricalCollisionBones];
+    BoneRingFrame() : valid(false), boneCount(0) {}
+};
+
 struct SoldierLatencyMeta
 {
-    int validSamples;
-    int reseedTick;
-    bool fromZeroReset;
+    int           validSamples;
+    int           reseedTick;
+    bool          fromZeroReset;
+    BoneRingFrame boneFrames[16];
     SoldierLatencyMeta() : validSamples(0), reseedTick(0), fromZeroReset(true) {}
 };
+
+void normalizeQuat(Quat& q)
+{
+    const float lenSq = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+    if (lenSq > 1e-8f)
+    {
+        const float invLen = 1.0f / sqrtf(lenSq);
+        q.x *= invLen;
+        q.y *= invLen;
+        q.z *= invLen;
+        q.w *= invLen;
+    }
+    else
+    {
+        q.x = 0.0f;
+        q.y = 0.0f;
+        q.z = 0.0f;
+        q.w = 1.0f;
+    }
+}
+
+void captureBoneFrame(Soldier* soldier, unsigned char pose, BoneRingFrame& outFrame)
+{
+    outFrame.valid = false;
+    outFrame.boneCount = 0;
+    if (!soldier)
+        return;
+
+    anim::Skeleton* const skel = soldier->getCollisionSkeleton(static_cast<int>(pose));
+    if (!skel || !skel->m_boneTemplates || !skel->m_transforms
+        || skel->m_boneCount <= 0 || skel->m_vector24.empty())
+        return;
+
+    int count = 0;
+    const std::size_t total = skel->m_vector24.size();
+    for (std::size_t i = 0; i < total && count < anim::kMaxHistoricalCollisionBones; ++i)
+    {
+        const int bIdx = skel->m_vector24[i];
+        if (bIdx < 0 || bIdx >= skel->m_boneCount)
+            continue;
+        const Mat4& bm = skel->m_transforms[bIdx];
+        outFrame.boneIndices[count] = bIdx;
+        outFrame.bones[count].pos.x = bm.m[12];
+        outFrame.bones[count].pos.y = bm.m[13];
+        outFrame.bones[count].pos.z = bm.m[14];
+        outFrame.bones[count].rot.fromMat(bm);
+        normalizeQuat(outFrame.bones[count].rot);
+        ++count;
+    }
+    outFrame.boneCount = count;
+    outFrame.valid = (count > 0);
+}
+
+void writeBoneTransform(const BoneSample& sample, Mat4& outMat)
+{
+    outMat = Mat4::getIdentity();
+    sample.rot.toMat(outMat);
+    outMat.m[12] = sample.pos.x;
+    outMat.m[13] = sample.pos.y;
+    outMat.m[14] = sample.pos.z;
+}
+
+void boneFrameToPose(const BoneRingFrame& frame, anim::HistoricalBonePose& outPose)
+{
+    outPose.boneCount = frame.boneCount;
+    for (int i = 0; i < frame.boneCount; ++i)
+    {
+        outPose.boneIndices[i] = frame.boneIndices[i];
+        writeBoneTransform(frame.bones[i], outPose.boneTransforms[i]);
+    }
+}
 
 std::unordered_map<const SoldierPhysicsNode*, SoldierLatencyMeta>& soldierLatencyMeta()
 {
@@ -466,6 +555,12 @@ void SoldierPhysicsNode::updateLatencyState()
     const unsigned char pose = static_cast<unsigned char>(
         static_cast<Soldier*>(m_object)->getPose());                       // Soldier +0x278
 
+    const bool wantBones = m_object
+        && (LatencyCompensation::isBoneHistoryEnabled() || HitregTelemetry::isEnabled());
+    BoneRingFrame boneFrame;
+    if (wantBones)
+        captureBoneFrame(static_cast<Soldier*>(m_object), pose, boneFrame);
+
     SoldierLatencyMeta& meta = soldierLatencyMeta()[this];
     const bool initialSeed = (meta.validSamples <= 0);
     bool teleported = false;
@@ -491,10 +586,13 @@ void SoldierPhysicsNode::updateLatencyState()
                 m_latency[i].rotation = rotation;
                 m_latency[i].pose = pose;
                 m_latency[i].pad[0] = m_latency[i].pad[1] = m_latency[i].pad[2] = 0;
+                meta.boneFrames[i] = boneFrame;
             }
             m_latencyIndex = 1;
             return;
         }
+        for (int i = 0; i < 16; ++i)
+            meta.boneFrames[i].valid = false;
     }
     else if (meta.validSamples < 16)
     {
@@ -507,6 +605,7 @@ void SoldierPhysicsNode::updateLatencyState()
     entry.position = position;
     entry.rotation = rotation;
     entry.pose = pose;
+    meta.boneFrames[m_latencyIndex] = boneFrame;
 
     ++m_latencyIndex;
     if (m_latencyIndex == 16)
@@ -689,6 +788,87 @@ void SoldierPhysicsNode::sampleLatencyTransform(float latency, bool simulateVani
 
     if (outPose)
         *outPose = olderPose;
+}
+
+bool SoldierPhysicsNode::sampleHistoricalBonePose(float latency,
+                                                  anim::HistoricalBonePose& outPose) const
+{
+    outPose.boneCount = 0;
+    const float samplePeriod = 0.033333335f;
+    if (!m_enabled || !m_latency || latency <= samplePeriod)
+        return false;
+
+    const std::unordered_map<const SoldierPhysicsNode*, SoldierLatencyMeta>& map =
+        soldierLatencyMeta();
+    std::unordered_map<const SoldierPhysicsNode*, SoldierLatencyMeta>::const_iterator it =
+        map.find(this);
+    if (it == map.end() || it->second.validSamples <= 0)
+        return false;
+
+    float integralSamples = 0.0f;
+    const float fractionalSamples = modff(latency / samplePeriod, &integralSamples);
+    const float blend = 1.0f - fractionalSamples;
+
+    int sampleCount = static_cast<int>(integralSamples);
+    if (sampleCount >= 15)
+        sampleCount = 14;
+
+    int newerIndex = m_latencyIndex - sampleCount;
+    if (newerIndex < 0)
+        newerIndex += 16;
+    if (newerIndex >= 16)
+        newerIndex = 15;
+
+    int olderIndex = newerIndex - 1;
+    if (olderIndex < 0)
+        olderIndex = 15;
+
+    const BoneRingFrame& older = it->second.boneFrames[olderIndex];
+    const BoneRingFrame& newer = it->second.boneFrames[newerIndex];
+    if (!older.valid && !newer.valid)
+        return false;
+
+    if (older.valid && newer.valid && older.boneCount == newer.boneCount && older.boneCount > 0)
+    {
+        bool sameBones = true;
+        for (int k = 0; k < older.boneCount; ++k)
+        {
+            if (older.boneIndices[k] != newer.boneIndices[k])
+            {
+                sameBones = false;
+                break;
+            }
+        }
+        if (sameBones)
+        {
+            outPose.boneCount = older.boneCount;
+            for (int k = 0; k < older.boneCount; ++k)
+            {
+                BoneSample interp;
+                interp.pos.x = older.bones[k].pos.x
+                             + (newer.bones[k].pos.x - older.bones[k].pos.x) * blend;
+                interp.pos.y = older.bones[k].pos.y
+                             + (newer.bones[k].pos.y - older.bones[k].pos.y) * blend;
+                interp.pos.z = older.bones[k].pos.z
+                             + (newer.bones[k].pos.z - older.bones[k].pos.z) * blend;
+                interp.rot.x = 0.0f;
+                interp.rot.y = 0.0f;
+                interp.rot.z = 0.0f;
+                interp.rot.w = 1.0f;
+                interp.rot.slerp(older.bones[k].rot, newer.bones[k].rot, blend);
+                normalizeQuat(interp.rot);
+                outPose.boneIndices[k] = older.boneIndices[k];
+                writeBoneTransform(interp, outPose.boneTransforms[k]);
+            }
+            return true;
+        }
+    }
+
+    const BoneRingFrame& fallback = older.valid ? older : newer;
+    if (!fallback.valid || fallback.boneCount <= 0)
+        return false;
+    boneFrameToPose(fallback, outPose);
+    return true;
 }
 
 IPhysicsNode* SoldierPhysicsNode::getRootNode()
