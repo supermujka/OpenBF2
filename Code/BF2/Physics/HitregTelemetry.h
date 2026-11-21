@@ -4,6 +4,8 @@
 #ifndef PHYSICS_HITREGTELEMETRY_H
 #define PHYSICS_HITREGTELEMETRY_H
 
+#include "../Math/Vec3.h"  // Vec3 is a typedef (Math::Vec3), not a class
+
 namespace dice {
 namespace anim {
 class Skeleton;
@@ -11,7 +13,6 @@ class Skeleton;
 namespace hfe {
 
 struct Mat4;
-struct Vec3;
 
 namespace world {
 

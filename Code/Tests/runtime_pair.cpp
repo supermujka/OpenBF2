@@ -163,6 +163,7 @@ unsigned int Random::getRaw()
 // disarmed, so the counter only has to exist.
 namespace WorldPref {
 unsigned int mTickCount = 0;
+int getTickCount() { return static_cast<int>(mTickCount); }
 } // namespace WorldPref
 
 namespace world {

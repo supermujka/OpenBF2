@@ -1249,7 +1249,10 @@ void SoldierResponsePhysics::checkSoldierVsPoint(IObject* soldierObject,
 
         if (v1Hit || flyBy || coarseDist <= 2.0f)
         {
-            const bool targetInAir = !(m_byteFA || m_isFloating);
+            const SoldierResponsePhysics* const soldierResponse =
+                static_cast<const SoldierResponsePhysics*>(L::responsePhysics(soldierObject));
+            const bool targetInAir =
+                soldierResponse ? !(soldierResponse->m_byteFA || soldierResponse->m_isFloating) : false;
             HitregTelemetry::recordSoldierProbe(
                 projectileObject, owner, soldierObject,
                 static_cast<const SoldierPhysicsNode*>(soldierNode), skeleton,
