@@ -817,9 +817,12 @@ bool GameLogicCollision::serverHandleCollisionForProjectile(IObject* projectile,
 
             const float matMod = materials()->getDamageMod(materialA, materialB);
             const float damage = matMod * (angleTerm * baseDamage);                        // +0x58
-            if (HitregTelemetry::isEnabled())
+            if (HitregTelemetry::isEnabled() && hitObject && hitObject->getTemplate()
+                && hitObject->getTemplate()->getClassID() == CID_SoldierTemplate)
+            {
                 HitregTelemetry::noteProjectileDamageCalc(
                     projectile, materialA, materialB, baseDamage, matMod, angleTerm);
+            }
 
             if (damage > 0.0099999998f)
             {

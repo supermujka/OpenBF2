@@ -1139,7 +1139,8 @@ void GenericProjectile::activate()
         m_detonationComp->activate();
 
     m_dword1BC = WorldPref::getTickCount();
-    // [CHOSEN, not recovered] Snapshot fire-time rewind if owner is already bound at activate().
+    // [CHOSEN, not recovered] Reset any prior snapshot, then snapshot fire-time rewind if owner is bound.
+    LatencyCompensation::clearProjectileLatency(this);
     if (IPlayer* const owner = getPlayer())
         LatencyCompensation::snapshotProjectileLatency(this, owner);
     m_tick1C8 = -1000;
@@ -1833,14 +1834,11 @@ void GenericProjectile::setPlayer(IPlayer* player)
 {
     m_player = player ? player->getWeakPtr() : WeakPtr<IPlayer>();
     // [CHOSEN, not recovered] FireComp calls setPlayer() right after activate(); clear stale
-    // ObjectCache latency if owner becomes null.
-    if (m_isActive)
-    {
-        if (player)
-            LatencyCompensation::snapshotProjectileLatency(this, player);
-        else
-            LatencyCompensation::clearProjectileLatency(this);
-    }
+    // ObjectCache latency unconditionally if owner becomes null.
+    if (!player)
+        LatencyCompensation::clearProjectileLatency(this);
+    else if (m_isActive)
+        LatencyCompensation::snapshotProjectileLatency(this, player);
 }
 
 // getPlayer - 0x8282650, 23 B, the weak

@@ -67,7 +67,8 @@ public:
     // [CHOSEN, not recovered] Reentrant, side-effect-free historical transform sampler for telemetry.
     void sampleLatencyTransform(float latency, bool simulateVanillaUnfilled,
                                 Mat4& outTransform, int* outPose,
-                                int* outValidSamples, int* outTicksSinceReseed) const;
+                                int* outValidSamples, int* outTicksSinceReseed,
+                                bool* outVanillaUnfilled = 0) const;
     void setCollidingMeshTangentSpeed(const Vec3&);
     void getCollidingMeshTangentSpeed(Vec3& out);
     void printDebug() const;                                 // empty

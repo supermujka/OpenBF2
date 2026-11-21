@@ -12,7 +12,7 @@ Ovaj dokument opisuje implementaciju **Verzije 1** unapređenja hit detekcije i 
 | --- | --- | --- | --- |
 | 1 | **Stajaći input red (`33–100 ms` skrivenog laga):** Posle jitter-a ili packet loss-a, `ActionBuffer` trajno zadrži 1–3 akcije u redu, a `getLatency()` to kašnjenje ne računa. | Meri se tick dolaska svake mrežne akcije (`notePlayerActionArrival`) i stvarno dodatno čekanje u redu (`setPlayerActiveQueueDelay`), uz `-1` tick korekciju jer `ServerGameLogic::uPlaying` uveća `WorldPref::mTickCount` pre `simulatePlayersUpdate`. | [LatencyCompensation.cpp](../Code/BF2/Physics/LatencyCompensation.cpp), [PlayerActionManager.cpp](../Code/BF2/Game/Common/PlayerActionManager.cpp), [GameServer.cpp](../Code/BF2/Game/GameServer/GameServer.cpp) |
 | 2 | **Spawn / izlazak iz vozila („neuhvatljiv“ prvih ~150 ms):** `reset(true)` i `initLatencyCompensation()` pune ring bafer nulama `(0,0,0)` pa rewind vuče igrača ka centru mape. | Prvi validni tick (ili teleport > 3 m za vojnike / > 50 m za vozila) popunjava svih 16 slotova trenutnom pozicijom i rotacijom, i beleži tick reseed-a za telemetriju. | [SoldierPhysicsNode.cpp](../Code/BF2/Physics/SoldierPhysicsNode.cpp), [PhysicsNode.cpp](../Code/BF2/Physics/PhysicsNode.cpp) |
-| 3 | **Prva kapsula umesto najbliže (`Skeleton::checkRayVsSkeleton`):** Petlja radi `break;` na prvoj kapsuli po indeksu u `m_vector24` (npr. ruka ume da „ukrade“ headshot). | Prolazi sve kolizione kapsule i bira presek sa strogo najmanjim vremenom duž putanje zrake `t`. | [Skeleton.cpp](../Code/BF2/Animation/BoneAnimation/Skeleton.cpp) |
+| 3 | **Prva kapsula umesto najbliže (`Skeleton::checkRayVsSkeleton`):** Petlja radi `break;` na prvoj kapsuli po indeksu u `m_vector24` (npr. ruka ume da „ukrade“ headshot). | Prolazi sve kolizione kapsule i bira presek po `closestBone` modu (`1` = prioritet zone pogotka `glava (25) > telo (24) > udovi (77)` pa najmanje vreme `t`; `2` = strogo najmanje `t`). | [Skeleton.cpp](../Code/BF2/Animation/BoneAnimation/Skeleton.cpp) |
 | 4 | **Zamrzavanje kašnjenja u trenutku pucanja:** Rewind se u retail BF2 ponovo računa tokom svakog tick-a leta metka. | Zamrzava ukupno kašnjenje (`ping * pingFactor + interp + queueDelay`, limitirano sa `phy-latencyComp-max`) na projektilu; čisti se u `resetProjectile()`, destruktoru i pri `setPlayer(0)` (zaštita od `ObjectCache` recikliranja). | [GenericProjectile.cpp](../Code/BF2/Game/Objects/Projectiles/GenericProjectile.cpp), [SoldierResponse.cpp](../Code/BF2/Physics/SoldierResponse.cpp), [PointResponsePhysics.cpp](../Code/BF2/Physics/PointResponsePhysics.cpp), [ResponsePhysicsManager.cpp](../Code/BF2/Physics/ResponsePhysicsManager.cpp), [GameLogicExplosion.cpp](../Code/BF2/Game/GameLogic/GameLogicExplosion.cpp) |
 | 5 | **Server-side limit za `interpolationTime`:** Klijent šalje 9 bita (`0–511 ms`); moguć backtrack exploit. | Ograničenje `phy-latencyComp-maxClientInterpMs` (default `133 ms`) primenjuje se u `LatencyCompensation::getLatency()`, dok `Player::setInterpolationTime()` čuva sirovu `0..512 ms` vrednost za telemetriju i trenutno reagovanje na cvar promene. | [Player.cpp](../Code/BF2/Game/GameLogic/Player.cpp), [LatencyCompensation.cpp](../Code/BF2/Physics/LatencyCompensation.cpp) |
 | 6 | **Broadphase nestajanje vojnika pri stajanju:** Kad vojnik naglo stane (`speed ≈ 0`), `latencyDistance` padne na `0`. | Donji prag brzine `phy-latencyComp-broadphaseFloor` (default `8.0 m/s`) za vojnike u `latencyBroadphaseRadius`. | [ObjectManager.cpp](../Code/BF2/Scene/Object/ObjectManager.cpp) |
@@ -25,23 +25,24 @@ Ovaj dokument opisuje implementaciju **Verzije 1** unapređenja hit detekcije i 
 ### Lag kompenzacija & Hitreg (`LatencyCompensation.cpp`)
 | CVar | Default | Opis |
 | --- | --- | --- |
-| `phy-latencyComp-improved` | `1` | Glavni prekidač za sve Verzija 1 izmene (`0` = 100% originalni BF2 1.50). |
+| `phy-latencyComp-improved` | `1` | Glavni prekidač za sve V1.1 izmene (`0` = 100% originalni BF2 1.50, uključujući `pf=0.5`, `max=0.30` i `closestBone=0`). |
 | `phy-latencyComp-maxClientInterpMs` | `133` | Maksimalni dozvoljeni klijentov `interpolationTime` na serveru (ms). |
 | `phy-latencyComp-queueDelay` | `1` | Kompenzacija čekanja u `ActionBuffer` redu (`0/1`). |
 | `phy-latencyComp-maxQueueTicks` | `4` | Maksimalno dodatno kašnjenje iz reda koje se kompenzuje (u 30 Hz tick-ovima). |
 | `phy-latencyComp-snapshotProjectile` | `1` | Zamrzava izračunati rewind na projektilu u trenutku ispaljivanja (`0/1`). |
-| `phy-latencyComp-closestBone` | `1` | Bira najbližu kapsulu duž zrake umesto prve u nizu (`0/1`). |
+| `phy-latencyComp-closestBone` | `1` | `0` = vanilla prva kapsula; `1` = V1.1 prioritet zone (`glava > telo > udovi`, pa najbliže `t`); `2` = strogo najbliža kapsula po `t`. |
 | `phy-latencyComp-spawnRingFix` | `1` | Sprečava rewind ka `(0,0,0)` neposredno posle spawn-a / izlaska iz vozila (`0/1`). |
 | `phy-latencyComp-broadphaseFloor` | `8.0` | Minimalna brzina (m/s) za širenje broadphase sfere vojnika. |
 | `phy-latencyComp-debugLog` | `0` | Kada je `1`, ispisuje kratki `[HITREG]` red na `stderr`. |
-| `phy-latencyComp-pingFactor` *(postojeći)* | `0.5` | Faktor množenja pinga (telemetrija automatski testira `0.0 / 0.5 / 0.75 / 1.0`). |
-| `phy-latencyComp-max` *(postojeći)* | `0.3` | Gornji limit rewind-a u sekundama (`0.18`–`0.20` preporučeno za 5v5). |
+| `phy-latencyComp-pingFactor` *(postojeći)* | `1.0` *(V1.1)* | Faktor množenja pinga (`1.0` kad je `improved=1`; automatski se vraća na `0.5` kad je `improved=0`). |
+| `phy-latencyComp-max` *(postojeći)* | `0.35` *(V1.1)* | Gornji limit rewind-a u sekundama (`0.35` kad je `improved=1`; vraća se na `0.30` kad je `improved=0`). |
 
 ### Telemetrija (`HitregTelemetry.cpp`)
 | CVar | Default | Opis |
 | --- | --- | --- |
 | `phy-latencyComp-telemetry` | `0` | `0` = ugašeno (nula troška); `1` = `CONFIG + PROBE + DELIVER + DAMAGE`; `2` = sve + svaki `FIRE` (preporučeno za test u dvoje). |
 | `phy-latencyComp-telemetryFile` | `"openbf2_hitreg.csv"` | Ime/putanja izlaznog CSV fajla (u radnom direktorijumu servera). |
+| `phy-latencyComp-telemetrySplitMatches` | `1` | Automatski rotira CSV po meču/rundi (`<stem>_YYYYMMDD_HHMMSS_<mapa>_mN.csv`). |
 | `phy-latencyComp-telemetryFlushTicks` | `30` | Na koliko tick-ova (`30` ≈ 1 s) se bafer prazni na disk. |
 
 ---
@@ -117,6 +118,17 @@ Preduslov: **Visual Studio 2022 Community** (besplatan) sa paketom **Desktop dev
    ```
    To odmah zatvara i snima ceo **`openbf2_hitreg.csv`** fajl u `D:\Games\Battlefield 2\openbf2_hitreg.csv` (bez potrebe da gasiš server).
 4. Pošalji mi **`openbf2_hitreg.csv`** — na osnovu njega ćemo odmah izračunati:
-   - koliko je tačno pogodaka i headshot-ova V1 spasao u odnosu na Vanilla BF2 (`v1_hit` vs `van_hit`),
+   - koliko je tačno pogodaka i headshot-ova V1.1 spasao u odnosu na Vanilla BF2 (`v1_hit` vs `van_hit`),
    - koja vrednost `phy-latencyComp-pingFactor` (`0.5` vs `0.75` vs `1.0`) daje najmanju grešku u metrima (`*_miss_m`),
    - koliki % promašaja dolazi od skakanja/animacije (`tgt_in_air`, `tgt_pose_diff`) za **Verziju 2** (čuvanje kompletnih kostiju skeleta u istoriji).
+
+---
+
+## 4. Predlog opisa servera (`serversettings.con`)
+
+Za javni ili testni server built iz ovog OpenBF2 forka (`feat/hitreg` V1.1), možeš ubaciti u `serversettings.con`:
+
+```text
+sv.serverName "OpenBF2 | Enhanced Hitreg v1.1 (github.com/supermujka/OpenBF2)"
+sv.welcomeMessage "Server built from OpenBF2 (github.com/supermujka/OpenBF2, branch feat/hitreg v1.1): improved lag compensation, input-queue delay compensation, fire-time latency snapshot, spawn-ring fix, and hit-zone priority arbitration. Vanilla BF2 1.50 clients supported!"
+```

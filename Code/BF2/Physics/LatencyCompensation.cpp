@@ -76,12 +76,14 @@ std::unordered_map<const IObject*, float>& projectileLatencies()
 }
 
 const float kServerTickPeriod = 0.033333335f;
+const float kRetailPingFactor = 0.5f;
+const float kRetailMaxLatency = 0.3f;
 }
 
 // one load of the cvar handle registered at static init, then its float.
 float LatencyCompensation::getMaxLatency()
 {
-    return *g_maxLatency;
+    return (*g_improved != 0) ? *g_maxLatency : kRetailMaxLatency;
 }
 
 // Returns local input delay plus optional render-ahead delay; null/remote players return zero.
@@ -115,8 +117,9 @@ float LatencyCompensation::convertLatency(float latency)
         return 0.0f;
 
     latency += *g_defaultLatency;
-    if (latency > *g_maxLatency)
-        return *g_maxLatency;
+    const float maxLat = getMaxLatency();
+    if (latency > maxLat)
+        return maxLat;
     return latency;
 }
 
@@ -134,7 +137,7 @@ float LatencyCompensation::getLatency(IPlayer* player)
 
         if (player->getIsRemote())
         {
-            latency = static_cast<float>(player->getPing()) * *g_pingFactor * 0.001f;
+            latency = static_cast<float>(player->getPing()) * getPingFactor() * 0.001f;
             if (*g_useClientWindow)
             {
                 const unsigned int interpMs =
@@ -150,8 +153,9 @@ float LatencyCompensation::getLatency(IPlayer* player)
         }
     }
 
-    if (latency > *g_maxLatency)
-        return *g_maxLatency;
+    const float maxLat = getMaxLatency();
+    if (latency > maxLat)
+        return maxLat;
     return latency;
 }
 
@@ -198,7 +202,7 @@ bool LatencyCompensation::isUseClientWindowEnabled()
 
 float LatencyCompensation::getPingFactor()
 {
-    return *g_pingFactor;
+    return (*g_improved != 0) ? *g_pingFactor : kRetailPingFactor;
 }
 
 float LatencyCompensation::getDefaultLatency()
@@ -338,21 +342,20 @@ void LatencyCompensation::snapshotProjectileLatency(const IObject* projectileObj
     if (!projectileObject)
         return;
 
-    if (!owner)
+    if (!owner || !m_isEnabled || *g_improved == 0 || *g_snapshotProjectile == 0
+        || *g_debugLatency > 0.0f)
     {
         clearProjectileLatency(projectileObject);
         return;
     }
 
-    if (!m_isEnabled || *g_improved == 0 || *g_snapshotProjectile == 0)
-        return;
-
+    const float maxLat = getMaxLatency();
     float latency = getLatency(owner);
-    if (*g_debugLatency <= 0.0f && owner->getIsRemote() && *g_useQueueDelay != 0)
+    if (owner->getIsRemote() && *g_useQueueDelay != 0)
     {
         latency += getPlayerQueueDelay(owner);
-        if (latency > *g_maxLatency)
-            latency = *g_maxLatency;
+        if (latency > maxLat)
+            latency = maxLat;
     }
     projectileLatencies()[projectileObject] = latency;
 }
@@ -374,20 +377,21 @@ float LatencyCompensation::getProjectileLatency(const IObject* projectileObject,
     if (*g_improved == 0)
         return getLatency(owner);
 
+    const float maxLat = getMaxLatency();
     if (*g_snapshotProjectile != 0 && projectileObject)
     {
         const std::unordered_map<const IObject*, float>& map = projectileLatencies();
         std::unordered_map<const IObject*, float>::const_iterator it = map.find(projectileObject);
         if (it != map.end())
-            return it->second;
+            return it->second > maxLat ? maxLat : it->second;
     }
 
     float latency = getLatency(owner);
     if (*g_useQueueDelay != 0 && owner->getIsRemote())
     {
         latency += getPlayerQueueDelay(owner);
-        if (latency > *g_maxLatency)
-            latency = *g_maxLatency;
+        if (latency > maxLat)
+            latency = maxLat;
     }
     return latency;
 }

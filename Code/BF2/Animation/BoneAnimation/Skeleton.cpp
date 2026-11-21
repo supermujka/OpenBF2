@@ -425,6 +425,9 @@ bool Skeleton::checkRayVsSkeleton(hfe::Vec3* hitPosition, hfe::Vec3* hitNormal,
                                   const hfe::Vec3& start, const hfe::Vec3& end,
                                   const hfe::Mat4& transformation)
 {
+    if (!m_boneTemplates || !m_bones)
+        return false;
+
     const int closestMode = hfe::world::LatencyCompensation::getClosestBoneMode();
     hfe::Vec3 rayAxis;
     rayAxis.x = end.x - start.x;
@@ -445,6 +448,8 @@ bool Skeleton::checkRayVsSkeleton(hfe::Vec3* hitPosition, hfe::Vec3* hitNormal,
         float candTimes[2];
         hfe::Mat4 candTransform = hfe::Mat4::getIdentity();
         const int candBoneIndex = m_vector24[i];
+        if (candBoneIndex < 0 || candBoneIndex >= m_boneCount)
+            continue;
         BoneTemplate* const candTemplate = &m_boneTemplates[candBoneIndex];
         getCollisionBoneTransform(
             &candTransform, transformation, candBoneIndex, m_bones[candBoneIndex]);
@@ -498,7 +503,7 @@ bool Skeleton::checkRayVsSkeleton(hfe::Vec3* hitPosition, hfe::Vec3* hitNormal,
             bestBoneIndex = candBoneIndex;
             bestTemplate = candTemplate;
 
-            if (closestMode == 0)
+            if (closestMode <= 0)
                 break;
         }
     }
@@ -598,6 +603,10 @@ void Skeleton::probeRayVsSkeleton(const hfe::Vec3& start, const hfe::Vec3& end,
     out.nearestBone = -1;
     out.nearestPart = 0;
 
+    if (!m_boneTemplates || !m_bones)
+        return;
+
+    const int closestMode = hfe::world::LatencyCompensation::getClosestBoneMode();
     hfe::Vec3 rayAxis;
     rayAxis.x = end.x - start.x;
     rayAxis.y = end.y - start.y;
@@ -607,6 +616,8 @@ void Skeleton::probeRayVsSkeleton(const hfe::Vec3& start, const hfe::Vec3& end,
     for (unsigned int i = 0; i < m_vector24.size(); ++i)
     {
         const int candBoneIndex = m_vector24[i];
+        if (candBoneIndex < 0 || candBoneIndex >= m_boneCount)
+            continue;
         const BoneTemplate* const candTemplate = &m_boneTemplates[candBoneIndex];
         hfe::Mat4 candTransform = hfe::Mat4::getIdentity();
         getCollisionBoneTransform(
@@ -665,8 +676,23 @@ void Skeleton::probeRayVsSkeleton(const hfe::Vec3& start, const hfe::Vec3& end,
                     out.firstPart = candTemplate->m_dword20;
                     out.firstT = candTime;
                 }
-                if (!out.hitClosest || candPrio > bestClosestPrio
-                    || (candPrio == bestClosestPrio && candTime < out.closestT))
+                bool betterClosest = false;
+                if (!out.hitClosest)
+                {
+                    betterClosest = true;
+                }
+                else if (closestMode >= 2)
+                {
+                    if (candTime < out.closestT)
+                        betterClosest = true;
+                }
+                else
+                {
+                    if (candPrio > bestClosestPrio
+                        || (candPrio == bestClosestPrio && candTime < out.closestT))
+                        betterClosest = true;
+                }
+                if (betterClosest)
                 {
                     out.hitClosest = true;
                     out.closestBone = candBoneIndex;

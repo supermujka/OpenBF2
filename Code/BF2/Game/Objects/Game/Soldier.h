@@ -326,6 +326,8 @@ private:
     // ZiplineContainer::handleUpdate raises the raw +0x399 latch immediately after a PIUse detach
     // in both ports (ELF 0x81D3430 / PE 0x57E4C0). Narrow friend, no setter.
     friend class ZiplineContainer;
+    // [CHOSEN, not recovered] Read-only zero-dt pose snapshots for shadow A/B telemetry.
+    friend class HitregTelemetry;
     /* +0x1F4 */ float  m_smoothedStrafe;            // [CHOSEN] name
     /* +0x1F8 */ float  m_smoothedForward;           // [CHOSEN] name
     /* +0x1FC */ int    m_pose;                      // SoldierPose

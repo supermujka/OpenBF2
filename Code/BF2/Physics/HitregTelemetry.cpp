@@ -11,12 +11,15 @@
 #include <ctime>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "LatencyCompensation.h"
 #include "SoldierPhysicsNode.h"
 #include "../Animation/BoneAnimation/Skeleton.h"
 #include "../Core/Ids.h"
 #include "../Core/System.h"
+#include "../Game/IGameLogic.h"
+#include "../Game/Objects/IAnimatedBundle.h"
 #include "../Game/Objects/IObject.h"
 #include "../Game/Objects/IObjectTemplate.h"
 #include "../Game/Objects/IPlayer.h"
@@ -32,7 +35,9 @@ namespace world {
 namespace {
 
 int*         const g_telemetryLevel  = Vars::getInt("phy-latencyComp-telemetry", 0);
-const char*  const g_telemetryFile   = Vars::getString("phy-latencyComp-telemetryFile", "openbf2_hitreg.csv");
+const char*  const kDefaultTelemetryFile = "openbf2_hitreg.csv";
+const bool         g_telemetryFileRegistered =
+    (Vars::getString("phy-latencyComp-telemetryFile", kDefaultTelemetryFile) != 0);
 int*         const g_telemetryFlush  = Vars::getInt("phy-latencyComp-telemetryFlushTicks", 30);
 int*         const g_telemetrySplitMatches = Vars::getInt("phy-latencyComp-telemetrySplitMatches", 1);
 
@@ -237,6 +242,8 @@ void closeTelemetryFile()
         st.activeSplitMatches = false;
         st.lastConfigSig.clear();
     }
+    st.buffer.clear();
+    shotRecords().clear();
 }
 
 void onProcessExit()
@@ -302,7 +309,7 @@ std::string sanitizeField(const char* raw)
         return std::string();
     std::string out;
     out.reserve(32);
-    for (const char* p = raw; *p; ++p)
+    for (const char* p = raw; *p && out.size() < 64u; ++p)
     {
         const char ch = *p;
         if (ch == ',' || ch == '"' || ch == '\r' || ch == '\n')
@@ -318,6 +325,8 @@ void appendLine(const char* line)
     if (!line || !*line)
         return;
     TelemetryLoggerState& st = loggerState();
+    if (!st.file)
+        return;
     st.buffer.append(line);
     if (st.buffer.size() >= 16384u)
         flushBufferToDisk(false);
@@ -413,9 +422,10 @@ float computeVanillaLatencySec(IPlayer* owner)
     return clampLatencySec(lat, kRetailMaxLatency);
 }
 
-float computeParameterizedSweepLatencySec(IPlayer* owner, float pingFactorOverride,
-                                          int pingMsOverride, float queueDelaySec,
-                                          bool clampInterp, bool useQueueDelay)
+float computeSweepLatencyFromInputs(IPlayer* owner, float pingFactorOverride,
+                                       int pingMs, unsigned int rawInterpMs,
+                                       float queueDelaySec, bool clampInterp,
+                                       bool useQueueDelay)
 {
     const float dbg = LatencyCompensation::getDebugLatency();
     if (dbg > 0.0f)
@@ -425,14 +435,12 @@ float computeParameterizedSweepLatencySec(IPlayer* owner, float pingFactorOverri
     if (!owner->getIsRemote())
         return clampRewindLatency(LatencyCompensation::getLocalLatency(owner));
 
-    const int pingVal = pingMsOverride >= 0 ? pingMsOverride : static_cast<int>(owner->getPing());
-    float lat = static_cast<float>(pingVal) * pingFactorOverride * 0.001f;
+    float lat = static_cast<float>(pingMs) * pingFactorOverride * 0.001f;
     if (LatencyCompensation::isUseClientWindowEnabled())
     {
-        const unsigned int rawInterp = owner->getInterpolationTime();
         const unsigned int interp = clampInterp
-            ? LatencyCompensation::clampClientInterpolationTime(rawInterp)
-            : rawInterp;
+            ? LatencyCompensation::clampClientInterpolationTime(rawInterpMs)
+            : rawInterpMs;
         lat += static_cast<float>(interp) * 0.001f;
     }
     else
@@ -443,19 +451,6 @@ float computeParameterizedSweepLatencySec(IPlayer* owner, float pingFactorOverri
         lat += queueDelaySec;
 
     return clampRewindLatency(lat);
-}
-
-float computeSweepLatencySec(IPlayer* owner, float pingFactorOverride, int pingMsOverride,
-                             float queueDelaySec)
-{
-    return computeParameterizedSweepLatencySec(
-        owner, pingFactorOverride, pingMsOverride, queueDelaySec, true, true);
-}
-
-float computeUnclampedSweepLatencySec(IPlayer* owner, float pingFactorOverride)
-{
-    return computeParameterizedSweepLatencySec(
-        owner, pingFactorOverride, -1, 0.0f, false, false);
 }
 
 void buildConfigSignature(char* buf, std::size_t bufSize)
@@ -482,6 +477,7 @@ void ensureTelemetryOpenAndConfigLogged()
     if (*g_telemetryLevel <= 0)
         return;
 
+    (void)g_telemetryFileRegistered;
     TelemetryLoggerState& st = loggerState();
     if (!st.atexitRegistered)
     {
@@ -491,7 +487,7 @@ void ensureTelemetryOpenAndConfigLogged()
 
     const char* qPath = Vars::queryString("phy-latencyComp-telemetryFile");
     if (!qPath || !*qPath)
-        qPath = g_telemetryFile && *g_telemetryFile ? g_telemetryFile : "openbf2_hitreg.csv";
+        qPath = kDefaultTelemetryFile;
     const std::string basePath(qPath);
     const bool splitMatches = (*g_telemetrySplitMatches != 0);
 
@@ -513,6 +509,7 @@ void ensureTelemetryOpenAndConfigLogged()
         st.activeSplitMatches = splitMatches;
         st.nextShotId = 1;
         st.lastFlushTick = WorldPref::getTickCount();
+        st.buffer.clear();
         st.buffer.append(kCsvHeader);
         std::fprintf(stderr, "[HITREG] telemetry file: %s\n", openPath.c_str());
         std::fflush(stderr);
@@ -723,16 +720,32 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
     const int tgtLivePose = static_cast<int>(soldier->getPose());
 
     const int currentTick = WorldPref::getTickCount();
-    const float qDelaySec = LatencyCompensation::getPlayerQueueDelay(owner);
+    const bool useFireSnapshot = LatencyCompensation::isSnapshotProjectileEnabled();
+    const unsigned int probePingMs = useFireSnapshot ? shot.pingMs : owner->getPing();
+    const unsigned int probeRawInterpMs =
+        useFireSnapshot ? shot.rawInterpMs : owner->getInterpolationTime();
+    const unsigned int probeInterpMs =
+        LatencyCompensation::clampClientInterpolationTime(probeRawInterpMs);
+    const float probeQDelaySec =
+        useFireSnapshot ? (shot.queueDelayMs * 0.001f)
+                        : LatencyCompensation::getPlayerQueueDelay(owner);
+    const int probeRawPingMs =
+        shot.rawPingMs > 0 ? shot.rawPingMs : static_cast<int>(probePingMs);
+
     const float vanLat = computeVanillaLatencySec(owner);
     const float pf00Lat = 0.0f;
-    const float pf05Lat = computeSweepLatencySec(owner, 0.50f, -1, qDelaySec);
-    const float pf075Lat = computeSweepLatencySec(owner, 0.75f, -1, qDelaySec);
-    const float pf10Lat = computeSweepLatencySec(owner, 1.00f, -1, qDelaySec);
-    const float raw05Lat = computeSweepLatencySec(
-        owner, 0.50f, shot.rawPingMs > 0 ? shot.rawPingMs : -1, qDelaySec);
-    const float pf125Lat = computeSweepLatencySec(owner, 1.25f, -1, qDelaySec);
-    const float uncl10Lat = computeUnclampedSweepLatencySec(owner, 1.00f);
+    const float pf05Lat = computeSweepLatencyFromInputs(
+        owner, 0.50f, static_cast<int>(probePingMs), probeRawInterpMs, probeQDelaySec, true, true);
+    const float pf075Lat = computeSweepLatencyFromInputs(
+        owner, 0.75f, static_cast<int>(probePingMs), probeRawInterpMs, probeQDelaySec, true, true);
+    const float pf10Lat = computeSweepLatencyFromInputs(
+        owner, 1.00f, static_cast<int>(probePingMs), probeRawInterpMs, probeQDelaySec, true, true);
+    const float raw05Lat = computeSweepLatencyFromInputs(
+        owner, 0.50f, probeRawPingMs, probeRawInterpMs, probeQDelaySec, true, true);
+    const float pf125Lat = computeSweepLatencyFromInputs(
+        owner, 1.25f, static_cast<int>(probePingMs), probeRawInterpMs, probeQDelaySec, true, true);
+    const float uncl10Lat = computeSweepLatencyFromInputs(
+        owner, 1.00f, static_cast<int>(probePingMs), probeRawInterpMs, probeQDelaySec, false, false);
 
     int ringValid = 0;
     int ticksSinceReseed = -1;
@@ -745,14 +758,10 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
     int vanPose = -1;
     int vanValid = 0;
     int vanSince = -1;
-    soldierNode->sampleLatencyTransform(vanLat, true, vanMat, &vanPose, &vanValid, &vanSince);
-    int vanRingUnfilled = 0;
-    if (vanLat > kServerTickSec)
-    {
-        const int needed = static_cast<int>(vanLat / kServerTickSec) + 1;
-        if (vanValid < needed)
-            vanRingUnfilled = 1;
-    }
+    bool vanUnfilledFlag = false;
+    soldierNode->sampleLatencyTransform(vanLat, true, vanMat, &vanPose, &vanValid, &vanSince,
+                                        &vanUnfilledFlag);
+    const int vanRingUnfilled = vanUnfilledFlag ? 1 : 0;
 
     Mat4 pf00Mat = Mat4::getIdentity();
     Mat4 pf05Mat = Mat4::getIdentity();
@@ -802,24 +811,95 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
         { &uncl10Mat, uncl10Pose, &pUncl10 }
     };
 
+    const bool canSwitchPose =
+        !soldier->m_ragDoll && soldier->m_collisionSkeleton && gameLogic && gameLogic->isServer();
+    bool switchedAnyPose = false;
+    int savedPose = 0;
+    int savedCharMode = 1;
+    int savedTick = 0;
+    int savedCachedPose = 0;
+    Vec3 savedHeadPos = Vec3::getZero();
+    float savedFloat230 = 0.0f;
+    float savedLookIdle = 0.0f;
+    bool savedByte27F1 = false;
+    std::vector<Mat4> savedTransforms;
+
     for (int j = 0; j < 8; ++j)
     {
         const int effPose =
             (shadowJobs[j].pose >= 0 && shadowJobs[j].pose < 4) ? shadowJobs[j].pose : tgtLivePose;
-        if (effPose != activeSkelPose)
+        if (effPose != activeSkelPose && canSwitchPose)
         {
-            anim::Skeleton* const switched = soldier->getCollisionSkeleton(effPose);
-            if (switched)
+            if (!switchedAnyPose)
             {
-                activeSkel = switched;
-                activeSkelPose = effPose;
+                savedPose = soldier->m_pose;
+                savedCharMode = soldier->m_characterMode;
+                savedTick = soldier->m_dword26C;
+                savedCachedPose = soldier->m_dword270;
+                savedHeadPos = soldier->m_headPosition;
+                savedFloat230 = soldier->m_float230;
+                savedLookIdle = soldier->m_soldierLookIdleTime;
+                savedByte27F1 = soldier->m_byte27F[1];
+                if (soldier->m_collisionSkeleton->m_transforms
+                    && soldier->m_collisionSkeleton->m_boneCount > 0)
+                {
+                    const int boneCount = soldier->m_collisionSkeleton->m_boneCount;
+                    savedTransforms.assign(
+                        soldier->m_collisionSkeleton->m_transforms,
+                        soldier->m_collisionSkeleton->m_transforms + boneCount);
+                }
+                switchedAnyPose = true;
             }
+            soldier->m_byte27F[1] = true;
+            soldier->m_characterMode = 1;
+            soldier->m_pose = effPose;
+            soldier->m_headPosition = savedHeadPos;
+            soldier->m_float230 = savedFloat230;
+            soldier->m_soldierLookIdleTime = 1.0f;
+            soldier->applyAnimationsOnSkeleton(0.0f, false);
+            activeSkel = soldier->m_collisionSkeleton;
+            activeSkelPose = effPose;
         }
         activeSkel->probeRayVsSkeleton(start, end, *shadowJobs[j].mat, *shadowJobs[j].out);
     }
 
-    if (activeSkelPose != initialSkelPose)
-        soldier->getCollisionSkeleton(v1StateIndex);
+    if (switchedAnyPose)
+    {
+        soldier->m_byte27F[1] = true;
+        soldier->m_characterMode = 1;
+        soldier->m_pose = initialSkelPose;
+        soldier->m_headPosition = savedHeadPos;
+        soldier->m_float230 = savedFloat230;
+        soldier->m_soldierLookIdleTime = 1.0f;
+        soldier->applyAnimationsOnSkeleton(0.0f, false);
+
+        if (!savedTransforms.empty() && soldier->m_collisionSkeleton->m_transforms)
+        {
+            for (std::size_t b = 0; b < savedTransforms.size(); ++b)
+                soldier->m_collisionSkeleton->m_transforms[b] = savedTransforms[b];
+        }
+
+        soldier->m_pose = savedPose;
+        soldier->m_characterMode = savedCharMode;
+        soldier->m_dword26C = savedTick;
+        soldier->m_dword270 = savedCachedPose;
+        soldier->m_headPosition = savedHeadPos;
+        soldier->m_float230 = savedFloat230;
+        soldier->m_soldierLookIdleTime = savedLookIdle;
+        soldier->m_byte27F[1] = savedByte27F1;
+
+        if (savedCharMode != 1)
+        {
+            IObject* const item = soldier->getItem(soldier->m_activeItemIndex);
+            if (item && (item->getFlags() & 1u) == 0)
+            {
+                IAnimatedBundle* const animated = static_cast<IAnimatedBundle*>(
+                    item->queryInterface(IID_IAnimatedBundle));
+                if (animated)
+                    animated->setActiveAnimationSystem(savedCharMode);
+            }
+        }
+    }
 
     IPlayer* const tgtPlayer = soldier->getOccupingPlayer();
     const int tgtId = tgtPlayer ? tgtPlayer->getId() : -1;
@@ -872,10 +952,9 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
         static_cast<unsigned long long>(shot.shotId),
         shot.weaponName.c_str(), shot.shooterId, shot.shooterName.c_str(),
         tgtId, tgtName.c_str(),
-        owner->getPing(), shot.rawPingMs, shot.rttJitterMs, shot.pktLossDnPct,
-        owner->getInterpolationTime(),
-        LatencyCompensation::clampClientInterpolationTime(owner->getInterpolationTime()),
-        shot.queueDepth, qDelaySec * 1000.0f, shot.replayCount, shot.replays30t,
+        probePingMs, shot.rawPingMs, shot.rttJitterMs, shot.pktLossDnPct,
+        probeRawInterpMs, probeInterpMs,
+        shot.queueDepth, probeQDelaySec * 1000.0f, shot.replayCount, shot.replays30t,
         activeLatency * 1000.0f, vanLat * 1000.0f,
         shotDist, flightTicks, coarseDist, flyBy ? 1 : 0, tgtAlive, tgtManDown,
         tgtLivePose, v1StateIndex, vanPose, tgtPoseDiff, tgtSpeed, tgtHSpeed, vel.y,

@@ -233,6 +233,7 @@ void GameLogicDamage::serverGiveDamage(IObject* object, float damage, IPlayer* a
     bool wreckDies = false;
     const bool wasDamaged = armor->getStatus() != 0;                              // +0x5C
     bool soldier = owner->getTemplate()->getClassID() == CID_SoldierTemplate;
+    const bool isSoldierTarget = soldier;
 
     IPlayerControlObject* pco = findPco(owner);
     if (pco)
@@ -286,12 +287,13 @@ void GameLogicDamage::serverGiveDamage(IObject* object, float damage, IPlayer* a
             const float after = armor->getHitPoints() - damage;
             if (-armor->getMaxWreckHitPoints() >= after)                          // +0x88
                 wreckDies = true;
-            if (sourceObject && HitregTelemetry::isEnabled())
-            {
-                const float hpBefore = armor->getHitPoints();
-                HitregTelemetry::noteServerGiveDamage(
-                    sourceObject, damage, hpBefore, after, dies);
-            }
+        }
+        if (isSoldierTarget && sourceObject && HitregTelemetry::isEnabled())
+        {
+            const float hpBefore = armor->getHitPoints();
+            const float after = hpBefore - damage;
+            HitregTelemetry::noteServerGiveDamage(
+                sourceObject, damage, hpBefore, after, dies);
         }
 
         for (std::map<int, IPlayerControlObject*>::iterator it = pcos->begin(); it != pcos->end(); ++it)

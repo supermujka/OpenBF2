@@ -36,7 +36,8 @@ struct SoldierLatencyMeta
 {
     int validSamples;
     int reseedTick;
-    SoldierLatencyMeta() : validSamples(0), reseedTick(0) {}
+    bool fromZeroReset;
+    SoldierLatencyMeta() : validSamples(0), reseedTick(0), fromZeroReset(true) {}
 };
 
 std::unordered_map<const SoldierPhysicsNode*, SoldierLatencyMeta>& soldierLatencyMeta()
@@ -466,18 +467,20 @@ void SoldierPhysicsNode::updateLatencyState()
         static_cast<Soldier*>(m_object)->getPose());                       // Soldier +0x278
 
     SoldierLatencyMeta& meta = soldierLatencyMeta()[this];
-    bool reseed = (meta.validSamples <= 0);
-    if (!reseed)
+    const bool initialSeed = (meta.validSamples <= 0);
+    bool teleported = false;
+    if (!initialSeed)
     {
         const int prevIdx = (m_latencyIndex + 15) & 15;
         const float dx = position.x - m_latency[prevIdx].position.x;
         const float dy = position.y - m_latency[prevIdx].position.y;
         const float dz = position.z - m_latency[prevIdx].position.z;
         if (dx * dx + dy * dy + dz * dz > kSoldierTeleportDistSq)
-            reseed = true;
+            teleported = true;
     }
-    if (reseed)
+    if (initialSeed || teleported)
     {
+        meta.fromZeroReset = initialSeed;
         meta.validSamples = 1;
         meta.reseedTick = WorldPref::getTickCount();
         if (LatencyCompensation::isSpawnRingFixEnabled())
@@ -496,6 +499,8 @@ void SoldierPhysicsNode::updateLatencyState()
     else if (meta.validSamples < 16)
     {
         ++meta.validSamples;
+        if (meta.validSamples >= 16)
+            meta.fromZeroReset = false;
     }
 
     LatencyEntry& entry = m_latency[m_latencyIndex];                       // +0x108, entries of 32 B
@@ -578,10 +583,15 @@ const Mat4& SoldierPhysicsNode::getLatencyCompensatedTransformation(float latenc
 void SoldierPhysicsNode::sampleLatencyTransform(float latency, bool simulateVanillaUnfilled,
                                                 Mat4& outTransform, int* outPose,
                                                 int* outValidSamples,
-                                                int* outTicksSinceReseed) const
+                                                int* outTicksSinceReseed,
+                                                bool* outVanillaUnfilled) const
 {
+    if (outVanillaUnfilled)
+        *outVanillaUnfilled = false;
+
     int validSamples = 0;
     int ticksSinceReseed = -1;
+    bool fromZeroReset = true;
     const std::unordered_map<const SoldierPhysicsNode*, SoldierLatencyMeta>& map =
         soldierLatencyMeta();
     std::unordered_map<const SoldierPhysicsNode*, SoldierLatencyMeta>::const_iterator it =
@@ -589,6 +599,7 @@ void SoldierPhysicsNode::sampleLatencyTransform(float latency, bool simulateVani
     if (it != map.end())
     {
         validSamples = it->second.validSamples;
+        fromZeroReset = it->second.fromZeroReset;
         if (validSamples > 0)
         {
             ticksSinceReseed = WorldPref::getTickCount() - it->second.reseedTick;
@@ -644,7 +655,7 @@ void SoldierPhysicsNode::sampleLatencyTransform(float latency, bool simulateVani
     Quat olderRot = m_latency[olderIndex].rotation;
     int olderPose = m_latency[olderIndex].pose;
 
-    if (simulateVanillaUnfilled)
+    if (simulateVanillaUnfilled && fromZeroReset)
     {
         if (validSamples < sampleCount)
         {
@@ -658,6 +669,8 @@ void SoldierPhysicsNode::sampleLatencyTransform(float latency, bool simulateVani
             olderRot.x = olderRot.y = olderRot.z = 0.0f;
             olderRot.w = 1.0f;
             olderPose = 0;
+            if (outVanillaUnfilled)
+                *outVanillaUnfilled = true;
         }
     }
 
