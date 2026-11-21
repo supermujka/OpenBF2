@@ -67,6 +67,10 @@ public:
 
     // Periodic buffered flush & cvar config change tracker (called from GameServer::update).
     static void tickFlush();
+
+    // Match lifecycle hooks for automatic per-match CSV file rotation.
+    static void noteMatchStarted(const char* mapName);
+    static void noteMatchEnded();
 };
 
 } // namespace world

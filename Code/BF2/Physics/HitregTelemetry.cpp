@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <unordered_map>
 
@@ -33,6 +34,7 @@ namespace {
 int*         const g_telemetryLevel  = Vars::getInt("phy-latencyComp-telemetry", 0);
 const char*  const g_telemetryFile   = Vars::getString("phy-latencyComp-telemetryFile", "openbf2_hitreg.csv");
 int*         const g_telemetryFlush  = Vars::getInt("phy-latencyComp-telemetryFlushTicks", 30);
+int*         const g_telemetrySplitMatches = Vars::getInt("phy-latencyComp-telemetrySplitMatches", 1);
 
 const float kServerTickSec = 0.033333335f;
 
@@ -149,6 +151,10 @@ struct TelemetryLoggerState
 {
     FILE*       file;
     std::string activePath;
+    std::string activeBasePath;
+    bool        activeSplitMatches;
+    std::string currentMapName;
+    int         matchSeq;
     std::string buffer;
     std::string lastConfigSig;
     int         lastFlushTick;
@@ -157,6 +163,8 @@ struct TelemetryLoggerState
 
     TelemetryLoggerState()
         : file(0)
+        , activeSplitMatches(false)
+        , matchSeq(0)
         , lastFlushTick(0)
         , nextShotId(1)
         , atexitRegistered(false)
@@ -225,6 +233,8 @@ void closeTelemetryFile()
         std::fclose(st.file);
         st.file = 0;
         st.activePath.clear();
+        st.activeBasePath.clear();
+        st.activeSplitMatches = false;
         st.lastConfigSig.clear();
     }
 }
@@ -232,6 +242,58 @@ void closeTelemetryFile()
 void onProcessExit()
 {
     closeTelemetryFile();
+}
+
+std::string sanitizeFilenameToken(const char* raw)
+{
+    if (!raw || !*raw)
+        return std::string();
+    std::string out;
+    out.reserve(32);
+    for (const char* p = raw; *p && out.size() < 32u; ++p)
+    {
+        const char ch = *p;
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
+            || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-')
+        {
+            out.push_back(ch);
+        }
+        else if (ch == ' ')
+        {
+            out.push_back('_');
+        }
+    }
+    return out;
+}
+
+std::string buildMatchFilePath(const std::string& basePath, const std::string& mapToken, int matchSeq)
+{
+    const std::size_t slashPos = basePath.find_last_of("/\\");
+    const std::size_t dotPos = basePath.find_last_of('.');
+    const bool hasExt =
+        (dotPos != std::string::npos) && (slashPos == std::string::npos || dotPos > slashPos);
+    const std::string stem = hasExt ? basePath.substr(0, dotPos) : basePath;
+    const std::string ext = hasExt ? basePath.substr(dotPos) : std::string(".csv");
+
+    char tsBuf[32] = "00000000_000000";
+    const std::time_t now = std::time(0);
+    std::tm tmBuf;
+    std::memset(&tmBuf, 0, sizeof(tmBuf));
+    bool haveTm = false;
+#if defined(_MSC_VER)
+    haveTm = (localtime_s(&tmBuf, &now) == 0);
+#else
+    haveTm = (localtime_r(&now, &tmBuf) != 0);
+#endif
+    if (haveTm)
+        std::strftime(tsBuf, sizeof(tsBuf), "%Y%m%d_%H%M%S", &tmBuf);
+
+    char suffix[96];
+    if (mapToken.empty())
+        std::snprintf(suffix, sizeof(suffix), "_%s_m%d", tsBuf, matchSeq);
+    else
+        std::snprintf(suffix, sizeof(suffix), "_%s_%s_m%d", tsBuf, mapToken.c_str(), matchSeq);
+    return stem + suffix + ext;
 }
 
 std::string sanitizeField(const char* raw)
@@ -430,19 +492,30 @@ void ensureTelemetryOpenAndConfigLogged()
     const char* qPath = Vars::queryString("phy-latencyComp-telemetryFile");
     if (!qPath || !*qPath)
         qPath = g_telemetryFile && *g_telemetryFile ? g_telemetryFile : "openbf2_hitreg.csv";
-    const std::string targetPath(qPath);
+    const std::string basePath(qPath);
+    const bool splitMatches = (*g_telemetrySplitMatches != 0);
 
-    if (st.file && st.activePath != targetPath)
+    if (st.file && (st.activeBasePath != basePath || st.activeSplitMatches != splitMatches))
         closeTelemetryFile();
 
     if (!st.file)
     {
-        st.file = std::fopen(targetPath.c_str(), "w");
+        const int nextSeq = st.matchSeq + 1;
+        const std::string openPath =
+            splitMatches ? buildMatchFilePath(basePath, st.currentMapName, nextSeq) : basePath;
+        st.file = std::fopen(openPath.c_str(), "w");
         if (!st.file)
             return;
-        st.activePath = targetPath;
+        if (splitMatches)
+            st.matchSeq = nextSeq;
+        st.activePath = openPath;
+        st.activeBasePath = basePath;
+        st.activeSplitMatches = splitMatches;
+        st.nextShotId = 1;
         st.lastFlushTick = WorldPref::getTickCount();
         st.buffer.append(kCsvHeader);
+        std::fprintf(stderr, "[HITREG] telemetry file: %s\n", openPath.c_str());
+        std::fflush(stderr);
     }
 
     char sig[256];
@@ -999,9 +1072,22 @@ void HitregTelemetry::tickFlush()
         return;
     }
 
-    ensureTelemetryOpenAndConfigLogged();
     if (!st.file)
-        return;
+    {
+        // With split-matches enabled, defer file creation until the first shot/probe
+        // of the match so empty rounds never leave 0-shot CSV files behind.
+        if (*g_telemetrySplitMatches != 0)
+            return;
+        ensureTelemetryOpenAndConfigLogged();
+        if (!st.file)
+            return;
+    }
+    else
+    {
+        ensureTelemetryOpenAndConfigLogged();
+        if (!st.file)
+            return;
+    }
 
     const int currentTick = WorldPref::getTickCount();
     const int flushEvery = *g_telemetryFlush > 0 ? *g_telemetryFlush : 30;
@@ -1010,6 +1096,20 @@ void HitregTelemetry::tickFlush()
         flushBufferToDisk(true);
         st.lastFlushTick = currentTick;
     }
+}
+
+void HitregTelemetry::noteMatchStarted(const char* mapName)
+{
+    TelemetryLoggerState& st = loggerState();
+    st.currentMapName = sanitizeFilenameToken(mapName);
+    if (*g_telemetrySplitMatches != 0)
+        closeTelemetryFile();
+}
+
+void HitregTelemetry::noteMatchEnded()
+{
+    if (*g_telemetrySplitMatches != 0)
+        closeTelemetryFile();
 }
 
 } // namespace world

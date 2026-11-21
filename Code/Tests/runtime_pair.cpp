@@ -226,6 +226,8 @@ void HitregTelemetry::noteProjectileDamageCalc(const IObject*, int, int, float, 
 void HitregTelemetry::noteServerGiveDamage(const IObject*, float, float, float, bool) {}
 void HitregTelemetry::finishProjectileCollisionDamage(const IObject*, IObject*, bool) {}
 void HitregTelemetry::tickFlush() {}
+void HitregTelemetry::noteMatchStarted(const char*) {}
+void HitregTelemetry::noteMatchEnded() {}
 
 void Soldier::setHitByVehicleSpeed(const Vec3&) {}
 dice::anim::Skeleton* Soldier::getCollisionSkeleton(int) { return 0; }

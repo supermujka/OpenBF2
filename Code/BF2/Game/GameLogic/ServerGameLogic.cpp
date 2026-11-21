@@ -105,6 +105,7 @@
 #include "../Objects/Game/CommanderToolsManager.h"    // commander tool state / lifecycle
 #include "../Objects/Game/UAVVehicleManager.h"        // UAV object lifecycle
 #include "../Objects/Game/SupplyDropManager.h"        // TU-static manager tick
+#include "../../Physics/HitregTelemetry.h"        // [CHOSEN, not recovered] per-match CSV rotation
 
 namespace dice {
 namespace hfe {
@@ -322,6 +323,8 @@ void ServerGameLogic::setGameStatus(GameStatus status, bool, float delay)
 // runs in the middle, after the status broadcast.
 void ServerGameLogic::reset()
 {
+    world::HitregTelemetry::noteMatchEnded();
+
     m_defaultNumberOfTickets[0] = 50;                // +0x238
     m_ticketLossPerMin[0]       = 10.0f;             // +0x22C
     m_ticketLossPerMin[1]       = 10.0f;             // +0x230
@@ -769,6 +772,8 @@ void ServerGameLogic::uFirstPreGame()
 void ServerGameLogic::uFirstPlaying()
 {
     m_firstPlaying = false;                                                    // +0x1F1
+    const std::string mapName = game ? game->getCurrentMapName() : std::string();
+    world::HitregTelemetry::noteMatchStarted(mapName.c_str());
 }
 
 // Starts the end-of-round countdown, adding endDelay on the last round. Expiry
@@ -780,6 +785,7 @@ void ServerGameLogic::uFirstEndGame()
     m_endOfRoundDelay = static_cast<float>(endOfRoundDelay);                   // +0x200
     if (m_roundsPlayed == serverSettings->m_roundsPerMap - 1)                  // +0x210 vs +0x74
         m_endOfRoundDelay = static_cast<float>(serverSettings->m_endDelay + endOfRoundDelay);   // +0x64
+    world::HitregTelemetry::noteMatchEnded();
 }
 
 void ServerGameLogic::uEndGame(float deltaTime)
