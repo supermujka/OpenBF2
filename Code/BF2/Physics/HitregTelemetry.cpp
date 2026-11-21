@@ -40,6 +40,7 @@ const bool         g_telemetryFileRegistered =
     (Vars::getString("phy-latencyComp-telemetryFile", kDefaultTelemetryFile) != 0);
 int*         const g_telemetryFlush  = Vars::getInt("phy-latencyComp-telemetryFlushTicks", 30);
 int*         const g_telemetrySplitMatches = Vars::getInt("phy-latencyComp-telemetrySplitMatches", 1);
+int*         const g_netServerSendRate = Vars::getInt("net-serverSendRate", 0);
 
 const float kServerTickSec = 0.033333335f;
 
@@ -458,7 +459,7 @@ void buildConfigSignature(char* buf, std::size_t bufSize)
     std::snprintf(
         buf, bufSize,
         "improved=%d;pf=%.2f;max=%.2f;maxInterp=%d;qDelay=%d;maxQ=%d;"
-        "snap=%d;closest=%d;spawnFix=%d;bpFloor=%.1f;tel=%d",
+        "snap=%d;closest=%d;spawnFix=%d;bpFloor=%.1f;tel=%d;sendRate=%d",
         LatencyCompensation::isImprovedEnabled() ? 1 : 0,
         LatencyCompensation::getPingFactor(),
         LatencyCompensation::getMaxLatency(),
@@ -469,7 +470,8 @@ void buildConfigSignature(char* buf, std::size_t bufSize)
         LatencyCompensation::getClosestBoneMode(),
         LatencyCompensation::isSpawnRingFixEnabled() ? 1 : 0,
         LatencyCompensation::getBroadphaseSoldierSpeedFloor(),
-        *g_telemetryLevel);
+        *g_telemetryLevel,
+        *g_netServerSendRate);
 }
 
 void ensureTelemetryOpenAndConfigLogged()

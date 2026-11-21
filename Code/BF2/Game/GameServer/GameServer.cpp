@@ -2517,6 +2517,18 @@ int* const g_connPacketSizeOverride = Vars::getInt("conn-packetsize-override", 0
                                                         //   (0x80B6B35..0x80B6B47, right after the one above),
                                                         //   which is what places it in this TU. chokeBandwidth
                                                         //   is its only reader.
+// [CHOSEN, not recovered] Live server->client snapshot send-rate override (Hz).
+// 0 = vanilla per-connection tier rate (g_connectionTypes[type][1], max 20 Hz).
+// Positive values (clamped to [1, 30]) override the packet rate gate live via RCON/console.
+int* const g_netServerSendRate = Vars::getInt("net-serverSendRate", 0);
+
+int effectiveServerSendRate(const ClientConnection* conn)
+{
+    const int overrideRate = *g_netServerSendRate;
+    if (overrideRate > 0)
+        return overrideRate > 30 ? 30 : overrideRate;
+    return conn->m_dword14 > 0 ? conn->m_dword14 : 20;
+}
 namespace memory { inline void nextPhysicFrame() {} }   // empty here, like nextVisualFrame:
                                                         //   the memory DLL's arena boundary (see BF2Engine.cpp)
 int g_collisionDumpFlag = 0;                            // ds:0x8ABA820 [UNRESOLVED name] - the physics side's
@@ -3026,7 +3038,7 @@ void GameServer::chokeBandwidth()
     for (ConnIt it = m_connections.begin(); it != m_connections.end(); ++it)
     {
         const ClientConnection* const conn = reinterpret_cast<const ClientConnection*>(it->second);
-        demand += conn->m_packetSizeOverride * conn->m_dword14;      // bytes * Hz = bytes/s
+        demand += conn->m_packetSizeOverride * effectiveServerSendRate(conn);      // bytes * Hz = bytes/s
     }
 
     if (demand <= m_bandwidthChoke)
@@ -3037,7 +3049,7 @@ void GameServer::chokeBandwidth()
     for (ConnIt it = m_connections.begin(); it != m_connections.end(); ++it)
     {
         ClientConnection* const conn = reinterpret_cast<ClientConnection*>(it->second);
-        const int rate = conn->m_dword14;
+        const int rate = effectiveServerSendRate(conn);
         if (rate * conn->m_packetSizeOverride > share)
         {
             const int size = share / rate;
@@ -3088,7 +3100,11 @@ void GameServer::processGameStateAndSendPackets(float dt)
         if (conn->m_timer1C <= 0.0f)
         {
             // one period back on the clock. m_dword14 is the rate in Hz - default 20.
-            conn->m_timer1C += 1.0f / static_cast<float>(conn->m_dword14);
+            const int sendRate = effectiveServerSendRate(conn);
+            const float period = 1.0f / static_cast<float>(sendRate);
+            conn->m_timer1C += period;
+            if (*g_netServerSendRate > 0 && conn->m_timer1C < -period)
+                conn->m_timer1C = 0.0f;
         }
 
         if (conn->m_connectionState == 4 && conn->m_bReset)
