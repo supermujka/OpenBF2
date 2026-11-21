@@ -925,7 +925,7 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
             soldier->m_pose = effPose;
             soldier->m_headPosition = savedHeadPos;
             soldier->m_float230 = savedFloat230;
-            soldier->m_soldierLookIdleTime = 1.0f;
+            soldier->m_soldierLookIdleTime = savedLookIdle;
             soldier->applyAnimationsOnSkeleton(0.0f, false);
             activeSkel = soldier->m_collisionSkeleton;
             activeSkelPose = effPose;
@@ -940,7 +940,7 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
         soldier->m_pose = initialSkelPose;
         soldier->m_headPosition = savedHeadPos;
         soldier->m_float230 = savedFloat230;
-        soldier->m_soldierLookIdleTime = 1.0f;
+        soldier->m_soldierLookIdleTime = savedLookIdle;
         soldier->applyAnimationsOnSkeleton(0.0f, false);
 
         if (!savedTransforms.empty() && soldier->m_collisionSkeleton->m_transforms)
@@ -1191,6 +1191,13 @@ void HitregTelemetry::finishProjectileCollisionDamage(const IObject* projectileO
     ShotRecord& shot = it->second;
     if (!shot.hasDmgCalc)
         return;
+
+    if (!hitmarker && shot.baseDmg <= 0.0f && (!shot.hasServerDmg || shot.finalDmg <= 0.0f))
+    {
+        shot.hasDmgCalc = false;
+        shot.hasServerDmg = false;
+        return;
+    }
 
     int tgtId = -1;
     std::string tgtName;
