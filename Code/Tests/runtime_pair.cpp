@@ -188,6 +188,7 @@ bool LatencyCompensation::m_isEnabled = false;
 float LatencyCompensation::getLatency(IPlayer*) { return 0.0f; }
 bool LatencyCompensation::isImprovedEnabled() { return false; }
 bool LatencyCompensation::isClosestBoneEnabled() { return false; }
+int LatencyCompensation::getClosestBoneMode() { return 0; }
 bool LatencyCompensation::isSpawnRingFixEnabled() { return false; }
 bool LatencyCompensation::isDebugLogEnabled() { return false; }
 bool LatencyCompensation::isQueueDelayEnabled() { return false; }

@@ -24,6 +24,7 @@ public:
     // [CHOSEN, not recovered] Version 1 hit-detection & lag-compensation controls and sidecars.
     static bool isImprovedEnabled();
     static bool isClosestBoneEnabled();
+    static int getClosestBoneMode();
     static bool isSpawnRingFixEnabled();
     static bool isDebugLogEnabled();
     static bool isQueueDelayEnabled();

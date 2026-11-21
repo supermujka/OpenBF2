@@ -403,6 +403,21 @@ void Skeleton::setSkeletonCollisionBone(const std::string& name, int material,
 }
 
 
+namespace {
+// [CHOSEN, not recovered] Soldier hit-zone priority matching BF2 materialManagerSettings.con
+// damage multipliers: Human_head (25, 3.0x) > Human_body (24, 1.0x) > Human_limbs (77, 0.7x).
+int hitPartPriority(int materialId)
+{
+    if (materialId == 25)
+        return 3;
+    if (materialId == 24)
+        return 2;
+    if (materialId == 77)
+        return 1;
+    return 0;
+}
+} // namespace
+
 // Tests a ray against the skeleton's collision bones and writes hit information when found.
 
 bool Skeleton::checkRayVsSkeleton(hfe::Vec3* hitPosition, hfe::Vec3* hitNormal,
@@ -410,7 +425,7 @@ bool Skeleton::checkRayVsSkeleton(hfe::Vec3* hitPosition, hfe::Vec3* hitNormal,
                                   const hfe::Vec3& start, const hfe::Vec3& end,
                                   const hfe::Mat4& transformation)
 {
-    const bool findClosest = hfe::world::LatencyCompensation::isClosestBoneEnabled();
+    const int closestMode = hfe::world::LatencyCompensation::getClosestBoneMode();
     hfe::Vec3 rayAxis;
     rayAxis.x = end.x - start.x;
     rayAxis.y = end.y - start.y;
@@ -418,6 +433,7 @@ bool Skeleton::checkRayVsSkeleton(hfe::Vec3* hitPosition, hfe::Vec3* hitNormal,
 
     bool foundHit = false;
     float bestTime = FLT_MAX;
+    int bestPriority = -1;
     hfe::Vec3 bestPoint = {};
     hfe::Mat4 bestTransform = hfe::Mat4::getIdentity();
     int bestBoneIndex = 0;
@@ -454,17 +470,35 @@ bool Skeleton::checkRayVsSkeleton(hfe::Vec3* hitPosition, hfe::Vec3* hitNormal,
         if (candCount == 2)
             candSelected = candTimes[1] <= candTimes[0];
         const float candTime = candTimes[candSelected];
+        const int candPriority = hitPartPriority(candTemplate->m_dword20);
 
-        if (!findClosest || !foundHit || candTime < bestTime)
+        bool better = false;
+        if (!foundHit)
+        {
+            better = true;
+        }
+        else if (closestMode == 1)
+        {
+            if (candPriority > bestPriority || (candPriority == bestPriority && candTime < bestTime))
+                better = true;
+        }
+        else if (closestMode >= 2)
+        {
+            if (candTime < bestTime)
+                better = true;
+        }
+
+        if (better)
         {
             foundHit = true;
             bestTime = candTime;
+            bestPriority = candPriority;
             bestPoint = candPoints[candSelected];
             bestTransform = candTransform;
             bestBoneIndex = candBoneIndex;
             bestTemplate = candTemplate;
 
-            if (!findClosest)
+            if (closestMode == 0)
                 break;
         }
     }
@@ -569,6 +603,7 @@ void Skeleton::probeRayVsSkeleton(const hfe::Vec3& start, const hfe::Vec3& end,
     rayAxis.y = end.y - start.y;
     rayAxis.z = end.z - start.z;
 
+    int bestClosestPrio = -1;
     for (unsigned int i = 0; i < m_vector24.size(); ++i)
     {
         const int candBoneIndex = m_vector24[i];
@@ -621,6 +656,7 @@ void Skeleton::probeRayVsSkeleton(const hfe::Vec3& start, const hfe::Vec3& end,
                 if (candCount == 2)
                     candSelected = candTimes[1] <= candTimes[0];
                 const float candTime = candTimes[candSelected];
+                const int candPrio = hitPartPriority(candTemplate->m_dword20);
 
                 if (!out.hitFirst)
                 {
@@ -629,12 +665,14 @@ void Skeleton::probeRayVsSkeleton(const hfe::Vec3& start, const hfe::Vec3& end,
                     out.firstPart = candTemplate->m_dword20;
                     out.firstT = candTime;
                 }
-                if (!out.hitClosest || candTime < out.closestT)
+                if (!out.hitClosest || candPrio > bestClosestPrio
+                    || (candPrio == bestClosestPrio && candTime < out.closestT))
                 {
                     out.hitClosest = true;
                     out.closestBone = candBoneIndex;
                     out.closestPart = candTemplate->m_dword20;
                     out.closestT = candTime;
+                    bestClosestPrio = candPrio;
                 }
             }
         }
@@ -643,7 +681,7 @@ void Skeleton::probeRayVsSkeleton(const hfe::Vec3& start, const hfe::Vec3& end,
 
 const char* Skeleton::getBoneNameSafe(int boneIndex) const
 {
-    if (!m_hasLoadedArrays || !m_boneTemplates || boneIndex < 0 || boneIndex >= m_boneCount)
+    if (!m_boneTemplates || boneIndex < 0 || boneIndex >= m_boneCount)
         return "";
     const short nameId = m_boneTemplates[boneIndex].m_nameId;
     if (nameId < 0)

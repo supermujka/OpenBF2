@@ -32,9 +32,9 @@ int*   const g_useInput = Vars::getInt("phy-latencyComp-useInput", 1);          
 int*   const g_useRenderAhead = Vars::getInt("phy-latencyComp-useRenderAhead", 0);   // +0x458
 float* const g_maxRenderAheadTime =
     Vars::getFloat("phy-latencyComp-maxRenderAheadTime", 0.033333335f);               // +0x45C
-float* const g_pingFactor = Vars::getFloat("phy-latencyComp-pingFactor", 0.5f);       // +0x460, used
+float* const g_pingFactor = Vars::getFloat("phy-latencyComp-pingFactor", 1.0f);       // +0x460, used
 float* const g_defaultLatency = Vars::getFloat("phy-latencyComp-default", 0.05f);    // +0x464, used
-float* const g_maxLatency = Vars::getFloat("phy-latencyComp-max", 0.3f);             // +0x468, used
+float* const g_maxLatency = Vars::getFloat("phy-latencyComp-max", 0.35f);            // +0x468, used
 float* const g_debugLatency = Vars::getFloat("phy-latencyComp-debug", -1.0f);        // +0x46C, used
 
 // [CHOSEN, not recovered] Version 1 hit-detection & lag-compensation cvars and sidecars.
@@ -161,9 +161,14 @@ bool LatencyCompensation::isImprovedEnabled()
     return *g_improved != 0;
 }
 
+int LatencyCompensation::getClosestBoneMode()
+{
+    return (*g_improved != 0) ? *g_closestBone : 0;
+}
+
 bool LatencyCompensation::isClosestBoneEnabled()
 {
-    return *g_improved != 0 && *g_closestBone != 0;
+    return getClosestBoneMode() != 0;
 }
 
 bool LatencyCompensation::isSpawnRingFixEnabled()

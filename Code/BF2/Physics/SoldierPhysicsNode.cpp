@@ -465,20 +465,22 @@ void SoldierPhysicsNode::updateLatencyState()
     const unsigned char pose = static_cast<unsigned char>(
         static_cast<Soldier*>(m_object)->getPose());                       // Soldier +0x278
 
-    if (LatencyCompensation::isSpawnRingFixEnabled())
+    SoldierLatencyMeta& meta = soldierLatencyMeta()[this];
+    bool reseed = (meta.validSamples <= 0);
+    if (!reseed)
     {
-        SoldierLatencyMeta& meta = soldierLatencyMeta()[this];
-        bool reseed = (meta.validSamples <= 0);
-        if (!reseed)
-        {
-            const int prevIdx = (m_latencyIndex + 15) & 15;
-            const float dx = position.x - m_latency[prevIdx].position.x;
-            const float dy = position.y - m_latency[prevIdx].position.y;
-            const float dz = position.z - m_latency[prevIdx].position.z;
-            if (dx * dx + dy * dy + dz * dz > kSoldierTeleportDistSq)
-                reseed = true;
-        }
-        if (reseed)
+        const int prevIdx = (m_latencyIndex + 15) & 15;
+        const float dx = position.x - m_latency[prevIdx].position.x;
+        const float dy = position.y - m_latency[prevIdx].position.y;
+        const float dz = position.z - m_latency[prevIdx].position.z;
+        if (dx * dx + dy * dy + dz * dz > kSoldierTeleportDistSq)
+            reseed = true;
+    }
+    if (reseed)
+    {
+        meta.validSamples = 1;
+        meta.reseedTick = WorldPref::getTickCount();
+        if (LatencyCompensation::isSpawnRingFixEnabled())
         {
             for (int i = 0; i < 16; ++i)
             {
@@ -488,12 +490,12 @@ void SoldierPhysicsNode::updateLatencyState()
                 m_latency[i].pad[0] = m_latency[i].pad[1] = m_latency[i].pad[2] = 0;
             }
             m_latencyIndex = 1;
-            meta.validSamples = 1;
-            meta.reseedTick = WorldPref::getTickCount();
             return;
         }
-        if (meta.validSamples < 16)
-            ++meta.validSamples;
+    }
+    else if (meta.validSamples < 16)
+    {
+        ++meta.validSamples;
     }
 
     LatencyEntry& entry = m_latency[m_latencyIndex];                       // +0x108, entries of 32 B
