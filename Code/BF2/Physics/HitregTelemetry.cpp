@@ -34,7 +34,7 @@ namespace world {
 
 namespace {
 
-int*         const g_telemetryLevel  = Vars::getInt("phy-latencyComp-telemetry", 0);
+int*         const g_telemetryLevel  = Vars::getInt("phy-latencyComp-telemetry", 2);
 const char*  const kDefaultTelemetryFile = "openbf2_hitreg.csv";
 const bool         g_telemetryFileRegistered =
     (Vars::getString("phy-latencyComp-telemetryFile", kDefaultTelemetryFile) != 0);
