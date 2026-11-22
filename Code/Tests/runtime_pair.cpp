@@ -217,6 +217,8 @@ bool LatencyCompensation::isDriftFreeTickEnabled() { return false; }
 int LatencyCompensation::getQueueDrainMaxTarget() { return 3; }
 int LatencyCompensation::getQueueDrainWindow() { return 60; }
 int LatencyCompensation::getQueueDrainCooldown() { return 15; }
+int LatencyCompensation::getQueueDrainDecayTicks() { return 1350; }
+int LatencyCompensation::getQueueDrainReplayBurst() { return 2; }
 void LatencyCompensation::noteQueueReplay(const IPlayer*) {}
 void LatencyCompensation::noteQueueCapDrop(const IPlayer*) {}
 bool LatencyCompensation::shouldDrainPlayerAction(const IPlayer*, int, bool) { return false; }

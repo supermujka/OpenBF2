@@ -531,7 +531,7 @@ void buildConfigSignature(char* buf, std::size_t bufSize)
         buf, bufSize,
         "improved=%d;pf=%.2f;max=%.2f;maxInterp=%d;qDelay=%d;maxQ=%d;"
         "snap=%d;closest=%d;spawnFix=%d;bpFloor=%.1f;tel=%d;sendRate=%d;"
-        "boneHist=%d;qMinInt=%d;qDrain=%d;driftTick=%d",
+        "boneHist=%d;qMinInt=%d;qDrain=%d;driftTick=%d;qMaxT=%d;qDecay=%d;qBurst=%d",
         LatencyCompensation::isImprovedEnabled() ? 1 : 0,
         LatencyCompensation::getPingFactor(),
         LatencyCompensation::getMaxLatency(),
@@ -547,7 +547,10 @@ void buildConfigSignature(char* buf, std::size_t bufSize)
         LatencyCompensation::isBoneHistoryEnabled() ? 1 : 0,
         LatencyCompensation::getQueueDelayMinInterpMs(),
         LatencyCompensation::isQueueDrainEnabled() ? 1 : 0,
-        LatencyCompensation::isDriftFreeTickEnabled() ? 1 : 0);
+        LatencyCompensation::isDriftFreeTickEnabled() ? 1 : 0,
+        LatencyCompensation::getQueueDrainMaxTarget(),
+        LatencyCompensation::getQueueDrainDecayTicks(),
+        LatencyCompensation::getQueueDrainReplayBurst());
 }
 
 void ensureTelemetryOpenAndConfigLogged()

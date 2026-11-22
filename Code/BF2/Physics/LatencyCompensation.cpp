@@ -5,6 +5,7 @@
 #include "../Game/Utility/Vars.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -52,6 +53,8 @@ int*   const g_queueDrain         = Vars::getInt("phy-latencyComp-queueDrain", 1
 int*   const g_queueDrainMaxTarget = Vars::getInt("phy-latencyComp-queueDrainMaxTarget", 3);
 int*   const g_queueDrainWindow   = Vars::getInt("phy-latencyComp-queueDrainWindow", 60);
 int*   const g_queueDrainCooldown = Vars::getInt("phy-latencyComp-queueDrainCooldown", 15);
+int*   const g_queueDrainDecayTicks  = Vars::getInt("phy-latencyComp-queueDrainDecayTicks", 1350);
+int*   const g_queueDrainReplayBurst = Vars::getInt("phy-latencyComp-queueDrainReplayBurst", 2);
 int*   const g_driftFreeTick      = Vars::getInt("phy-latencyComp-driftFreeTick", 1);
 float* const g_broadphaseFloor    = Vars::getFloat("phy-latencyComp-broadphaseFloor", 8.0f);
 int*   const g_debugLog           = Vars::getInt("phy-latencyComp-debugLog", 0);
@@ -75,6 +78,7 @@ struct PlayerQueueState
     int   ticksSinceReplay;
     int   drainDrops;
     int   capDrops;
+    std::uint32_t replayMask30;
 
     PlayerQueueState()
         : activeDelaySec(0.0f)
@@ -86,10 +90,23 @@ struct PlayerQueueState
         , ticksSinceReplay(0)
         , drainDrops(0)
         , capDrops(0)
+        , replayMask30(0u)
     {
         std::memset(depthRing, 0, sizeof(depthRing));
     }
 };
+
+int popCount30(std::uint32_t mask)
+{
+    int count = 0;
+    mask &= 0x3FFFFFFFu;
+    while (mask != 0u)
+    {
+        mask &= (mask - 1u);
+        ++count;
+    }
+    return count;
+}
 
 std::unordered_map<const IPlayer*, PlayerQueueState>& playerQueues()
 {
@@ -419,6 +436,21 @@ int LatencyCompensation::getQueueDrainCooldown()
     return *g_queueDrainCooldown > 0 ? *g_queueDrainCooldown : 15;
 }
 
+int LatencyCompensation::getQueueDrainDecayTicks()
+{
+    return *g_queueDrainDecayTicks >= 300 ? *g_queueDrainDecayTicks : 300;
+}
+
+int LatencyCompensation::getQueueDrainReplayBurst()
+{
+    int v = *g_queueDrainReplayBurst;
+    if (v < 1)
+        v = 1;
+    else if (v > 10)
+        v = 10;
+    return v;
+}
+
 void LatencyCompensation::noteQueueReplay(const IPlayer* player)
 {
     if (!player)
@@ -430,13 +462,25 @@ void LatencyCompensation::noteQueueReplay(const IPlayer* player)
     if (!isQueueDrainEnabled())
         return;
 
-    st.ticksSinceReplay = 0;
     st.depthRingCount = 0;
     st.depthRingWrite = 0;
     st.lastMinWin = 0;
-    const int maxTarget = getQueueDrainMaxTarget();
-    if (st.targetDepth < maxTarget)
-        ++st.targetDepth;
+
+    if (!player->getIsAlive())
+    {
+        st.replayMask30 = 0u;
+        return;
+    }
+
+    st.ticksSinceReplay = 0;
+    st.replayMask30 = ((st.replayMask30 << 1) | 1u) & 0x3FFFFFFFu;
+    if (popCount30(st.replayMask30) >= getQueueDrainReplayBurst())
+    {
+        const int maxTarget = getQueueDrainMaxTarget();
+        if (st.targetDepth < maxTarget)
+            ++st.targetDepth;
+        st.replayMask30 = 0u;
+    }
 }
 
 void LatencyCompensation::noteQueueCapDrop(const IPlayer* player)
@@ -453,6 +497,10 @@ bool LatencyCompensation::shouldDrainPlayerAction(const IPlayer* player, int pre
         return false;
 
     PlayerQueueState& st = playerQueues()[player];
+    const int maxTarget = getQueueDrainMaxTarget();
+    if (st.targetDepth > maxTarget)
+        st.targetDepth = maxTarget;
+
     const int win = getQueueDrainWindow();
     st.depthRing[st.depthRingWrite] = prePopDepth;
     st.depthRingWrite = (st.depthRingWrite + 1) % 60;
@@ -460,12 +508,21 @@ bool LatencyCompensation::shouldDrainPlayerAction(const IPlayer* player, int pre
         ++st.depthRingCount;
 
     ++st.ticksSinceDrop;
-    ++st.ticksSinceReplay;
-    if (st.ticksSinceReplay >= 3600)
+    if (player->getIsAlive())
     {
-        if (st.targetDepth > 1)
-            --st.targetDepth;
-        st.ticksSinceReplay = 0;
+        st.replayMask30 = (st.replayMask30 << 1) & 0x3FFFFFFFu;
+        ++st.ticksSinceReplay;
+        const int decayTicks = getQueueDrainDecayTicks();
+        if (st.ticksSinceReplay >= decayTicks)
+        {
+            if (st.targetDepth > 1)
+                --st.targetDepth;
+            st.ticksSinceReplay = 0;
+        }
+    }
+    else
+    {
+        st.replayMask30 = 0u;
     }
 
     const int sampleCount = st.depthRingCount < win ? st.depthRingCount : win;

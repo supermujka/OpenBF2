@@ -55,6 +55,8 @@ public:
     static int  getQueueDrainMaxTarget();
     static int  getQueueDrainWindow();
     static int  getQueueDrainCooldown();
+    static int  getQueueDrainDecayTicks();
+    static int  getQueueDrainReplayBurst();
     static void noteQueueReplay(const IPlayer* player);
     static void noteQueueCapDrop(const IPlayer* player);
     static bool shouldDrainPlayerAction(const IPlayer* player, int prePopDepth, bool canDrop);
