@@ -55,6 +55,8 @@
 #include "../../Scene/Object/PlayerManager.h" // the real PlayerManager - replaces the local shim
 #include "../Objects/IPlayer.h"              // per-player handleFrameUpdate loop
 #include "../Objects/ICameraObject.h"       // mainLoop's held camera: getCamera / setInterpolatedMode
+#include "../../Physics/LatencyCompensation.h" // [CHOSEN, not recovered] drift-free dedicated tick toggle
+#include "../../Physics/HitregTelemetry.h"     // [CHOSEN, not recovered] per-tick duration telemetry
 
 #include <list>
 #include <string>
@@ -1899,32 +1901,79 @@ bool BF2Engine::mainLoop()
 
     updateStatusMonitor(false);
 
-    // Limit dedicated frames to 30 Hz using time since frame entry. Each sleep-loop
-    // iteration subtracts overhead again; a backward clock ends the wait.
+    // Limit dedicated frames to 30 Hz.
     if (isDedicated())                                              // BF2.exe 0x40CA80: the frame limiter is server-only
     {
-    double remaining = (1.0 / 30.0)                                 // dbl_8892F10
-                     - (g_system->getWallClockTime() - frameStartWallClock)
-                     - *s_sleepOverheadTime;                        //  fsub m32
-    if (remaining > 0.0)
-    {
-        double sleepStart = g_system->getWallClockTime();           //  (var_1B0, fixed)
-        if (remaining > 0.0)                                        // the literal re-test
+        static bool s_hasDeadline = false;
+        static std::chrono::steady_clock::time_point s_nextDeadline;
+        static bool s_hasPrevTickEnd = false;
+        static std::chrono::steady_clock::time_point s_prevTickEnd;
+
+        if (world::LatencyCompensation::isDriftFreeTickEnabled())
         {
-            do
+            const std::chrono::nanoseconds kTickNs(33333333LL);
+            const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+            if (!s_hasDeadline)
             {
-                // truncated milliseconds: remaining * 1000.0f (flt_888B168) with the FPU rounding
-                // mode forced to chop (CW | 0x0C00) around the fistp at 0x8137744.
-                g_system->sleep((int)(remaining * 1000.0f));        //  vcall +0x20
-                double elapsed = g_system->getWallClockTime() - sleepStart;
-                if (elapsed >= 0.0)
-                    remaining = remaining - elapsed - *s_sleepOverheadTime;
-                else
-                    remaining = -1.0f;                              //  flt_888B590
+                s_nextDeadline = now + kTickNs;
+                s_hasDeadline = true;
             }
-            while (remaining > 0.0);
+            else
+            {
+                s_nextDeadline += kTickNs;
+            }
+
+            if (now > s_nextDeadline + kTickNs * 2)
+                s_nextDeadline = now;
+
+            if (now < s_nextDeadline)
+            {
+                const std::chrono::steady_clock::time_point sleepUntil =
+                    s_nextDeadline - std::chrono::microseconds(1500);
+                if (now < sleepUntil)
+                    std::this_thread::sleep_until(sleepUntil);
+                while (std::chrono::steady_clock::now() < s_nextDeadline)
+                    std::this_thread::yield();
+            }
+
+            const std::chrono::steady_clock::time_point tickEnd = std::chrono::steady_clock::now();
+            if (s_hasPrevTickEnd)
+            {
+                const long long us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    tickEnd - s_prevTickEnd).count();
+                world::HitregTelemetry::noteServerTickUs(static_cast<int>(us));
+            }
+            s_prevTickEnd = tickEnd;
+            s_hasPrevTickEnd = true;
         }
-    }
+        else
+        {
+            s_hasDeadline = false;
+            s_hasPrevTickEnd = false;
+
+            double remaining = (1.0 / 30.0)                                 // dbl_8892F10
+                             - (g_system->getWallClockTime() - frameStartWallClock)
+                             - *s_sleepOverheadTime;                        //  fsub m32
+            if (remaining > 0.0)
+            {
+                double sleepStart = g_system->getWallClockTime();           //  (var_1B0, fixed)
+                if (remaining > 0.0)                                        // the literal re-test
+                {
+                    do
+                    {
+                        // truncated milliseconds: remaining * 1000.0f (flt_888B168) with the FPU rounding
+                        // mode forced to chop (CW | 0x0C00) around the fistp at 0x8137744.
+                        g_system->sleep((int)(remaining * 1000.0f));        //  vcall +0x20
+                        double elapsed = g_system->getWallClockTime() - sleepStart;
+                        if (elapsed >= 0.0)
+                            remaining = remaining - elapsed - *s_sleepOverheadTime;
+                        else
+                            remaining = -1.0f;                              //  flt_888B590
+                    }
+                    while (remaining > 0.0);
+                }
+            }
+        }
 
     // Every exit from the limiter lands here (0x8137704 jbe and 0x813778C jmp both target it), so
     // the arena boundary is crossed exactly once per frame whether or not the frame slept.

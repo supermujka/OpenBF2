@@ -659,6 +659,8 @@ void probeRayVsBoneList(const Skeleton::BoneTemplate* boneTemplates,
     out.minSurfaceDist = FLT_MAX;
     out.nearestBone = -1;
     out.nearestPart = 0;
+    out.nearestRayPt.x = out.nearestRayPt.y = out.nearestRayPt.z = 0.0f;
+    out.nearestCapPt.x = out.nearestCapPt.y = out.nearestCapPt.z = 0.0f;
 
     if (!boneTemplates || !boneIndices || indexCount <= 0
         || (!overrideTransforms && !liveTransforms))
@@ -671,6 +673,7 @@ void probeRayVsBoneList(const Skeleton::BoneTemplate* boneTemplates,
     rayAxis.z = end.z - start.z;
 
     int bestClosestPrio = -1;
+    float bestSignedSurfDist = FLT_MAX;
     for (int i = 0; i < indexCount; ++i)
     {
         const int candBoneIndex = boneIndices[i];
@@ -703,7 +706,18 @@ void probeRayVsBoneList(const Skeleton::BoneTemplate* boneTemplates,
         float paramT = 0.0f;
         const float segDist = hfe::world::getClosestDistanceBetweenLines(
             start, end, capsuleStart, capsuleEnd, paramS, paramT);
-        float surfDist = segDist - radius;
+        const float signedSurfDist = segDist - radius;
+        if (signedSurfDist < bestSignedSurfDist)
+        {
+            bestSignedSurfDist = signedSurfDist;
+            out.nearestRayPt.x = start.x + rayAxis.x * paramS;
+            out.nearestRayPt.y = start.y + rayAxis.y * paramS;
+            out.nearestRayPt.z = start.z + rayAxis.z * paramS;
+            out.nearestCapPt.x = capsuleStart.x + capsuleAxis.x * paramT;
+            out.nearestCapPt.y = capsuleStart.y + capsuleAxis.y * paramT;
+            out.nearestCapPt.z = capsuleStart.z + capsuleAxis.z * paramT;
+        }
+        float surfDist = signedSurfDist;
         if (surfDist < 0.0f)
             surfDist = 0.0f;
 

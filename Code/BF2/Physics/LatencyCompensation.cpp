@@ -5,6 +5,7 @@
 #include "../Game/Utility/Vars.h"
 
 #include <cstddef>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 
@@ -46,7 +47,12 @@ int*   const g_snapshotProjectile = Vars::getInt("phy-latencyComp-snapshotProjec
 int*   const g_closestBone        = Vars::getInt("phy-latencyComp-closestBone", 0);
 int*   const g_spawnRingFix       = Vars::getInt("phy-latencyComp-spawnRingFix", 1);
 int*   const g_boneHistory        = Vars::getInt("phy-latencyComp-boneHistory", 1);
-int*   const g_qDelayMinInterpMs  = Vars::getInt("phy-latencyComp-qDelayMinInterpMs", 100);
+int*   const g_qDelayMinInterpMs  = Vars::getInt("phy-latencyComp-qDelayMinInterpMs", 0);
+int*   const g_queueDrain         = Vars::getInt("phy-latencyComp-queueDrain", 1);
+int*   const g_queueDrainMaxTarget = Vars::getInt("phy-latencyComp-queueDrainMaxTarget", 3);
+int*   const g_queueDrainWindow   = Vars::getInt("phy-latencyComp-queueDrainWindow", 60);
+int*   const g_queueDrainCooldown = Vars::getInt("phy-latencyComp-queueDrainCooldown", 15);
+int*   const g_driftFreeTick      = Vars::getInt("phy-latencyComp-driftFreeTick", 1);
 float* const g_broadphaseFloor    = Vars::getFloat("phy-latencyComp-broadphaseFloor", 8.0f);
 int*   const g_debugLog           = Vars::getInt("phy-latencyComp-debugLog", 0);
 
@@ -60,7 +66,29 @@ struct PlayerQueueState
 {
     std::vector<ActionArrival> arrivals;
     float activeDelaySec;
-    PlayerQueueState() : activeDelaySec(0.0f) {}
+    int   depthRing[60];
+    int   depthRingWrite;
+    int   depthRingCount;
+    int   lastMinWin;
+    int   targetDepth;
+    int   ticksSinceDrop;
+    int   ticksSinceReplay;
+    int   drainDrops;
+    int   capDrops;
+
+    PlayerQueueState()
+        : activeDelaySec(0.0f)
+        , depthRingWrite(0)
+        , depthRingCount(0)
+        , lastMinWin(0)
+        , targetDepth(1)
+        , ticksSinceDrop(0)
+        , ticksSinceReplay(0)
+        , drainDrops(0)
+        , capDrops(0)
+    {
+        std::memset(depthRing, 0, sizeof(depthRing));
+    }
 };
 
 std::unordered_map<const IPlayer*, PlayerQueueState>& playerQueues()
@@ -354,6 +382,141 @@ void LatencyCompensation::forgetPlayer(const IPlayer* player)
 {
     if (player)
         playerQueues().erase(player);
+}
+
+bool LatencyCompensation::isQueueDrainEnabled()
+{
+    return m_isEnabled && *g_improved != 0 && *g_queueDrain != 0;
+}
+
+bool LatencyCompensation::isDriftFreeTickEnabled()
+{
+    return m_isEnabled && *g_improved != 0 && *g_driftFreeTick != 0;
+}
+
+int LatencyCompensation::getQueueDrainMaxTarget()
+{
+    int v = *g_queueDrainMaxTarget;
+    if (v < 1)
+        v = 1;
+    else if (v > 4)
+        v = 4;
+    return v;
+}
+
+int LatencyCompensation::getQueueDrainWindow()
+{
+    int v = *g_queueDrainWindow;
+    if (v < 15)
+        v = 15;
+    else if (v > 60)
+        v = 60;
+    return v;
+}
+
+int LatencyCompensation::getQueueDrainCooldown()
+{
+    return *g_queueDrainCooldown > 0 ? *g_queueDrainCooldown : 15;
+}
+
+void LatencyCompensation::noteQueueReplay(const IPlayer* player)
+{
+    if (!player)
+        return;
+
+    PlayerQueueState& st = playerQueues()[player];
+    st.activeDelaySec = 0.0f;
+
+    if (!isQueueDrainEnabled())
+        return;
+
+    st.ticksSinceReplay = 0;
+    st.depthRingCount = 0;
+    st.depthRingWrite = 0;
+    st.lastMinWin = 0;
+    const int maxTarget = getQueueDrainMaxTarget();
+    if (st.targetDepth < maxTarget)
+        ++st.targetDepth;
+}
+
+void LatencyCompensation::noteQueueCapDrop(const IPlayer* player)
+{
+    if (!player)
+        return;
+    ++playerQueues()[player].capDrops;
+}
+
+bool LatencyCompensation::shouldDrainPlayerAction(const IPlayer* player, int prePopDepth,
+                                                  bool canDrop)
+{
+    if (!player)
+        return false;
+
+    PlayerQueueState& st = playerQueues()[player];
+    const int win = getQueueDrainWindow();
+    st.depthRing[st.depthRingWrite] = prePopDepth;
+    st.depthRingWrite = (st.depthRingWrite + 1) % 60;
+    if (st.depthRingCount < 60)
+        ++st.depthRingCount;
+
+    ++st.ticksSinceDrop;
+    ++st.ticksSinceReplay;
+    if (st.ticksSinceReplay >= 3600)
+    {
+        if (st.targetDepth > 1)
+            --st.targetDepth;
+        st.ticksSinceReplay = 0;
+    }
+
+    const int sampleCount = st.depthRingCount < win ? st.depthRingCount : win;
+    int minWin = prePopDepth;
+    if (sampleCount > 0)
+    {
+        minWin = st.depthRing[(st.depthRingWrite + 59) % 60];
+        for (int i = 1; i < sampleCount; ++i)
+        {
+            const int idx = (st.depthRingWrite + 60 - 1 - i) % 60;
+            if (st.depthRing[idx] < minWin)
+                minWin = st.depthRing[idx];
+        }
+    }
+    st.lastMinWin = minWin;
+
+    if (!isQueueDrainEnabled() || !canDrop || prePopDepth < 2 || st.depthRingCount < win)
+        return false;
+
+    const int cooldown = getQueueDrainCooldown();
+    if (minWin >= st.targetDepth + 1 && st.ticksSinceDrop >= cooldown)
+    {
+        ++st.drainDrops;
+        st.ticksSinceDrop = 0;
+        st.depthRingCount = 0;
+        st.depthRingWrite = 0;
+        return true;
+    }
+    return false;
+}
+
+void LatencyCompensation::getPlayerQueueStats(const IPlayer* player, int& outMinWin,
+                                              int& outTarget, int& outDrainDrops,
+                                              int& outCapDrops)
+{
+    outMinWin = 0;
+    outTarget = 1;
+    outDrainDrops = 0;
+    outCapDrops = 0;
+    if (!player)
+        return;
+
+    const std::unordered_map<const IPlayer*, PlayerQueueState>& queues = playerQueues();
+    std::unordered_map<const IPlayer*, PlayerQueueState>::const_iterator it = queues.find(player);
+    if (it == queues.end())
+        return;
+
+    outMinWin = it->second.lastMinWin;
+    outTarget = it->second.targetDepth;
+    outDrainDrops = it->second.drainDrops;
+    outCapDrops = it->second.capDrops;
 }
 
 float LatencyCompensation::getPlayerQueueDelay(const IPlayer* player)

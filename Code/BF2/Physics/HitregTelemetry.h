@@ -54,8 +54,12 @@ public:
     // Contact arbitration (delivered vs wall/terrain/other-soldier override).
     static void noteProjectileContactDelivered(const IObject* projectileObject,
                                                IObject* contactObject,
+                                               const Vec3& contactPoint,
                                                float contactDepthSq,
                                                int contactMaterial);
+
+    // Server main-loop tick duration sampler (microseconds).
+    static void noteServerTickUs(int tickUs);
 
     // Confirmed damage & multipliers.
     static void noteProjectileDamageCalc(const IObject* projectileObject,

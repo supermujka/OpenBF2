@@ -32,6 +32,8 @@ struct RaySkeletonProbe
     float minSurfaceDist;
     int   nearestBone;
     int   nearestPart;
+    hfe::Vec3 nearestRayPt;
+    hfe::Vec3 nearestCapPt;
 };
 
 // [CHOSEN, not recovered] Interpolated historical skeleton-local transforms for collision bones (V2).

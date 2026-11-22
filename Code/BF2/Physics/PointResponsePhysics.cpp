@@ -310,7 +310,7 @@ void PointResponsePhysics::solveImpulse(IPhysicsNode* node)
     // [CHOSEN, not recovered] Log final contact arbitration (delivered vs wall/terrain override).
     if (HitregTelemetry::isEnabled())
         HitregTelemetry::noteProjectileContactDelivered(
-            object, m_contactObject, m_contactDepthSq, m_contactMaterial);
+            object, m_contactObject, m_contactPoint, m_contactDepthSq, m_contactMaterial);
     CollisionFaceInfo* const faceInfo =
         m_hasFaceInfo == true ? reinterpret_cast<CollisionFaceInfo*>(&m_faceInfo) : 0;
     object->handleCollision(m_contactObject, m_contactSpeed, m_contactNormal, penetration,

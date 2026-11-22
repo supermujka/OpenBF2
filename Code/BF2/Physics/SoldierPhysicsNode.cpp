@@ -683,7 +683,8 @@ void SoldierPhysicsNode::sampleLatencyTransform(float latency, bool simulateVani
                                                 Mat4& outTransform, int* outPose,
                                                 int* outValidSamples,
                                                 int* outTicksSinceReseed,
-                                                bool* outVanillaUnfilled) const
+                                                bool* outVanillaUnfilled,
+                                                Vec3* outVelocity) const
 {
     if (outVanillaUnfilled)
         *outVanillaUnfilled = false;
@@ -718,6 +719,8 @@ void SoldierPhysicsNode::sampleLatencyTransform(float latency, bool simulateVani
         if (outPose)
             *outPose = -1;
         outTransform = getAbsoluteTransformation();
+        if (outVelocity)
+            *outVelocity = getPositionalSpeed();
         return;
     }
 
@@ -727,6 +730,8 @@ void SoldierPhysicsNode::sampleLatencyTransform(float latency, bool simulateVani
         if (outPose)
             *outPose = -1;
         outTransform = getAbsoluteTransformation();
+        if (outVelocity)
+            *outVelocity = getPositionalSpeed();
         return;
     }
 
@@ -788,6 +793,13 @@ void SoldierPhysicsNode::sampleLatencyTransform(float latency, bool simulateVani
 
     if (outPose)
         *outPose = olderPose;
+    if (outVelocity)
+    {
+        const float invDt = 1.0f / samplePeriod;
+        outVelocity->x = (newerPos.x - olderPos.x) * invDt;
+        outVelocity->y = (newerPos.y - olderPos.y) * invDt;
+        outVelocity->z = (newerPos.z - olderPos.z) * invDt;
+    }
 }
 
 bool SoldierPhysicsNode::sampleHistoricalBonePose(float latency,

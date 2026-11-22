@@ -212,6 +212,15 @@ float LatencyCompensation::getPlayerQueueDelay(const IPlayer*) { return 0.0f; }
 void LatencyCompensation::snapshotProjectileLatency(const IObject*, IPlayer*) {}
 void LatencyCompensation::clearProjectileLatency(const IObject*) {}
 float LatencyCompensation::getProjectileLatency(const IObject*, IPlayer*) { return 0.0f; }
+bool LatencyCompensation::isQueueDrainEnabled() { return false; }
+bool LatencyCompensation::isDriftFreeTickEnabled() { return false; }
+int LatencyCompensation::getQueueDrainMaxTarget() { return 3; }
+int LatencyCompensation::getQueueDrainWindow() { return 60; }
+int LatencyCompensation::getQueueDrainCooldown() { return 15; }
+void LatencyCompensation::noteQueueReplay(const IPlayer*) {}
+void LatencyCompensation::noteQueueCapDrop(const IPlayer*) {}
+bool LatencyCompensation::shouldDrainPlayerAction(const IPlayer*, int, bool) { return false; }
+void LatencyCompensation::getPlayerQueueStats(const IPlayer*, int& a, int& b, int& c, int& d) { a = 0; b = 1; c = 0; d = 0; }
 
 bool HitregTelemetry::isEnabled() { return false; }
 int HitregTelemetry::getLevel() { return 0; }
@@ -225,7 +234,8 @@ void HitregTelemetry::recordSoldierProbe(IObject*, IPlayer*, IObject*, const Sol
                                          float, int, const Mat4&, bool, int, int, const Vec3&,
                                          bool, float, bool,
                                          bool, const anim::HistoricalBonePose*) {}
-void HitregTelemetry::noteProjectileContactDelivered(const IObject*, IObject*, float, int) {}
+void HitregTelemetry::noteProjectileContactDelivered(const IObject*, IObject*, const Vec3&, float, int) {}
+void HitregTelemetry::noteServerTickUs(int) {}
 void HitregTelemetry::noteProjectileDamageCalc(const IObject*, int, int, float, float, float) {}
 void HitregTelemetry::noteServerGiveDamage(const IObject*, float, float, float, bool) {}
 void HitregTelemetry::finishProjectileCollisionDamage(const IObject*, IObject*, bool) {}

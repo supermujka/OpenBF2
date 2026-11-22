@@ -71,7 +71,8 @@ public:
     void sampleLatencyTransform(float latency, bool simulateVanillaUnfilled,
                                 Mat4& outTransform, int* outPose,
                                 int* outValidSamples, int* outTicksSinceReseed,
-                                bool* outVanillaUnfilled = 0) const;
+                                bool* outVanillaUnfilled = 0,
+                                Vec3* outVelocity = 0) const;
     // [CHOSEN, not recovered] Hitreg V2: samples & interpolates historical collision-bone transforms.
     bool sampleHistoricalBonePose(float latency, anim::HistoricalBonePose& outPose) const;
     void setCollidingMeshTangentSpeed(const Vec3&);

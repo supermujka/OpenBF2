@@ -48,6 +48,18 @@ public:
     static void snapshotProjectileLatency(const IObject* projectileObject, IPlayer* owner);
     static void clearProjectileLatency(const IObject* projectileObject);
     static float getProjectileLatency(const IObject* projectileObject, IPlayer* owner);
+
+    // [CHOSEN, not recovered] Hitreg V3 Phase 1: ActionBuffer queue-drain & drift-free tick controls.
+    static bool isQueueDrainEnabled();
+    static bool isDriftFreeTickEnabled();
+    static int  getQueueDrainMaxTarget();
+    static int  getQueueDrainWindow();
+    static int  getQueueDrainCooldown();
+    static void noteQueueReplay(const IPlayer* player);
+    static void noteQueueCapDrop(const IPlayer* player);
+    static bool shouldDrainPlayerAction(const IPlayer* player, int prePopDepth, bool canDrop);
+    static void getPlayerQueueStats(const IPlayer* player, int& outMinWin, int& outTarget,
+                                    int& outDrainDrops, int& outCapDrops);
 };
 
 } // namespace world

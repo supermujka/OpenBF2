@@ -3200,10 +3200,30 @@ void GameServer::clearPlayerActions()
         if (!player)
             continue;
 
-        if (player->getActionBuffer()->size() > 4)                   // something older than the last 4?
+        const int maxCap = world::LatencyCompensation::isQueueDrainEnabled() ? 8 : 4;
+        ActionBuffer* const ab = player->getActionBuffer();
+        if (ab->size() > maxCap)                                    // something older than the cap?
         {
-            while (player->getActionBuffer()->size() > 4)            // drop the oldest until 4 remain
-                player->getActionBuffer()->m_entries.pop_front();
+            while (ab->size() > maxCap)                             // drop oldest while preserving edges
+            {
+                if (world::LatencyCompensation::isQueueDrainEnabled() && ab->size() >= 2)
+                {
+                    const PlayerAction dropped = ab->m_entries.front().m_action;
+                    ab->m_entries.pop_front();
+                    PlayerAction& survivor = ab->m_entries.front().m_action;
+                    survivor.m_buttonMaskLow  |= dropped.m_buttonMaskLow;
+                    survivor.m_buttonMaskHigh |= dropped.m_buttonMaskHigh;
+                    const int sumX = static_cast<int>(survivor.m_axis[4]) + static_cast<int>(dropped.m_axis[4]);
+                    const int sumY = static_cast<int>(survivor.m_axis[5]) + static_cast<int>(dropped.m_axis[5]);
+                    survivor.m_axis[4] = static_cast<short>(sumX > 32767 ? 32767 : (sumX < -32767 ? -32767 : sumX));
+                    survivor.m_axis[5] = static_cast<short>(sumY > 32767 ? 32767 : (sumY < -32767 ? -32767 : sumY));
+                }
+                else
+                {
+                    ab->m_entries.pop_front();
+                }
+                world::LatencyCompensation::noteQueueCapDrop(player);
+            }
             player->resetTickCounter();                              // IPlayer +0xDC
         }
     }
@@ -3393,8 +3413,9 @@ bool GameServer::simulatePlayerUpdate(world::IPlayer* player, float dt)
 
         if (buffer->m_entries.empty())
         {
-            // [CHOSEN, not recovered] Replayed ticks have no fresh packet arrival queue wait.
-            world::LatencyCompensation::clearPlayerActiveQueueDelay(player);
+            // [CHOSEN, not recovered] Replayed ticks have no fresh arrival queue wait;
+            // also adaptively raises the per-player queue drain target on starvation.
+            world::LatencyCompensation::noteQueueReplay(player);
             // nothing queued - replay m_current, see the header block
             const int replays = buffer->m_replayCount;
             if (world::HitregTelemetry::isEnabled())
@@ -3412,6 +3433,45 @@ bool GameServer::simulatePlayerUpdate(world::IPlayer* player, float dt)
         }
         else
         {
+            // [CHOSEN, not recovered] Hitreg V3 Phase 1: bleed standing ActionBuffer excess safely.
+            const int prePopDepth = static_cast<int>(buffer->m_entries.size());
+            bool canDrop = false;
+            int mergedAxisX = 0;
+            int mergedAxisY = 0;
+            if (prePopDepth >= 2)
+            {
+                const PlayerAction& prev = buffer->m_current;
+                const PlayerAction& first = buffer->m_entries.front().m_action;
+                std::list<ActionBufferEntry>::const_iterator secondIt = buffer->m_entries.begin();
+                ++secondIt;
+                const PlayerAction& next = secondIt->m_action;
+
+                if ((first.m_buttonMaskLow & 1u) == 0u
+                    && first.m_buttonMaskLow == prev.m_buttonMaskLow
+                    && first.m_buttonMaskHigh == prev.m_buttonMaskHigh
+                    && first.m_flag == prev.m_flag
+                    && next.m_buttonMaskLow == first.m_buttonMaskLow
+                    && next.m_buttonMaskHigh == first.m_buttonMaskHigh
+                    && next.m_flag == first.m_flag)
+                {
+                    mergedAxisX = static_cast<int>(next.m_axis[4]) + static_cast<int>(first.m_axis[4]);
+                    mergedAxisY = static_cast<int>(next.m_axis[5]) + static_cast<int>(first.m_axis[5]);
+                    if (mergedAxisX >= -32767 && mergedAxisX <= 32767
+                        && mergedAxisY >= -32767 && mergedAxisY <= 32767)
+                    {
+                        canDrop = true;
+                    }
+                }
+            }
+            if (world::LatencyCompensation::shouldDrainPlayerAction(player, prePopDepth, canDrop))
+            {
+                std::list<ActionBufferEntry>::iterator secondIt = buffer->m_entries.begin();
+                ++secondIt;
+                secondIt->m_action.m_axis[4] = static_cast<short>(mergedAxisX);
+                secondIt->m_action.m_axis[5] = static_cast<short>(mergedAxisY);
+                buffer->m_entries.pop_front();
+            }
+
             // consume the oldest queued action and make it current
             PlayerAction& front = buffer->m_entries.front().m_action;
             front.get(input);

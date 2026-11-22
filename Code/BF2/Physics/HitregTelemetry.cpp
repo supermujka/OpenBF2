@@ -2,6 +2,7 @@
 
 #include "HitregTelemetry.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +14,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "IPhysicsNode.h"
 #include "LatencyCompensation.h"
 #include "SoldierPhysicsNode.h"
 #include "../Animation/BoneAnimation/Skeleton.h"
@@ -20,13 +22,16 @@
 #include "../Core/System.h"
 #include "../Game/IGameLogic.h"
 #include "../Game/Objects/IAnimatedBundle.h"
+#include "../Game/Objects/ICameraObject.h"
 #include "../Game/Objects/IObject.h"
 #include "../Game/Objects/IObjectTemplate.h"
 #include "../Game/Objects/IPlayer.h"
+#include "../Game/Objects/ObjectLayoutAccess.h"
 #include "../Game/Objects/Game/Soldier.h"
 #include "../Game/Utility/Vars.h"
 #include "../Math/Mat4.h"
 #include "../Math/Vec3.h"
+#include "../Scene/Object/ObjectUtil.h"
 
 namespace dice {
 namespace hfe {
@@ -100,6 +105,11 @@ struct ShotRecord
     int           pendingBone;
     int           pendingPart;
     float         pendingDepthSq;
+    Vec3          pendingRayStart;
+    Vec3          pendingHitPos;
+    bool          hasShooterEye;
+    Vec3          shooterCenterPos;
+    Vec3          shooterEyePos;
 
     // Damage trace for current collision.
     bool          hasDmgCalc;
@@ -137,6 +147,7 @@ struct ShotRecord
         , pendingBone(-1)
         , pendingPart(0)
         , pendingDepthSq(-1.0f)
+        , hasShooterEye(false)
         , hasDmgCalc(false)
         , matA(0)
         , matB(0)
@@ -150,6 +161,10 @@ struct ShotRecord
         , killed(false)
     {
         startPos.x = startPos.y = startPos.z = 0.0f;
+        pendingRayStart.x = pendingRayStart.y = pendingRayStart.z = 0.0f;
+        pendingHitPos.x = pendingHitPos.y = pendingHitPos.z = 0.0f;
+        shooterCenterPos.x = shooterCenterPos.y = shooterCenterPos.z = 0.0f;
+        shooterEyePos.x = shooterEyePos.y = shooterEyePos.z = 0.0f;
     }
 };
 
@@ -166,6 +181,9 @@ struct TelemetryLoggerState
     int         lastFlushTick;
     std::uint64_t nextShotId;
     bool        atexitRegistered;
+    int         tickUsRing[60];
+    int         tickUsWrite;
+    int         tickUsCount;
 
     TelemetryLoggerState()
         : file(0)
@@ -174,7 +192,10 @@ struct TelemetryLoggerState
         , lastFlushTick(0)
         , nextShotId(1)
         , atexitRegistered(false)
+        , tickUsWrite(0)
+        , tickUsCount(0)
     {
+        std::memset(tickUsRing, 0, sizeof(tickUsRing));
         buffer.reserve(65536);
     }
 };
@@ -217,7 +238,12 @@ const char* kCsvHeader =
     "v2_hit,v2_bone,v2_part,v2_miss_m,"
     "v11_hit,v11_bone,v11_part,v11_miss_m,"
     "nodedup_hit,nodedup_bone,nodedup_miss_m,"
-    "outcome,blocker,blocker_mat,override_margin_m,"
+    "q_min_win,q_target,q_drain_drops,q_cap_drops,tick_us_p50,tick_us_p99,"
+    "v2_vel_resid_m,v2_dt_err_ms,v11_dt_err_ms,"
+    "v2a_hit,v2a_bone,v2a_miss_m,v2a_dt_err_ms,"
+    "c17_hit,c17_bone,c17_miss_m,c17_dt_err_ms,"
+    "c33_hit,c33_bone,c33_miss_m,c33_dt_err_ms,"
+    "outcome,blocker,blocker_mat,override_margin_m,t_wall_m,t_soldier_m,obj_class,eye_clear,"
     "mat_a,mat_b,base_dmg,mat_mod,angle_mod,final_dmg,hp_before,hp_after,killed,hitmarker\n";
 
 void flushBufferToDisk(bool forceFlush)
@@ -459,13 +485,53 @@ float computeSweepLatencyFromInputs(IPlayer* owner, float pingFactorOverride,
     return clampRewindLatency(lat);
 }
 
+void computeTickUsPercentiles(int& outP50, int& outP99)
+{
+    outP50 = 0;
+    outP99 = 0;
+    const TelemetryLoggerState& st = loggerState();
+    const int n = st.tickUsCount < 60 ? st.tickUsCount : 60;
+    if (n <= 0)
+        return;
+
+    int sorted[60];
+    for (int i = 0; i < n; ++i)
+        sorted[i] = st.tickUsRing[i];
+    std::sort(sorted, sorted + n);
+    outP50 = sorted[n / 2];
+    const int idx99 = (n * 99) / 100;
+    outP99 = sorted[idx99 < n ? idx99 : (n - 1)];
+}
+
+void computeVelResidual(const anim::RaySkeletonProbe& p, const Vec3& vel,
+                        float& outResidM, float& outDtErrMs)
+{
+    outResidM = 0.0f;
+    outDtErrMs = 0.0f;
+    const float speedSq = vel.x * vel.x + vel.y * vel.y + vel.z * vel.z;
+    if (speedSq < 4.0f)
+        return;
+    const float speed = std::sqrt(speedSq);
+    const float dx = p.nearestRayPt.x - p.nearestCapPt.x;
+    const float dy = p.nearestRayPt.y - p.nearestCapPt.y;
+    const float dz = p.nearestRayPt.z - p.nearestCapPt.z;
+    const float resid = (dx * vel.x + dy * vel.y + dz * vel.z) / speed;
+    float dtErrMs = -1000.0f * resid / speed;
+    if (dtErrMs > 500.0f)
+        dtErrMs = 500.0f;
+    else if (dtErrMs < -500.0f)
+        dtErrMs = -500.0f;
+    outResidM = resid;
+    outDtErrMs = dtErrMs;
+}
+
 void buildConfigSignature(char* buf, std::size_t bufSize)
 {
     std::snprintf(
         buf, bufSize,
         "improved=%d;pf=%.2f;max=%.2f;maxInterp=%d;qDelay=%d;maxQ=%d;"
         "snap=%d;closest=%d;spawnFix=%d;bpFloor=%.1f;tel=%d;sendRate=%d;"
-        "boneHist=%d;qMinInt=%d",
+        "boneHist=%d;qMinInt=%d;qDrain=%d;driftTick=%d",
         LatencyCompensation::isImprovedEnabled() ? 1 : 0,
         LatencyCompensation::getPingFactor(),
         LatencyCompensation::getMaxLatency(),
@@ -479,7 +545,9 @@ void buildConfigSignature(char* buf, std::size_t bufSize)
         *g_telemetryLevel,
         *g_netServerSendRate,
         LatencyCompensation::isBoneHistoryEnabled() ? 1 : 0,
-        LatencyCompensation::getQueueDelayMinInterpMs());
+        LatencyCompensation::getQueueDelayMinInterpMs(),
+        LatencyCompensation::isQueueDrainEnabled() ? 1 : 0,
+        LatencyCompensation::isDriftFreeTickEnabled() ? 1 : 0);
 }
 
 void ensureTelemetryOpenAndConfigLogged()
@@ -525,12 +593,12 @@ void ensureTelemetryOpenAndConfigLogged()
         std::fflush(stderr);
     }
 
-    char sig[320];
+    char sig[384];
     buildConfigSignature(sig, sizeof(sig));
     if (st.lastConfigSig != sig)
     {
         st.lastConfigSig = sig;
-        char line[640];
+        char line[768];
         std::snprintf(
             line, sizeof(line),
             "CONFIG,%d,%.3f"
@@ -538,8 +606,9 @@ void ensureTelemetryOpenAndConfigLogged()
             ",,,,,,,,,,,,,,,,,,,,"
             ",,,,,,,,,,,,,,,,,,,,"
             ",,,,,,,,,,,,,,,,,,,,"
-            ",,,,,,%s"
-            ",,,,,,,,,,,,,\n",
+            ",,,,,,,,,,,,,,,,,,,,"
+            ",,,,,,,%s"
+            ",,,,,,,,,,,,,,,,,\n",
             WorldPref::getTickCount(), WorldPref::getWorldTime(), sig);
         appendLine(line);
         flushBufferToDisk(true);
@@ -682,6 +751,20 @@ void HitregTelemetry::noteShotFired(const IObject* projectile, IPlayer* owner,
     fillShotNetSnapshot(owner, shot);
     shot.v1RewindMs = LatencyCompensation::getProjectileLatency(projectile, owner) * 1000.0f;
 
+    IObject* const shooterVeh = owner->getVehicle();
+    if (shooterVeh && shooterVeh->getTemplate()
+        && shooterVeh->getTemplate()->getClassID() == CID_SoldierTemplate)
+    {
+        Soldier* const shooterSoldier = static_cast<Soldier*>(shooterVeh);
+        shot.shooterCenterPos = shooterSoldier->getAbsolutePosition();
+        ICameraObject* const cam = shooterSoldier->getSoldierCamera();
+        IObject* const camObj = cam ? static_cast<IObject*>(cam->queryInterface(IID_IObject)) : 0;
+        shot.shooterEyePos = camObj
+            ? camObj->getAbsolutePosition()
+            : shooterSoldier->getSkeletonRayTestPoint(Soldier::SkeletonRayTestPointHead);
+        shot.hasShooterEye = true;
+    }
+
     if (*g_telemetryLevel >= 2 && st.file)
     {
         char line[768];
@@ -690,8 +773,12 @@ void HitregTelemetry::noteShotFired(const IObject* projectile, IPlayer* owner,
             "FIRE,%d,%.3f,%llu,%s,%d,%s,,,"
             "%u,%d,%.2f,%.2f,%u,%u,"
             "%d,%.2f,%d,%d,%.2f,%.2f"
-            ",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,"
-            ",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,\n",
+            ",,,,,,,,,,,,,,,,,,,,"
+            ",,,,,,,,,,,,,,,,,,,,"
+            ",,,,,,,,,,,,,,,,,,,,"
+            ",,,,,,,,,,,,,,,,,,,,"
+            ",,,,,,,,,,,,,,,,,,,,"
+            ",,,,,,\n",
             shot.fireTick, WorldPref::getWorldTime(),
             static_cast<unsigned long long>(shot.shotId),
             shot.weaponName.c_str(), shot.shooterId, shot.shooterName.c_str(),
@@ -776,13 +863,17 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
         owner, 1.00f, static_cast<int>(probePingMs), probeRawInterpMs, probeEffQDelaySec, false, false);
     const float nodedupLat = computeSweepLatencyFromInputs(
         owner, 1.00f, static_cast<int>(probePingMs), probeRawInterpMs, probeQDelaySec, true, true);
+    const float c17Lat = clampRewindLatency(activeLatency + 0.017f);
+    const float c33Lat = clampRewindLatency(activeLatency + kServerTickSec);
 
     int ringValid = 0;
     int ticksSinceReseed = -1;
     int dummyPose = -1;
     Mat4 tmpMat = Mat4::getIdentity();
+    Vec3 rewindVel;
+    rewindVel.x = rewindVel.y = rewindVel.z = 0.0f;
     soldierNode->sampleLatencyTransform(activeLatency, false, tmpMat, &dummyPose,
-                                        &ringValid, &ticksSinceReseed);
+                                        &ringValid, &ticksSinceReseed, 0, &rewindVel);
 
     Mat4 vanMat = Mat4::getIdentity();
     int vanPose = -1;
@@ -801,6 +892,10 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
     Mat4 pf125Mat = Mat4::getIdentity();
     Mat4 uncl10Mat = Mat4::getIdentity();
     Mat4 nodedupMat = Mat4::getIdentity();
+    Mat4 c17Mat = Mat4::getIdentity();
+    Mat4 c33Mat = Mat4::getIdentity();
+    Vec3 c17Vel = rewindVel;
+    Vec3 c33Vel = rewindVel;
     int pf00Pose = -1;
     int pf05Pose = -1;
     int pf075Pose = -1;
@@ -809,6 +904,8 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
     int pf125Pose = -1;
     int uncl10Pose = -1;
     int nodedupPose = -1;
+    int c17Pose = -1;
+    int c33Pose = -1;
     soldierNode->sampleLatencyTransform(pf00Lat, false, pf00Mat, &pf00Pose, 0, 0);
     soldierNode->sampleLatencyTransform(pf05Lat, false, pf05Mat, &pf05Pose, 0, 0);
     soldierNode->sampleLatencyTransform(pf075Lat, false, pf075Mat, &pf075Pose, 0, 0);
@@ -817,13 +914,15 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
     soldierNode->sampleLatencyTransform(pf125Lat, false, pf125Mat, &pf125Pose, 0, 0);
     soldierNode->sampleLatencyTransform(uncl10Lat, false, uncl10Mat, &uncl10Pose, 0, 0);
     soldierNode->sampleLatencyTransform(nodedupLat, false, nodedupMat, &nodedupPose, 0, 0);
+    soldierNode->sampleLatencyTransform(c17Lat, false, c17Mat, &c17Pose, 0, 0, 0, &c17Vel);
+    soldierNode->sampleLatencyTransform(c33Lat, false, c33Mat, &c33Pose, 0, 0, 0, &c33Vel);
 
     const int initialSkelPose =
         (v1StateIndex >= 0 && v1StateIndex < 4) ? v1StateIndex : tgtLivePose;
     int activeSkelPose = initialSkelPose;
     const anim::Skeleton* activeSkel = skeleton;
 
-    // Evaluate V1.1 (live animation at v1StateIndex) and V2 (historical collision bones)
+    // Evaluate V1.1 (live animation at v1StateIndex) and V2 / V2a (historical collision bones)
     // before any shadow pose switches touch soldier->m_collisionSkeleton.
     anim::RaySkeletonProbe pV11;
     activeSkel->probeRayVsSkeleton(start, end, v1Transform, pV11);
@@ -848,9 +947,19 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
     {
         pV2 = pV11;
     }
+
+    const float v2aAnimLat =
+        activeLatency > (static_cast<float>(probeInterpMs) * 0.001f)
+            ? (activeLatency - static_cast<float>(probeInterpMs) * 0.001f)
+            : 0.0f;
+    anim::HistoricalBonePose sampledV2aPose;
+    anim::RaySkeletonProbe pV2a = pV11;
+    if (v2aAnimLat > kServerTickSec && soldierNode->sampleHistoricalBonePose(v2aAnimLat, sampledV2aPose))
+        activeSkel->probeRayVsHistoricalPose(start, end, v1Transform, sampledV2aPose, pV2a);
+
     const anim::RaySkeletonProbe& pActive = (usedBoneHistory && v2BoneValid) ? pV2 : pV11;
 
-    anim::RaySkeletonProbe pVan, p00, p05, p075, p10, pRaw05, p125, pUncl10, pNoDedup;
+    anim::RaySkeletonProbe pVan, p00, p05, p075, p10, pRaw05, p125, pUncl10, pNoDedup, pC17, pC33;
     struct ShadowProbeJob
     {
         const Mat4* mat;
@@ -859,7 +968,7 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
         bool allowBones;
         anim::RaySkeletonProbe* out;
     };
-    const ShadowProbeJob shadowJobs[9] = {
+    const ShadowProbeJob shadowJobs[11] = {
         { &vanMat,     vanLat,     vanPose,     false, &pVan     },
         { &pf00Mat,    pf00Lat,    pf00Pose,    false, &p00      },
         { &pf05Mat,    pf05Lat,    pf05Pose,    true,  &p05      },
@@ -868,7 +977,9 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
         { &raw05Mat,   raw05Lat,   raw05Pose,   true,  &pRaw05   },
         { &pf125Mat,   pf125Lat,   pf125Pose,   true,  &p125     },
         { &uncl10Mat,  uncl10Lat,  uncl10Pose,  true,  &pUncl10  },
-        { &nodedupMat, nodedupLat, nodedupPose, true,  &pNoDedup }
+        { &nodedupMat, nodedupLat, nodedupPose, true,  &pNoDedup },
+        { &c17Mat,     c17Lat,     c17Pose,     true,  &pC17     },
+        { &c33Mat,     c33Lat,     c33Pose,     true,  &pC33     }
     };
 
     const bool canSwitchPose =
@@ -885,7 +996,7 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
     std::vector<Mat4> savedTransforms;
     anim::HistoricalBonePose swBones;
 
-    for (int j = 0; j < 9; ++j)
+    for (int j = 0; j < 11; ++j)
     {
         if (shadowJobs[j].allowBones
             && shadowJobs[j].lat > kServerTickSec
@@ -1002,7 +1113,7 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
 
     char vanBuf[64], pf00Buf[48], pf05Buf[48], pf075Buf[48], pf10Buf[48];
     char raw05Buf[48], pf125Buf[48], uncl10Buf[48];
-    char v2Buf[64], v11Buf[64], nodedupBuf[48];
+    char v2Buf[64], v11Buf[64], nodedupBuf[48], v2aBuf[48], c17Buf[48], c33Buf[48];
     formatVanillaFields(pVan, vanRingUnfilled, vanBuf, sizeof(vanBuf));
     formatProbeFields(p00, pf00Buf, sizeof(pf00Buf));
     formatProbeFields(p05, pf05Buf, sizeof(pf05Buf));
@@ -1014,8 +1125,24 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
     formatFullProbeFields(pV2, v2Buf, sizeof(v2Buf));
     formatFullProbeFields(pV11, v11Buf, sizeof(v11Buf));
     formatProbeFields(pNoDedup, nodedupBuf, sizeof(nodedupBuf));
+    formatProbeFields(pV2a, v2aBuf, sizeof(v2aBuf));
+    formatProbeFields(pC17, c17Buf, sizeof(c17Buf));
+    formatProbeFields(pC33, c33Buf, sizeof(c33Buf));
 
-    char line[2048];
+    int qMinWin = 0, qTarget = 1, qDrainDrops = 0, qCapDrops = 0;
+    LatencyCompensation::getPlayerQueueStats(owner, qMinWin, qTarget, qDrainDrops, qCapDrops);
+    int tickUsP50 = 0, tickUsP99 = 0;
+    computeTickUsPercentiles(tickUsP50, tickUsP99);
+
+    float v2VelResidM = 0.0f, v2DtErrMs = 0.0f;
+    float dummyResid = 0.0f, v11DtErrMs = 0.0f, v2aDtErrMs = 0.0f, c17DtErrMs = 0.0f, c33DtErrMs = 0.0f;
+    computeVelResidual(pV2, rewindVel, v2VelResidM, v2DtErrMs);
+    computeVelResidual(pV11, rewindVel, dummyResid, v11DtErrMs);
+    computeVelResidual(pV2a, rewindVel, dummyResid, v2aDtErrMs);
+    computeVelResidual(pC17, c17Vel, dummyResid, c17DtErrMs);
+    computeVelResidual(pC33, c33Vel, dummyResid, c33DtErrMs);
+
+    char line[2560];
     std::snprintf(
         line, sizeof(line),
         "PROBE,%d,%.3f,%llu,%s,%d,%s,%d,%s,"
@@ -1029,7 +1156,12 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
         "%d,%.2f,%u,%.3f,"
         "%d,%.4f,%.4f,"
         "%s,%s,%s,"
-        ",,,,,,,,,,,,,\n",
+        "%d,%d,%d,%d,%d,%d,"
+        "%.4f,%.2f,%.2f,"
+        "%s,%.2f,"
+        "%s,%.2f,"
+        "%s,%.2f"
+        ",,,,,,,,,,,,,,,,,,\n",
         currentTick, WorldPref::getWorldTime(),
         static_cast<unsigned long long>(shot.shotId),
         shot.weaponName.c_str(), shot.shooterId, shot.shooterName.c_str(),
@@ -1047,7 +1179,12 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
         vanBuf, pf00Buf, pf05Buf, pf075Buf, pf10Buf, raw05Buf, pf125Buf, uncl10Buf,
         usedBoneHistory ? 1 : 0, probeEffQDelaySec * 1000.0f, tgtPingMs, rayLenM,
         v2BoneValid, v2HeadShiftM, v2MaxBoneShiftM,
-        v2Buf, v11Buf, nodedupBuf);
+        v2Buf, v11Buf, nodedupBuf,
+        qMinWin, qTarget, qDrainDrops, qCapDrops, tickUsP50, tickUsP99,
+        v2VelResidM, v2DtErrMs, v11DtErrMs,
+        v2aBuf, v2aDtErrMs,
+        c17Buf, c17DtErrMs,
+        c33Buf, c33DtErrMs);
     appendLine(line);
 
     if (v1Hit)
@@ -1066,12 +1203,15 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
             shot.pendingBone = v1HitBone;
             shot.pendingPart = v1HitPart;
             shot.pendingDepthSq = depthSq;
+            shot.pendingRayStart = start;
+            shot.pendingHitPos = v1HitPos;
         }
     }
 }
 
 void HitregTelemetry::noteProjectileContactDelivered(const IObject* projectileObject,
                                                      IObject* contactObject,
+                                                     const Vec3& contactPoint,
                                                      float contactDepthSq,
                                                      int contactMaterial)
 {
@@ -1091,6 +1231,10 @@ void HitregTelemetry::noteProjectileContactDelivered(const IObject* projectileOb
     const char* outcome = "DELIVERED";
     std::string blocker;
     float marginM = 0.0f;
+    float tWallM = 0.0f;
+    float tSoldierM = 0.0f;
+    const char* objClass = "";
+    int eyeClear = -1;
 
     if (contactObject != shot.pendingTarget)
     {
@@ -1098,36 +1242,83 @@ void HitregTelemetry::noteProjectileContactDelivered(const IObject* projectileOb
         const float soldierDist = shot.pendingDepthSq >= 0.0f ? std::sqrt(shot.pendingDepthSq) : 0.0f;
         marginM = winnerDist - soldierDist;
 
+        const float wdx = contactPoint.x - shot.pendingRayStart.x;
+        const float wdy = contactPoint.y - shot.pendingRayStart.y;
+        const float wdz = contactPoint.z - shot.pendingRayStart.z;
+        tWallM = std::sqrt(wdx * wdx + wdy * wdy + wdz * wdz);
+
+        const float sdx = shot.pendingHitPos.x - shot.pendingRayStart.x;
+        const float sdy = shot.pendingHitPos.y - shot.pendingRayStart.y;
+        const float sdz = shot.pendingHitPos.z - shot.pendingRayStart.z;
+        tSoldierM = std::sqrt(sdx * sdx + sdy * sdy + sdz * sdz);
+
         if (!contactObject)
         {
             outcome = "OVERRIDE_TERRAIN";
             blocker = "TERRAIN";
+            objClass = "terrain";
         }
         else
         {
             const IObjectTemplate* tmpl = contactObject->getTemplate();
             if (tmpl && tmpl->getClassID() == CID_SoldierTemplate)
+            {
                 outcome = "OVERRIDE_SOLDIER";
+                objClass = "soldier";
+            }
             else
+            {
                 outcome = "OVERRIDE_WALL";
+                IPhysicsNode* const rootNode = static_cast<IPhysicsNode*>(
+                    object_detail::LayoutAccess::physicsNode(getRootParent(contactObject)));
+                objClass = (rootNode && rootNode->getIsMobile()) ? "dynamic" : "static";
+            }
             blocker = tmpl ? sanitizeField(tmpl->getName().c_str()) : std::string("OBJECT");
+        }
+
+        if (shot.hasShooterEye)
+        {
+            IObject* dummyHit = 0;
+            const bool guard1Clear = !checkIfRayHitAnyObjectOrGround(
+                shot.shooterCenterPos, shot.shooterEyePos, 0, dummyHit, true, false, true, 0);
+            const bool guard2Clear = guard1Clear && !checkIfRayHitAnyObjectOrGround(
+                shot.shooterEyePos, shot.pendingHitPos, 0, dummyHit, true, false, true, 0);
+            eyeClear = guard2Clear ? 1 : 0;
         }
     }
 
-    char line[768];
+    char line[1024];
     std::snprintf(
         line, sizeof(line),
         "DELIVER,%d,%.3f,%llu,%s,%d,%s,%d,%s,"
-        ",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,"
-        ",,,,,,,,,,,,,,,,,,%s,%s,%d,%.4f,,,,,,,,,,\n",
+        ",,,,,,,,,,,,,,,,,,,,"
+        ",,,,,,,,,,,,,,,,,,,,"
+        ",,,,,,,,,,,,,,,,,,,,"
+        ",,,,,,,,,,,,,,,,,,,,"
+        ",,,,,,,,,,,,,,,,,,,,"
+        "%s,%s,%d,%.4f,%.4f,%.4f,%s,%d"
+        ",,,,,,,,,,\n",
         currentTick, WorldPref::getWorldTime(),
         static_cast<unsigned long long>(shot.shotId),
         shot.weaponName.c_str(), shot.shooterId, shot.shooterName.c_str(),
         shot.pendingTargetId, shot.pendingTargetName.c_str(),
-        outcome, blocker.c_str(), contactMaterial, marginM);
+        outcome, blocker.c_str(), contactMaterial, marginM,
+        tWallM, tSoldierM, objClass, eyeClear);
     appendLine(line);
 
     shot.pendingTarget = 0;
+}
+
+void HitregTelemetry::noteServerTickUs(int tickUs)
+{
+    if (*g_telemetryLevel <= 0 || tickUs <= 0)
+        return;
+
+    TelemetryLoggerState& st = loggerState();
+    st.tickUsRing[st.tickUsWrite] = tickUs;
+    st.tickUsWrite = (st.tickUsWrite + 1) % 60;
+    if (st.tickUsCount < 60)
+        ++st.tickUsCount;
 }
 
 void HitregTelemetry::noteProjectileDamageCalc(const IObject* projectileObject,
@@ -1216,8 +1407,12 @@ void HitregTelemetry::finishProjectileCollisionDamage(const IObject* projectileO
     std::snprintf(
         line, sizeof(line),
         "DAMAGE,%d,%.3f,%llu,%s,%d,%s,%d,%s,"
-        ",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,"
-        ",,,,,,,,,,,,,,,,,,,,,,"
+        ",,,,,,,,,,,,,,,,,,,,"
+        ",,,,,,,,,,,,,,,,,,,,"
+        ",,,,,,,,,,,,,,,,,,,,"
+        ",,,,,,,,,,,,,,,,,,,,"
+        ",,,,,,,,,,,,,,,,,,,,"
+        ",,,,,,,,"
         "%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d\n",
         WorldPref::getTickCount(), WorldPref::getWorldTime(),
         static_cast<unsigned long long>(shot.shotId),
