@@ -1,7 +1,7 @@
-# OpenBF2 Hitreg & Netcode — V3 Phase 2 Handoff (`feat/hitreg`)
+# OpenBF2 Hitreg & Netcode — Clean Branch `hitreg-v1` Handoff
 
 > **Za AI agenta / developera na kućnom računaru — PROČITAJ OVO PRVO!**
-> Ovaj fajl sadrži sve zaključke, simulacije, analize 27 realnih CSV fajlova (`125,943` redova), arhitektonske odluke i tačan plan za nastavak rada na grani `feat/hitreg`, tako da ne gubiš vreme na ponovno istraživanje ili vraćanje odbačenih ideja.
+> Ova grana (**`hitreg-v1`**) je čista radna/produkcijska grana presečena sa `feat/hitreg` (`79e31f6`). Sadrži **sve finalne, dokazane optimizacije** (V1 + V1.1 + 30 Hz + V2 bone history + V3 drift-free tick & `queueDrain` + V3 Phase 2 Opcija A & C) i **pojednostavljenu, 5× bržu telemetriju od 82 kolone** koja poredi isključivo **Active (`act_*`, naše finalne optimizacije) vs Vanilla (`van_*`)** + forenziku (starih 11 V1/V2 `pf*`/`c17`/`c33`/`v11`/`v2a` sweep raycast-ova je uklonjeno; puna arhiva ostaje na grani `feat/hitreg`).
 
 ---
 
@@ -61,40 +61,31 @@ Sve izmene su **server-only**, bez promene ABI/layout-a/vtable-a i 100% kompatib
   - Prati `lastTick` i `lastParent` u `SoldierLatencyMeta`; na promenu `parent`-a ili `tickGap > 1` odmah radi pun reseed svih 16 slotova + `boneFrames` živom pozom.
 - **Verifikacija:** `tgt_ticks_since_reseed` u CSV-u.
 
-### 3) Forenzička telemetrija (`127 -> 143` kolona, 0 novih redova)
+### 3) Čista `hitreg-v1` telemetrija (**82 kolone**, Active vs Vanilla + Forenzika, ~5× manji CPU trošak)
 - **Fajlovi:** `Code/BF2/Physics/HitregTelemetry.h`, `Code/BF2/Physics/HitregTelemetry.cpp`, `Code/BF2/Game/Objects/Projectiles/GenericProjectile.cpp`, `Code/BF2/Game/Objects/Weapons/DeviationComponents/DeviationComp.cpp`, `Code/BF2/Game/Objects/Weapons/GenericFireArm.cpp`, `Code/BF2/Game/GameServer/GameServer.cpp`, `Code/Tests/runtime_pair.cpp`
-- **Cilj:** Definitivno dijagnostikovati scenario *„dođeš čoveku iza leđa, ispališ 15 metaka iz blizine, on se okrene i ubije te“* — razdvajajući spread, server-odbijene hice, queue drop-ove, rani udar u zid, point-blank muzzle offset, stance/pitch mismatch i rewind grešku.
-- **Trik koji garantuje tačnost:** `GenericProjectile::initOnLaunch()` snima tačan pre-deviation `aimDir` (`launchVel`), `DeviationComp::postFire()` odmah nakon `setPositionalSpeed(speed)` snima konačan `bulletDir`, `dev_deg` i tačan pre-shot `dev_cone_deg = atan(deviation / 100) * 180/pi`, a `GenericFireArm::postFire()` poziva `finalizeShotFired()` koji emituje `FIRE` red (sa `char line[1024]` + `appendCheckedLine` proverom truncation-a i tačnog broja zareza!).
-
-#### Novih 16 kolona (indeksi `127..142`, postojeće `0..126` nisu pomerene!):
-| Indeks | Kolona | Redovi | Značenje |
-|---:|---|---|---|
-| 127 | `dev_deg` | `FIRE` | Ugao (deg) između pre-deviation `aimDir` i konačnog `bulletDir` |
-| 128 | `dev_cone_deg` | `FIRE` | Stvarni server-side 1-sigma konus devijacije oružja (deg) pre pucnja |
-| 129 | `muzzle_off_m` | `FIRE` | `dot(startPos - eyePos, aimDir)` (point-blank spawn offset cevi) |
-| 130 | `sh_held_cum` | `FIRE` (pucač), `DAMAGE` (žrtva) | Kumulativni prvokonzumirani tikovi sa držanim okidačem (`buttonMaskLow & 1`, bez replay-eva) |
-| 131 | `sh_shots_cum` | `FIRE` (pucač), `DAMAGE` (žrtva) | Kumulativni broj `FIRE` metaka koje je server stvarno ispalio |
-| 132 | `sh_fdrop_cum` | `FIRE` (pucač), `DAMAGE` (žrtva) | Kumulativni broj dropovanih inputa (`qDrain`/cap) sa držanim okidačem |
-| 133 | `sh_early_np_cum` | `FIRE` (pucač), `DAMAGE` (žrtva) | Kumulativni broj projektila uništenih za `<= 1` tik bez ijednog `PROBE` reda (rani zid/prop) |
-| 134 | `snd_gap_ticks` | `FIRE` | Broj tikova između poslednja 2 snapshot-a poslata ovom pucaču (Opcija A) |
-| 135 | `q_drop_age_t` | `FIRE` | Tikovi od poslednjeg `qDrain` drop-a za ovog pucača (`-1` ako nije bilo) |
-| 136 | `aim_hit` | `PROBE` | `0/1` shadow ray-test **čistog nišana bez spread-a** sa istog `shot.startPos` protiv V2 poze |
-| 137 | `aim_miss_m` | `PROBE` | Distanca promašaja čistog nišana (`0.0000` ako `aim_hit=1`) |
-| 138 | `miss_dy_m` | `PROBE` | Usmereni vertikalni promašaj (`+` iznad / `-` ispod najbliže kosti; prazno kad `v1_hit=1`) |
-| 139 | `miss_lat_m` | `PROBE` | Usmereni bočni promašaj (`+` desno / `-` levo u BF2 left-handed sistemu; prazno kad `v1_hit=1`) |
-| 140 | `tgt_back_dot` | `PROBE` | `dot(bulletDir, rewound_tgt_forward)` (`+1.0` = čist pucanj u leđa, `-1.0` = spreda) |
-| 141 | `tgt_ticks_since_reseed` | `PROBE` | Tikovi od poslednjeg spawn/revive/vehicle reseed-a mete (Opcija C) |
-| 142 | `ring_uf` | `PROBE` | Procenjeni retail 4-slot underflow (`1` ako `raw_interp_ms - 15 > (k_est + 4) * 33.333`, inače `0`) |
+- **Šta je uklonjeno u odnosu na `feat/hitreg` (143 -> 82 kolone):** svih 11 starih V1/V2 kalibracionih shadow sweep-ova (`pf00..pf125`, `raw05`, `uncl10`, `v11`, `nodedup`, `v2a`, `c17`, `c33`) — sada na svaki `PROBE` idu samo **3 raycast-a** (`Active`, `Vanilla` i `Zero-Deviation Aim`) umesto 14!
+- **Struktura 82 kolone (`0..81`):**
+  - `0..8`: `event,tick,time_s,shot_id,weapon,shooter_id,shooter,tgt_id,tgt`
+  - `9..22`: `ping_ms,raw_ping_ms,rtt_jitter_ms,pkt_loss_dn_pct,raw_interp_ms,interp_ms,q_depth,q_delay_ms,replay_cnt,replays_30t,q_target,q_drain_drops,tick_us_p50,tick_us_p99`
+  - `23..34`: `act_rewind_ms,van_rewind_ms,shot_dist_m,flight_ticks,coarse_dist_m,flyby,tgt_alive,tgt_mandown,tgt_live_pose,tgt_act_pose,tgt_speed,tgt_ticks_since_reseed`
+  - `35..43` (**Active — naše finalne optimizacije**): `act_bone_hist,act_head_shift_m,act_hit,act_bone,act_bone_name,act_part,act_miss_m,act_near_bone,act_dt_err_ms`
+  - `44..48` (**Vanilla baseline**): `van_hit,van_bone,van_part,van_miss_m,van_ring_unfilled`
+  - `49..57` (**Forenzika `FIRE` + `DAMAGE` žrtva**): `dev_deg,dev_cone_deg,muzzle_off_m,sh_held_cum,sh_shots_cum,sh_fdrop_cum,sh_early_np_cum,snd_gap_ticks,q_drop_age_t`
+  - `58..63` (**Forenzika `PROBE`**): `aim_hit,aim_miss_m,miss_dy_m,miss_lat_m,tgt_back_dot,ring_uf`
+  - `64..71` (**`DELIVER`**): `outcome,blocker,blocker_mat,override_margin_m,t_wall_m,t_soldier_m,obj_class,eye_clear`
+  - `72..81` (**`DAMAGE`**): `mat_a,mat_b,base_dmg,mat_mod,angle_mod,final_dmg,hp_before,hp_after,killed,hitmarker`
+- **Cilj forenzike:** Definitivno dijagnostikovati scenario *„dođeš čoveku iza leđa, ispališ 15 metaka iz blizine, on se okrene i ubije te“* (`act_hit=0 && aim_hit=1` = čist RNG spread; `sh_shots_cum` mnogo manji od `sh_held_cum` na `DAMAGE` redu žrtve = server odbio hice; `sh_fdrop_cum > 0` = queue pojeo okidač; `sh_early_np_cum` = zid/prop pre mete; `miss_dy_m` vs `miss_lat_m` = stance/pitch vs rewind).
 
 ---
 
 ## 4. Šta uraditi kod kuće (Korak po korak)
 
-> **VAŽNA NAPOMENA:** Na računaru gde je ovaj commit napisan nije bilo C++ kompajlera, pa su izmene verifikovane statičkim auditom + Python CSV-schema/snprintf validatorom (`143/143` kolone, tačan broj argumenata na svih 5 redova). **Prvi korak kod kuće je kompajliranje!**
+> **VAŽNA NAPOMENA:** Na računaru gde je ovaj commit napisan nije bilo C++ kompajlera, pa su izmene verifikovane statičkim auditom + Python CSV-schema/snprintf validatorom (**`82/82` kolone**, tačan broj argumenata na svih 5 redova). **Prvi korak kod kuće je kompajliranje!**
 
 ### Korak 1: Pull i Linux build dedicated servera
 ```bash
-git checkout feat/hitreg
+git fetch origin
+git checkout hitreg-v1
 git pull
 # Pokreni svoj standardni Linux dedicated CMake build za bf2_ded / bf2_l64ded
 # (i po želji x86/tests: bf2_recovered, bf2_run_checks, runtime_pair)
@@ -106,18 +97,19 @@ Ako se pojavi bilo kakav compiler warning/error (npr. strict GCC `-Wformat` ili 
 2. Uradi 3 kratke provere:
    - **Stojeći ADS prvi metak:** u CSV-u mora biti `dev_deg <= dev_cone_deg` (provera da `aimDir` i `bulletDir` nemaju ofset osa).
    - **Medic revive:** ubij kolegu, oživi ga, pucaj u prvih 15 tikova → `tgt_ticks_since_reseed` treba da bude `0..15`, a hitbox na visini tela (ne pod zemljom).
-   - **Provera broja kolona:** `python` proverom potvrdi da svi redovi imaju tačno `143` kolone (`0` `[HITREG] telemetry column mismatch` poruka na `stderr`).
+   - **Provera broja kolona:** `python` proverom potvrdi da svi redovi imaju tačno **`82` kolone** (`0` `[HITREG] telemetry column mismatch` poruka na `stderr`).
 
-### Korak 3: Analiza prvog 4v4 meča (kriterijumi uspeha i dijagnostika)
+### Korak 3: Analiza prvog 4v4 meča (Active vs Vanilla + Forenzika)
 Kada snimiš 4v4 meč na Linux-u, pokreni Python skriptu (nikad sirov CSV u kontekst!) da proveriš:
-1. **Opcija A:** udeo `snd_gap_ticks > 1` treba da bude `~0%` (samo uz CPU hitch-eve).
-2. **Opcija C:** za pogotke sa `tgt_ticks_since_reseed <= 15`, nema vertikalnog odstupanja posle revive-a/vozila.
-3. **Retail ring transient:** ako je `ring_uf == 1` ukupno `< 2%` bez grupisanja posle `q_drop_age_t < 270`, **NE dirati `qDrain`**. Ako je `> 2%` grupisano odmah posle drop-ova, sledeći korak (Phase 3) je jednostavna vremenska pauza od `~9 s` (`270` tikova) posle drop-a koji sleti na `qD <= 2` (nikad trajni floor koji kvari input lag!).
-4. **Dijagnoza „15 metaka u leđa iz blizine“** (filtriraj `shot_dist_m <= 12` i `tgt_back_dot >= 0.5`):
+1. **Active vs Vanilla:** `act_hit` / headshot (`act_bone==47`) vs `van_hit` / headshot (`van_bone==47`) — ukupno, samo vatreno oružje i `flyby==0`.
+2. **Opcija A:** udeo `snd_gap_ticks > 1` treba da bude `~0%` (samo uz CPU hitch-eve).
+3. **Opcija C:** za pogotke sa `tgt_ticks_since_reseed <= 15`, nema vertikalnog odstupanja posle revive-a/vozila.
+4. **Retail ring transient:** ako je `ring_uf == 1` ukupno `< 2%` bez grupisanja posle `q_drop_age_t < 270`, **NE dirati `qDrain`**. Ako je `> 2%` grupisano odmah posle drop-ova, sledeći korak je jednostavna vremenska pauza od `~9 s` (`270` tikova) posle drop-a koji sleti na `qD <= 2` (nikad trajni floor koji kvari input lag!).
+5. **Dijagnoza „15 metaka u leđa iz blizine“** (filtriraj `shot_dist_m <= 12` i `tgt_back_dot >= 0.5`):
    - `sh_shots_cum` delta mnogo manji od `sh_held_cum * RoF / 30` (poređenjem `FIRE` i `DAMAGE` žrtve!) → **server odbio hice (sprint/reload/switch desync)**.
    - `sh_fdrop_cum` delta `> 0` → **`qDrain`/cap pojeo okidač**.
    - `sh_early_np_cum` delta skočio bez `PROBE` → **metak udario u zid/ivicu/prop pre mete**.
-   - `v2_hit == 0 && aim_hit == 1 && dev_deg <= dev_cone_deg` → **čist BF2 RNG spread** (ako je pritom `dev_cone_deg` visok iako je igrač stajao → **movement/turn/stance desync pucača**).
-   - `v2_hit == 0 && aim_hit == 0 && |miss_dy_m| >> |miss_lat_m| && dt_err ≈ 0` → **stance/crouch/prone/pitch desync**.
-   - Velik `|miss_lat_m|` uz `dt_err != 0` → **rewind / timing greška**.
-   - `muzzle_off_m >= shot_dist_m` → **point-blank spawn cevi prošao iza mete** (ako je p99 `muzzle_off_m < 0.3 m`, u Phase 3 ovu kolonu možemo obrisati).
+   - `act_hit == 0 && aim_hit == 1 && dev_deg <= dev_cone_deg` → **čist BF2 RNG spread** (ako je pritom `dev_cone_deg` visok iako je igrač stajao → **movement/turn/stance desync pucača**).
+   - `act_hit == 0 && aim_hit == 0 && |miss_dy_m| >> |miss_lat_m| && act_dt_err_ms ≈ 0` → **stance/crouch/prone/pitch desync**.
+   - Velik `|miss_lat_m|` uz `act_dt_err_ms != 0` → **rewind / timing greška**.
+   - `muzzle_off_m >= shot_dist_m` → **point-blank spawn cevi prošao iza mete**.
