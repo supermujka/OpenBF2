@@ -325,6 +325,11 @@ bool ScoreManager::getNetUpdate(io::BitStream& stream, io::BaseLineData* /*basel
     return true;
 }
 
+void ScoreManager::addNetWriteBits(int bits)
+{
+    g_scoreManagerStats.m_writeBits += bits;
+}
+
 // Decodes score changes into the next record, then applies them to both teams.
 // A failed mask read returns early; later read failures still apply the decoded portion.
 // The application step intentionally writes m_block[6] into m_block[5]'s destination,

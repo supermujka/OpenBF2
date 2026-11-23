@@ -30,6 +30,12 @@ public:
     virtual unsigned int getGhostStateMask() const;      // +0x28
     virtual bool         getBaseLine(BaseLineData&);     // +0x38
 
+    // [CHOSEN, not recovered] Non-virtual ring accessors for read-only NetPipeline snapshotting.
+    int  getHeadSlot() const { return m_head; }
+    int  getNextSlot() const { return m_next; }
+    void pinNextToHead() { m_next = m_head; }
+    void setUpdateStartBitPos(unsigned int pos) { m_updateStartBitPos = pos; }
+
 protected:
     /* +0x1C */ bool m_forceFullUpdate;      // ctor and reset set this true
     /* +0x20 */ int  m_unknown20;            // [UNRESOLVED] - reset only, never in the update path

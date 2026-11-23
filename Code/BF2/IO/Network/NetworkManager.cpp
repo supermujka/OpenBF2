@@ -19,7 +19,9 @@
 #include "../../Game/Objects/ObjectLayoutAccess.h" // addDescriptor's raw template read (+0x14)
 #include "../../Game/Objects/RotationalBundleTemplate.h"     // compareProperties' field reads
 #include "../../Scene/Object/ObjectTypes/Game/IPlayerControlObject.h"
+#include "../../Game/Utility/Vars.h"              // net-fast-statemasks
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <sstream>
@@ -48,7 +50,105 @@ bool networkableInfoForcesId(world::IObject* object)
     INetworkable* networkable = object->getNetworkable();
     return networkable->m_networkableInfo->getForceNetworkableId();
 }
+
+struct FastScopableRootState
+{
+    enum { kHashBuckets = 8192 };
+
+    FastScopableRootBuffer    buffer;
+    std::vector<unsigned int> hashKey;
+    std::vector<unsigned int> hashGroupIdx;
+    std::vector<unsigned int> hashGen;
+    unsigned int              generation;
+
+    FastScopableRootState() : generation(0) {}
+
+    void beginFrame(std::size_t approxCapacity)
+    {
+        const std::size_t minCap = approxCapacity < 256 ? 256 : approxCapacity;
+        if (buffer.groups.capacity() < minCap)
+            buffer.groups.reserve(minCap);
+        if (buffer.entries.capacity() < minCap)
+            buffer.entries.reserve(minCap);
+        buffer.groups.clear();
+        buffer.entries.clear();
+
+        if (hashGen.size() != kHashBuckets)
+        {
+            hashKey.assign(kHashBuckets, 0u);
+            hashGroupIdx.assign(kHashBuckets, 0u);
+            hashGen.assign(kHashBuckets, 0u);
+            generation = 0;
+        }
+        ++generation;
+        if (generation == 0)
+        {
+            std::fill(hashGen.begin(), hashGen.end(), 0u);
+            generation = 1;
+        }
+    }
+
+    void add(unsigned int rootId, INetworkableObject* netObject, NetworkableDescriptor* descriptor)
+    {
+        const unsigned int entryIdx = static_cast<unsigned int>(buffer.entries.size());
+        FastScopableRootEntry entry;
+        entry.netObject   = netObject;
+        entry.descriptor  = descriptor;
+        entry.nextInGroup = 0xFFFFFFFFu;
+        buffer.entries.push_back(entry);
+
+        unsigned int slot = (rootId * 2654435761u) & (kHashBuckets - 1u);
+        for (unsigned int probe = 0; probe < kHashBuckets; ++probe)
+        {
+            if (hashGen[slot] != generation)
+            {
+                const unsigned int groupIdx = static_cast<unsigned int>(buffer.groups.size());
+                hashGen[slot]      = generation;
+                hashKey[slot]      = rootId;
+                hashGroupIdx[slot] = groupIdx;
+
+                FastScopableRootGroup group;
+                group.rootId     = rootId;
+                group.firstEntry = entryIdx;
+                group.lastEntry  = entryIdx;
+                buffer.groups.push_back(group);
+                return;
+            }
+            if (hashKey[slot] == rootId)
+            {
+                FastScopableRootGroup& group = buffer.groups[hashGroupIdx[slot]];
+                buffer.entries[group.lastEntry].nextInGroup = entryIdx;
+                group.lastEntry = entryIdx;
+                return;
+            }
+            slot = (slot + 1u) & (kHashBuckets - 1u);
+        }
+    }
+
+    void releaseMemory()
+    {
+        std::vector<FastScopableRootGroup>().swap(buffer.groups);
+        std::vector<FastScopableRootEntry>().swap(buffer.entries);
+        std::vector<unsigned int>().swap(hashKey);
+        std::vector<unsigned int>().swap(hashGroupIdx);
+        std::vector<unsigned int>().swap(hashGen);
+        generation = 0;
+    }
+};
+
+FastScopableRootState s_fastScopableRoots;
 } // namespace
+
+bool isFastStateMasksEnabled()
+{
+    static int* const s_fastStateMasks = Vars::getInt("net-fast-statemasks", 0);
+    return s_fastStateMasks && (*s_fastStateMasks != 0);
+}
+
+const FastScopableRootBuffer& getFastScopableRootBuffer()
+{
+    return s_fastScopableRoots.buffer;
+}
 
 // Initializes empty descriptor stores and network-ID allocation, then registers for core events.
 NetworkManager::NetworkManager()
@@ -109,6 +209,7 @@ void NetworkManager::clear()
     m_networkedTemplates.clear();
     m_scopableRootDescriptors.clear();
     m_networkableStateMasks.clear();
+    s_fastScopableRoots.releaseMemory();
     m_word12 = 1;
     m_idCounter = 642;
     m_byte5C = false;
@@ -740,6 +841,84 @@ NetworkManager::updateStateMasks()
 {
     typedef std::map<unsigned short, NetworkableDescriptor*>::iterator DescIt;
     typedef std::list<std::pair<INetworkableObject*, NetworkableDescriptor*> > RootList;
+
+    const bool fastMasks = isFastStateMasksEnabled();
+    if (fastMasks)
+    {
+        m_networkableStateMasks.clear();
+        if (!m_scopableRootDescriptors.empty())
+            m_scopableRootDescriptors.clear();
+
+        const std::size_t totalDescs = m_staticDescriptors.size() + m_scopableDescriptors.size();
+        if (m_networkableStateMasks.capacity() < totalDescs)
+            m_networkableStateMasks.reserve(totalDescs);
+
+        s_fastScopableRoots.beginFrame(m_scopableDescriptors.size());
+
+        for (DescIt it = m_staticDescriptors.begin(); it != m_staticDescriptors.end(); ++it)
+        {
+            NetworkableDescriptor* const descriptor = it->second;
+
+            NetworkableStateMask mask;
+            buildStateMask(descriptor, mask);
+
+            if (stateMaskIsNonZero(mask))
+                m_networkableStateMasks.push_back(
+                    std::make_pair(static_cast<const NetworkableDescriptor*>(descriptor), mask));
+        }
+
+        DescIt it = m_scopableDescriptors.begin();
+        while (it != m_scopableDescriptors.end())
+        {
+            NetworkableDescriptor* const descriptor = it->second;
+
+            INetworkable* const networkable = *descriptor->properties.begin()->networkables.begin();
+            INetworkableObject* const netObject = networkable->m_networkableObject;   // +0x18
+            world::IObject* const object = netObject->m_object;                       // +0x08
+
+            if (object->getFlags() & 1)              // bit 0 of +0x04 skips the whole body
+            {
+                ++it;
+                continue;
+            }
+
+            if (object->getTemplate()->getClassID() == world::CID_KitTemplate)
+            {
+                m_scopableDescriptors.erase(it++);   // erased, not skipped - see the note above
+                continue;
+            }
+
+            NetworkableStateMask mask;
+            buildStateMask(descriptor, mask);
+
+            if (stateMaskIsNonZero(mask))
+                m_networkableStateMasks.push_back(
+                    std::make_pair(static_cast<const NetworkableDescriptor*>(descriptor), mask));
+
+            world::IPlayerControlObject* const pco = static_cast<world::IPlayerControlObject*>(
+                object->queryInterface(world::IID_IPlayerControlObject));
+            const bool include = (object->getParent() == 0)
+                              || (pco == 0)
+                              || (object->getArmorComponent() != 0)
+                              || pco->isOccupied();
+
+            if (include && networkable->m_ghostActive && networkable->m_basePriority > 0.0f)
+            {
+                const unsigned int rootId = world::getRootParent(object)->getObjectId();
+                s_fastScopableRoots.add(rootId, netObject, descriptor);
+            }
+
+            ++it;
+        }
+
+        return &m_networkableStateMasks;
+    }
+
+    if (!s_fastScopableRoots.buffer.groups.empty() || !s_fastScopableRoots.buffer.entries.empty())
+    {
+        s_fastScopableRoots.buffer.groups.clear();
+        s_fastScopableRoots.buffer.entries.clear();
+    }
 
     // 1. both outputs are rebuilt from scratch every frame
     m_networkableStateMasks.clear();

@@ -62,6 +62,10 @@
 #include "../../Physics/PhysicsUtil.h"        // disablePhysics
 #include "../../Physics/LatencyCompensation.h" // [CHOSEN, not recovered] Version 1 queue-delay tracking
 #include "../../Physics/HitregTelemetry.h"     // [CHOSEN, not recovered] Version 1 hitreg telemetry CSV
+#include "ServerTickProfiler.h"                // [CHOSEN, not recovered] 32v32 per-phase server tick profiler
+#include "NetPipeline/WorldNetSnapshot.h"      // [CHOSEN, not recovered] Phase 2A immutable tick world snapshot
+#include "NetPipeline/NetWorkerPool.h"         // [CHOSEN, not recovered] Phase 2B Stage A/B/C MT network pipeline
+#include "NetPipeline/LinuxBatchSender.h"      // [CHOSEN, not recovered] Phase 2A batched sendmmsg sender
 #include "../Python/PythonHost.h"             // buildArgs / handleEvent - the two script events
 #include "../../Core/Ids.h"                    // CID_SquadManager / IID_ISquadManager
 #include "../../Core/IProfilerClient.h"        // getEnable - startServer's profiler gate; retires
@@ -1414,6 +1418,7 @@ bool GameServer::load()
 
 bool GameServer::unload()
 {
+    ServerTickProfiler::flushAndReset();
     eventManager->postEvent(ECHud, 3, 0, 0.0f);
 
     const std::list<world::IPlayer*> players(world::playerManager->getPlayers());
@@ -1806,6 +1811,7 @@ void GameServer::shutdown()
     if (m_shutdownComplete)
         return;
 
+    netpipeline::NetWorkerPool::instance().shutdown();
     unload();
     Game::destroyAllPlayers();
     Game::unregisterStaticNetworkables();
@@ -1908,6 +1914,7 @@ GameServer::GameServer()
 
 GameServer::~GameServer()
 {
+    netpipeline::NetWorkerPool::instance().shutdown();
     // shutdown() owns the protocol objects. The destructor only tears down these four owned
     // allocations before C++ destroys the containers and the Game base in reverse field order.
     if (m_autoRecorder)
@@ -2364,6 +2371,59 @@ void clearPlayerActionsPerConnection(IClientConnection* connection);            
 // [CHOSEN, not recovered] Hitreg V3 Phase 2 (Option A): tracks sim steps in the current
 // GameServer::update call so 30 Hz send-rate connections emit once per simulated frame.
 int g_currentUpdateSimSteps = 0;
+
+// [CHOSEN, not recovered] Phase 1 32v32 safe single-thread tuning CVars (0 = 100% vanilla).
+int* const   g_svMaxCatchUpTicks      = Vars::getInt("sv-maxCatchUpTicks", 0);
+int* const   g_netScopeBudgetPerFrame = Vars::getInt("net-scopeBudgetPerFrame", 0);
+float* const g_netScopeDistance       = Vars::getFloat("net-scopeDistance", 0.0f);
+int* const   g_netMaxPacketBytes      = Vars::getInt("net-maxPacketBytes", 0);
+
+int effectiveMaxPacketBytes()
+{
+    const int raw = *g_netMaxPacketBytes;
+    if (raw <= 0)
+        return 0;
+    return raw < 320 ? 320 : (raw > 1400 ? 1400 : raw);
+}
+
+float effectiveScopeDistance(float fallbackRange)
+{
+    const float overrideDist = *g_netScopeDistance;
+    if (overrideDist > 0.0f)
+        return overrideDist < 50.0f ? 50.0f : (overrideDist > 5000.0f ? 5000.0f : overrideDist);
+    return fallbackRange;
+}
+
+int getNetMaxGhostsPerPacketOverrideForMt()
+{
+    static int* const s_maxGhosts = Vars::getInt("net-maxGhostsPerPacket", 0);
+    const int raw = s_maxGhosts ? *s_maxGhosts : 0;
+    if (raw <= 0)
+        return 0;
+    return raw < 40 ? 40 : (raw > 255 ? 255 : raw);
+}
+
+const std::vector<std::pair<const io::NetworkableDescriptor*, io::NetworkableStateMask> >*
+    g_pendingMtUpdatedMasks = 0;
+bool g_hasPendingMtUpdatedMasks = false;
+
+netpipeline::WorldNetSnapshot& getMtWorldSnapshot()
+{
+    static netpipeline::WorldNetSnapshot s_snapshot;
+    return s_snapshot;
+}
+
+std::vector<netpipeline::ConnectionStageTask>& getMtStageTasks()
+{
+    static std::vector<netpipeline::ConnectionStageTask> s_tasks;
+    return s_tasks;
+}
+
+std::vector<BatchPacket>& getBatchSendBuffer()
+{
+    static std::vector<BatchPacket> s_batch;
+    return s_batch;
+}
 } // namespace
 
 // Advances server simulation and network traffic. Negative dt runs only receive,
@@ -2383,18 +2443,47 @@ bool GameServer::update(int steps, float dt)
 
     if (world::playerManager)
         world::playerManager->getNumberOfPlayers();             // the result is dropped; the vcall is kept
-    if (steps > 10)
+
+    const bool prof = ServerTickProfiler::isEnabled();
+    if (prof)
+        ServerTickProfiler::noteServerUpdate(static_cast<int>(m_connections.size()));
+
+    int maxSteps = 10;
+    const int catchUpClamp = *g_svMaxCatchUpTicks;
+    if (catchUpClamp > 0)
+        maxSteps = catchUpClamp > 10 ? 10 : catchUpClamp;
+
+    if (steps > maxSteps)
     {
-        steps = 1;                                              // the second clamp: past ten steps behind, one step
+        if (prof)
+        {
+            const int dropped = (catchUpClamp > 0) ? (steps - maxSteps) : (steps - 1);
+            ServerTickProfiler::noteDroppedSteps(dropped);
+        }
+        steps = (catchUpClamp > 0) ? maxSteps : 1;              // the second clamp: past ten steps behind, one step
         ++m_numberOfDroppedFrames;
     }
     if (steps > 1)
         m_numberOvershotFrames += steps - 1;
 
-    processLocalPlayersInputs(steps);
-    processReceivedPackets();
-    if (steps > 0)
-        processEnqueuedRadioMessages();
+    if (prof)
+    {
+        const ServerTickProfiler::TimePoint recvStart = ServerTickProfiler::now();
+        processLocalPlayersInputs(steps);
+        processReceivedPackets();
+        if (steps > 0)
+            processEnqueuedRadioMessages();
+        ServerTickProfiler::addPhaseUs(
+            ServerTickProfiler::PHASE_RECV,
+            ServerTickProfiler::elapsedUs(recvStart, ServerTickProfiler::now()));
+    }
+    else
+    {
+        processLocalPlayersInputs(steps);
+        processReceivedPackets();
+        if (steps > 0)
+            processEnqueuedRadioMessages();
+    }
 
     for (int i = 0; i < steps; ++i)
     {
@@ -2552,20 +2641,56 @@ bool GameServer::simulateFrame(float dt)
             ai::aiInstance()->update(static_cast<double>(dt));
     }
     eventManager->processEvents(dt);                            // +0x20
-    simulatePlayersUpdate(dt);
+    const bool prof = ServerTickProfiler::isEnabled();
+    if (prof)
+    {
+        const ServerTickProfiler::TimePoint tPlayers = ServerTickProfiler::now();
+        simulatePlayersUpdate(dt);
+        ServerTickProfiler::addPhaseUs(
+            ServerTickProfiler::PHASE_SIM_PLAYERS,
+            ServerTickProfiler::elapsedUs(tPlayers, ServerTickProfiler::now()));
+    }
+    else
+    {
+        simulatePlayersUpdate(dt);
+    }
     if (gameLogic->getGameStatus() != 4)
     {
         updateTriggerManager(dt);
         updateTriggerableManager(dt);
-        world::objectManager->updateObjects(dt, static_cast<world::UpdateFreqencyType>(0), 3);
-        simulatePlayersPhysics(dt);
-        world::physicsNodeManager->update(dt, 0, 0);
-        world::responsePhysicsManager->resetCachedCollisionObjects();
-        updateWorldCollision(dt);
-        world::responsePhysicsManager->resetCachedCollisionObjects();
-        simulatePlayersCollisions(dt);
-        world::physicsNodeManager->postFrameUpdate();
-        world::responsePhysicsManager->postFrameUpdate();
+        if (prof)
+        {
+            const ServerTickProfiler::TimePoint tObj = ServerTickProfiler::now();
+            world::objectManager->updateObjects(dt, static_cast<world::UpdateFreqencyType>(0), 3);
+            const ServerTickProfiler::TimePoint tPhys = ServerTickProfiler::now();
+            ServerTickProfiler::addPhaseUs(
+                ServerTickProfiler::PHASE_SIM_OBJECTS,
+                ServerTickProfiler::elapsedUs(tObj, tPhys));
+
+            simulatePlayersPhysics(dt);
+            world::physicsNodeManager->update(dt, 0, 0);
+            world::responsePhysicsManager->resetCachedCollisionObjects();
+            updateWorldCollision(dt);
+            world::responsePhysicsManager->resetCachedCollisionObjects();
+            simulatePlayersCollisions(dt);
+            world::physicsNodeManager->postFrameUpdate();
+            world::responsePhysicsManager->postFrameUpdate();
+            ServerTickProfiler::addPhaseUs(
+                ServerTickProfiler::PHASE_SIM_PHYSICS_COLL,
+                ServerTickProfiler::elapsedUs(tPhys, ServerTickProfiler::now()));
+        }
+        else
+        {
+            world::objectManager->updateObjects(dt, static_cast<world::UpdateFreqencyType>(0), 3);
+            simulatePlayersPhysics(dt);
+            world::physicsNodeManager->update(dt, 0, 0);
+            world::responsePhysicsManager->resetCachedCollisionObjects();
+            updateWorldCollision(dt);
+            world::responsePhysicsManager->resetCachedCollisionObjects();
+            simulatePlayersCollisions(dt);
+            world::physicsNodeManager->postFrameUpdate();
+            world::responsePhysicsManager->postFrameUpdate();
+        }
         updatePortals(dt);
     }
     ++m_frameCount;                                             // +0x60
@@ -2943,6 +3068,39 @@ void GameServer::updateStateMasks()
 {
     if (m_connections.empty())
         return;
+
+    if (netpipeline::NetWorkerPool::isEnabled())
+    {
+        if (ServerTickProfiler::isEnabled())
+        {
+            const ServerTickProfiler::TimePoint t0 = ServerTickProfiler::now();
+            g_pendingMtUpdatedMasks    = io::networkManager->updateStateMasks();
+            g_hasPendingMtUpdatedMasks = true;
+            ServerTickProfiler::addPhaseUs(
+                ServerTickProfiler::PHASE_STATE_MASKS,
+                ServerTickProfiler::elapsedUs(t0, ServerTickProfiler::now()));
+        }
+        else
+        {
+            g_pendingMtUpdatedMasks    = io::networkManager->updateStateMasks();
+            g_hasPendingMtUpdatedMasks = true;
+        }
+        return;
+    }
+
+    if (ServerTickProfiler::isEnabled())
+    {
+        const ServerTickProfiler::TimePoint t0 = ServerTickProfiler::now();
+        const std::vector<std::pair<const io::NetworkableDescriptor*, io::NetworkableStateMask> >* updated =
+            io::networkManager->updateStateMasks();
+        for (std::map<unsigned char, IClientConnection*>::iterator it = m_connections.begin();
+             it != m_connections.end(); ++it)
+            asServerConnection(it->second)->m_ghostManager->updateStateMasks(*updated);
+        ServerTickProfiler::addPhaseUs(
+            ServerTickProfiler::PHASE_STATE_MASKS,
+            ServerTickProfiler::elapsedUs(t0, ServerTickProfiler::now()));
+        return;
+    }
     // Build fresh networkable state masks and merge them into each connection's ghost state.
     const std::vector<std::pair<const io::NetworkableDescriptor*, io::NetworkableStateMask> >* updated =
         io::networkManager->updateStateMasks();
@@ -3017,8 +3175,9 @@ void GameServer::setConnectionType(int connectionId, ConnectionType type)
     if (connectionId != 129)                         // the demo recorder keeps its own numbers
     {
         const int* const row = g_connectionTypes[static_cast<int>(type)];
-        cc->m_packetSizeOverride = row[3];           // +0x18
-        cc->m_dword14            = row[1];           // +0x14
+        const int maxPktOverride = effectiveMaxPacketBytes();
+        cc->m_packetSizeOverride = (maxPktOverride > 0) ? maxPktOverride : row[3]; // +0x18
+        cc->m_dword14            = row[1];                                         // +0x14
     }
 
     chokeBandwidth();
@@ -3029,7 +3188,17 @@ void GameServer::chokeBandwidth()
     typedef std::map<unsigned char, IClientConnection*>::iterator ConnIt;
 
     // 1. the cvar override
-    if (*g_connPacketSizeOverride)
+    const int maxPktOverride = effectiveMaxPacketBytes();
+    if (maxPktOverride > 0)
+    {
+        for (ConnIt it = m_connections.begin(); it != m_connections.end(); ++it)
+        {
+            ClientConnection* const conn = reinterpret_cast<ClientConnection*>(it->second);
+            if (!conn->getIsRecordingConnection())
+                conn->m_packetSizeOverride = maxPktOverride;
+        }
+    }
+    else if (*g_connPacketSizeOverride)
     {
         for (ConnIt it = m_connections.begin(); it != m_connections.end(); ++it)
             reinterpret_cast<ClientConnection*>(it->second)->m_packetSizeOverride =
@@ -3080,8 +3249,15 @@ void GameServer::processGameStateAndSendPackets(float dt)
 
     // 1. GSViewDistance, floored at 500 - see above. Read as an int, compared as a float.
     float viewDistance = static_cast<float>(settings->intGet(std::string("GSViewDistance"), 500));
-    if (!(500.0f <= viewDistance))                       // `cmovbe`, 0x80A8EED
+    const float scopeFloor = effectiveScopeDistance(500.0f);
+    if (*g_netScopeDistance > 0.0f)
+    {
+        viewDistance = scopeFloor;
+    }
+    else if (!(500.0f <= viewDistance))                  // `cmovbe`, 0x80A8EED
+    {
         viewDistance = 500.0f;
+    }
 
     // 2. flatten the byte-keyed map into a vector so it can be ordered.
     std::vector<ServerConnection*> ordered;
@@ -3095,6 +3271,332 @@ void GameServer::processGameStateAndSendPackets(float dt)
     std::sort(ordered.begin(), ordered.end(), ScopeTimeSort());
 
     int ghostBudget = 20;                                // twenty scope passes per frame
+    const int budgetOverride = *g_netScopeBudgetPerFrame;
+    if (budgetOverride > 0)
+        ghostBudget = budgetOverride > 256 ? 256 : budgetOverride;
+
+    const bool prof = ServerTickProfiler::isEnabled();
+    const bool useBatchSend = LinuxBatchSender::isEnabled();
+    std::vector<BatchPacket>& batchPackets = getBatchSendBuffer();
+    batchPackets.clear();
+
+    auto flushBatchPackets = [&]() {
+        if (batchPackets.empty())
+            return;
+
+        const ServerTickProfiler::TimePoint tSend = prof
+            ? ServerTickProfiler::now()
+            : ServerTickProfiler::TimePoint();
+
+        LinuxBatchSender::sendBatch(m_netServer, &batchPackets[0], batchPackets.size());
+
+        if (prof)
+        {
+            ServerTickProfiler::addPhaseUs(
+                ServerTickProfiler::PHASE_NET_SEND,
+                ServerTickProfiler::elapsedUs(tSend, ServerTickProfiler::now()));
+        }
+
+        const int curTick = WorldPref::getTickCount();
+        const bool hitregTelem = world::HitregTelemetry::isEnabled();
+
+        for (std::size_t bi = 0; bi < batchPackets.size(); ++bi)
+        {
+            const BatchPacket& pkt = batchPackets[bi];
+            ServerConnection* const conn = static_cast<ServerConnection*>(pkt.userContext);
+            const int queued = pkt.bufferStatus;
+            if (!queued)
+            {
+                conn->m_sentData = false;
+            }
+            else if (queued == 15)
+            {
+                conn->m_sentData = true;
+            }
+            else
+            {
+                m_disconnectTypes[conn->m_connectionId] =
+                    DisconnectType(conn->m_connectionId, 28, std::string());
+            }
+
+            if (m_sampleStreamManagerReadStats)
+                m_networkableStats->sampleStreamManagerWriteStats(conn, true);
+
+            if (prof)
+            {
+                ServerTickProfiler::notePacketSent(
+                    pkt.sizeBytes,
+                    conn->m_ghostManager ? conn->m_ghostManager->m_ghostsThisPacket : 0);
+            }
+            if (hitregTelem
+                && conn->m_connectionState == 4 && conn->m_bReset && conn->getPlayer())
+            {
+                world::HitregTelemetry::noteSnapshotSent(conn->getPlayer(), curTick);
+            }
+        }
+        batchPackets.clear();
+    };
+
+    if (netpipeline::NetWorkerPool::isEnabled())
+    {
+        // Stage A: build immutable per-tick world snapshot + per-connection pre-ghost state on main thread.
+        const ServerTickProfiler::TimePoint tSnapStart = prof
+            ? ServerTickProfiler::now()
+            : ServerTickProfiler::TimePoint();
+
+        netpipeline::WorldNetSnapshot& worldSnap = getMtWorldSnapshot();
+        const bool applyStateMasks = g_hasPendingMtUpdatedMasks;
+        worldSnap.buildFromLiveWorld(applyStateMasks ? g_pendingMtUpdatedMasks : 0);
+        g_hasPendingMtUpdatedMasks = false;
+        g_pendingMtUpdatedMasks    = 0;
+
+        if (prof)
+        {
+            ServerTickProfiler::addPhaseUs(
+                ServerTickProfiler::PHASE_STATE_MASKS,
+                ServerTickProfiler::elapsedUs(tSnapStart, ServerTickProfiler::now()));
+        }
+
+        const float hysteresis   = netpipeline::NetWorkerPool::getScopeHysteresis();
+        const int   maxPktBytes  = effectiveMaxPacketBytes();
+        const int   maxGhosts    = getNetMaxGhostsPerPacketOverrideForMt();
+        const unsigned int tickCount = static_cast<unsigned int>(WorldPref::getTickCount());
+
+        std::vector<netpipeline::ConnectionStageTask>& tasks = getMtStageTasks();
+        tasks.resize(ordered.size());
+
+        const ServerTickProfiler::TimePoint tStageAPackStart = prof
+            ? ServerTickProfiler::now()
+            : ServerTickProfiler::TimePoint();
+
+        for (std::size_t idx = 0; idx < ordered.size(); ++idx)
+        {
+            ServerConnection* const conn = ordered[idx];
+            const bool recording = conn->getIsRecordingConnection();
+            const int sendRate   = effectiveServerSendRate(conn);
+            const bool forceFullRateSend =
+                !recording && sendRate >= 30 && g_currentUpdateSimSteps >= 1
+                && world::LatencyCompensation::isImprovedEnabled();
+
+            bool dueToSend = true;
+            if (!recording && !forceFullRateSend && !(conn->m_timer1C <= 0.0f))
+            {
+                dueToSend = false;
+            }
+            else if (forceFullRateSend)
+            {
+                conn->m_timer1C = 0.0f;
+            }
+            else if (conn->m_timer1C <= 0.0f)
+            {
+                const float period = 1.0f / static_cast<float>(sendRate);
+                conn->m_timer1C += period;
+                if (*g_netServerSendRate > 0 && conn->m_timer1C < -period)
+                    conn->m_timer1C = 0.0f;
+            }
+
+            bool shouldScope = false;
+            if (dueToSend && !recording && conn->m_connectionState == 4 && conn->m_bReset)
+            {
+                if (ghostBudget > 0 && conn->m_timer20 <= 0.0f)
+                {
+                    --ghostBudget;
+                    shouldScope     = true;
+                    conn->m_timer20 = 0.1f;
+                }
+                else
+                {
+                    conn->m_timer20 -= 0.1f;
+                }
+            }
+
+            netpipeline::NetWorkerPool::prepareConnectionStageA(
+                worldSnap, conn, applyStateMasks, dueToSend, shouldScope,
+                viewDistance, hysteresis, tickCount, m_frameCount,
+                maxPktBytes, maxGhosts, tasks[idx]);
+        }
+
+        const int stageAPackUs = prof
+            ? ServerTickProfiler::elapsedUs(tStageAPackStart, ServerTickProfiler::now())
+            : 0;
+
+        // Stage B: parallel worker-thread execution (state masks, spatial scoping, heap build, ghost pack).
+        const bool verifyEnabled = netpipeline::NetWorkerPool::isVerifyEnabled();
+        const ServerTickProfiler::TimePoint tStageBStart = prof
+            ? ServerTickProfiler::now()
+            : ServerTickProfiler::TimePoint();
+
+        netpipeline::NetWorkerPool::instance().runConnectionsStageB(
+            worldSnap, tasks, prof, verifyEnabled);
+
+        const int stageBWallUs = prof
+            ? ServerTickProfiler::elapsedUs(tStageBStart, ServerTickProfiler::now())
+            : 0;
+
+        // Stage C: main-thread hybrid fallback, PacketStatus finalization, commit, and batched send.
+        netpipeline::WorldNetSnapshot::TypeWriteBitStats mergedWriteBits;
+        unsigned int mergedDidNotFit      = 0;
+        unsigned int mergedMissingUpdates = 0;
+        long long sumWorkerScopeUs        = 0;
+        long long sumWorkerPackUs         = 0;
+
+        const ServerTickProfiler::TimePoint tStageCFallbackStart = prof
+            ? ServerTickProfiler::now()
+            : ServerTickProfiler::TimePoint();
+
+        for (std::size_t idx = 0; idx < tasks.size(); ++idx)
+        {
+            netpipeline::ConnectionStageTask& task = tasks[idx];
+            ServerConnection* const conn = task.conn;
+
+            sumWorkerScopeUs += task.scopeUs;
+            sumWorkerPackUs  += task.packUs;
+            for (int t = 0; t < 10; ++t)
+                mergedWriteBits.bitsByType[t] += task.writeBitStats.bitsByType[t];
+            mergedDidNotFit      += task.didNotFitCount;
+            mergedMissingUpdates += task.missingUpdatesCount;
+
+            if (!task.dueToSend)
+                continue;
+
+            if (task.recording)
+            {
+                if (conn->m_connectionState == 4 && conn->m_bReset)
+                {
+                    conn->updatePlayerControlObject(m_frameCount);
+                    --ghostBudget;
+                    conn->updateGhostManager(viewDistance);
+                    conn->m_timer20 = 0.1f;
+                    conn->m_ghostManager->update(WorldPref::getTickCount());
+                }
+                if (!conn->transmitMsgs())
+                {
+                    m_disconnectTypes[conn->m_connectionId] =
+                        DisconnectType(conn->m_connectionId, 28, std::string());
+                }
+                unsigned int demoBytes = conn->m_bitStream->m_highWaterBits >> 3;
+                if (conn->m_bitStream->m_highWaterBits & 7)
+                    ++demoBytes;
+                if (demoBytes)
+                {
+                    const int tick = (conn->m_connectionState == 4) ? WorldPref::getTickCount() : -1;
+                    if (m_demoRecorder)
+                        m_demoRecorder->writeData(tick, conn->m_bitStream);
+                    bool delivered = true;
+                    conn->handlePacketStatusNotification(delivered);
+                }
+                continue;
+            }
+
+            netpipeline::NetWorkerPool::finishConnectionStageC(worldSnap, task, verifyEnabled);
+            if (!task.txOk)
+            {
+                m_disconnectTypes[conn->m_connectionId] =
+                    DisconnectType(conn->m_connectionId, 28, std::string());
+            }
+        }
+
+        const int stageCFallbackUs = prof
+            ? ServerTickProfiler::elapsedUs(tStageCFallbackStart, ServerTickProfiler::now())
+            : 0;
+
+        if (prof)
+        {
+            const long long sumWorkerTotalUs = sumWorkerScopeUs + sumWorkerPackUs;
+            int wallScopeUs = 0;
+            int wallPackUs  = stageBWallUs;
+            if (sumWorkerTotalUs > 0)
+            {
+                wallScopeUs = static_cast<int>((static_cast<long long>(stageBWallUs) * sumWorkerScopeUs) / sumWorkerTotalUs);
+                wallPackUs  = stageBWallUs - wallScopeUs;
+            }
+            ServerTickProfiler::addPhaseUs(ServerTickProfiler::PHASE_GHOST_SCOPE, wallScopeUs);
+            ServerTickProfiler::addPhaseUs(ServerTickProfiler::PHASE_GHOST_PACK, stageAPackUs + wallPackUs + stageCFallbackUs);
+        }
+
+        // Commit main-thread INetworkable side effects (m_next = m_head, ammoStatus &= 0xF, stats) once.
+        worldSnap.commitMainThreadSideEffects(&mergedWriteBits);
+        if (io::networkManager && (mergedDidNotFit || mergedMissingUpdates))
+        {
+            io::networkManager->addNetUpdateCounters(
+                static_cast<int>(mergedDidNotFit),
+                static_cast<int>(mergedMissingUpdates));
+        }
+
+        // Dispatch packets via LinuxBatchSender (if net-batch-send != 0) or vanilla send.
+        for (std::size_t idx = 0; idx < tasks.size(); ++idx)
+        {
+            netpipeline::ConnectionStageTask& task = tasks[idx];
+            if (!task.dueToSend || task.recording || !task.conn)
+                continue;
+
+            ServerConnection* const conn = task.conn;
+            unsigned int bytes = conn->m_bitStream->m_highWaterBits >> 3;
+            if (conn->m_bitStream->m_highWaterBits & 7)
+                ++bytes;
+            if (!bytes)
+                continue;
+
+            if (useBatchSend)
+            {
+                batchPackets.push_back(BatchPacket(conn->m_connectionId, conn->m_bitStream, bytes, conn));
+                continue;
+            }
+
+            const ServerTickProfiler::TimePoint tSend = prof
+                ? ServerTickProfiler::now()
+                : ServerTickProfiler::TimePoint();
+
+            const int queued = m_netServer->bufferPacket(conn->m_connectionId, conn->m_bitStream, bytes);
+            if (!queued)
+            {
+                conn->m_sentData = false;
+            }
+            else if (queued == 15)
+            {
+                conn->m_sentData = true;
+            }
+            else
+            {
+                m_disconnectTypes[conn->m_connectionId] =
+                    DisconnectType(conn->m_connectionId, 28, std::string());
+            }
+
+            if (m_sampleStreamManagerReadStats)
+                m_networkableStats->sampleStreamManagerWriteStats(conn, true);
+
+            m_netServer->send(conn->m_connectionId);
+            if (prof)
+            {
+                ServerTickProfiler::addPhaseUs(
+                    ServerTickProfiler::PHASE_NET_SEND,
+                    ServerTickProfiler::elapsedUs(tSend, ServerTickProfiler::now()));
+                ServerTickProfiler::notePacketSent(
+                    bytes, conn->m_ghostManager ? conn->m_ghostManager->m_ghostsThisPacket : 0);
+            }
+            if (world::HitregTelemetry::isEnabled()
+                && conn->m_connectionState == 4 && conn->m_bReset && conn->getPlayer())
+            {
+                world::HitregTelemetry::noteSnapshotSent(conn->getPlayer(), WorldPref::getTickCount());
+            }
+        }
+
+        flushBatchPackets();
+
+        if (m_sampleStreamManagerReadStats)
+            m_networkableStats->sampleNetworkableWriteStats();
+        return;
+    }
+
+    // If net-mt-enable was toggled off mid-tick after updateStateMasks(), flush pending state masks now.
+    if (g_hasPendingMtUpdatedMasks && g_pendingMtUpdatedMasks)
+    {
+        for (std::map<unsigned char, IClientConnection*>::iterator it = m_connections.begin();
+             it != m_connections.end(); ++it)
+            asServerConnection(it->second)->m_ghostManager->updateStateMasks(*g_pendingMtUpdatedMasks);
+        g_hasPendingMtUpdatedMasks = false;
+        g_pendingMtUpdatedMasks    = 0;
+    }
 
     for (std::vector<ServerConnection*>::iterator it = ordered.begin(); it != ordered.end(); ++it)
     {
@@ -3132,7 +3634,18 @@ void GameServer::processGameStateAndSendPackets(float dt)
             if (recording || (ghostBudget > 0 && conn->m_timer20 <= 0.0f))
             {
                 --ghostBudget;
-                conn->updateGhostManager(viewDistance);              // the scope pass, 10 Hz max
+                if (prof)
+                {
+                    const ServerTickProfiler::TimePoint tScope = ServerTickProfiler::now();
+                    conn->updateGhostManager(viewDistance);          // the scope pass, 10 Hz max
+                    ServerTickProfiler::addPhaseUs(
+                        ServerTickProfiler::PHASE_GHOST_SCOPE,
+                        ServerTickProfiler::elapsedUs(tScope, ServerTickProfiler::now()));
+                }
+                else
+                {
+                    conn->updateGhostManager(viewDistance);          // the scope pass, 10 Hz max
+                }
                 conn->m_timer20 = 0.1f;                              // 10 Hz
             }
             else
@@ -3141,10 +3654,34 @@ void GameServer::processGameStateAndSendPackets(float dt)
                 conn->m_timer20 -= 0.1f;
             }
 
-            conn->m_ghostManager->update(WorldPref::getTickCount()); // the send-heap build
+            if (prof)
+            {
+                const ServerTickProfiler::TimePoint tUpd = ServerTickProfiler::now();
+                conn->m_ghostManager->update(WorldPref::getTickCount()); // the send-heap build
+                ServerTickProfiler::addPhaseUs(
+                    ServerTickProfiler::PHASE_GHOST_PACK,
+                    ServerTickProfiler::elapsedUs(tUpd, ServerTickProfiler::now()));
+            }
+            else
+            {
+                conn->m_ghostManager->update(WorldPref::getTickCount()); // the send-heap build
+            }
         }
 
-        if (!conn->transmitMsgs())                                   // returns bool - see the header
+        bool txOk;
+        if (prof)
+        {
+            const ServerTickProfiler::TimePoint tTx = ServerTickProfiler::now();
+            txOk = conn->transmitMsgs();
+            ServerTickProfiler::addPhaseUs(
+                ServerTickProfiler::PHASE_GHOST_PACK,
+                ServerTickProfiler::elapsedUs(tTx, ServerTickProfiler::now()));
+        }
+        else
+        {
+            txOk = conn->transmitMsgs();
+        }
+        if (!txOk)                                                   // returns bool - see the header
         {
             m_disconnectTypes[conn->m_connectionId] =
                 DisconnectType(conn->m_connectionId, 28, std::string());
@@ -3173,6 +3710,16 @@ void GameServer::processGameStateAndSendPackets(float dt)
         if (!bytes)
             continue;
 
+        if (useBatchSend)
+        {
+            batchPackets.push_back(BatchPacket(conn->m_connectionId, conn->m_bitStream, bytes, conn));
+            continue;
+        }
+
+        const ServerTickProfiler::TimePoint tSend = prof
+            ? ServerTickProfiler::now()
+            : ServerTickProfiler::TimePoint();
+
         // the three-way back-pressure result - see above.
         const int queued = m_netServer->bufferPacket(conn->m_connectionId, conn->m_bitStream, bytes);
         if (!queued)
@@ -3193,12 +3740,22 @@ void GameServer::processGameStateAndSendPackets(float dt)
             m_networkableStats->sampleStreamManagerWriteStats(conn, true);
 
         m_netServer->send(conn->m_connectionId);
+        if (prof)
+        {
+            ServerTickProfiler::addPhaseUs(
+                ServerTickProfiler::PHASE_NET_SEND,
+                ServerTickProfiler::elapsedUs(tSend, ServerTickProfiler::now()));
+            ServerTickProfiler::notePacketSent(
+                bytes, conn->m_ghostManager ? conn->m_ghostManager->m_ghostsThisPacket : 0);
+        }
         if (world::HitregTelemetry::isEnabled()
             && conn->m_connectionState == 4 && conn->m_bReset && conn->getPlayer())
         {
             world::HitregTelemetry::noteSnapshotSent(conn->getPlayer(), WorldPref::getTickCount());
         }
     }
+
+    flushBatchPackets();
 
     if (m_sampleStreamManagerReadStats)
         m_networkableStats->sampleNetworkableWriteStats();

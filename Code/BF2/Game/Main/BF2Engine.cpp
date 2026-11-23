@@ -57,6 +57,7 @@
 #include "../Objects/ICameraObject.h"       // mainLoop's held camera: getCamera / setInterpolatedMode
 #include "../../Physics/LatencyCompensation.h" // [CHOSEN, not recovered] drift-free dedicated tick toggle
 #include "../../Physics/HitregTelemetry.h"     // [CHOSEN, not recovered] per-tick duration telemetry
+#include "../GameServer/ServerTickProfiler.h"  // [CHOSEN, not recovered] per-phase server tick profiler
 
 #include <list>
 #include <string>
@@ -1562,6 +1563,9 @@ bool BF2Engine::mainLoop()
     if (!byte52)
         std::this_thread::sleep_for(std::chrono::milliseconds(100));   // imm 100000 us
 
+    if (ServerTickProfiler::isEnabled() || ServerTickProfiler::hasPendingSamples())
+        ServerTickProfiler::beginTick();
+
     // Honor client shutdown and aborted-load requests before advancing the frame.
     // Keep the repeated client-interface queries in their original order.
     if (world::playerManager && dwordB0)
@@ -1780,7 +1784,20 @@ bool BF2Engine::mainLoop()
     if (renderTicks > 0)
     {
         if (python::pythonHost()->isInitialized())
-            python::pythonHost()->update();
+        {
+            if (ServerTickProfiler::isEnabled())
+            {
+                const ServerTickProfiler::TimePoint pyStart = ServerTickProfiler::now();
+                python::pythonHost()->update();
+                ServerTickProfiler::addPhaseUs(
+                    ServerTickProfiler::PHASE_PYTHON,
+                    ServerTickProfiler::elapsedUs(pyStart, ServerTickProfiler::now()));
+            }
+            else
+            {
+                python::pythonHost()->update();
+            }
+        }
     }
 
     // Keep the unconditional player lookup even in dedicated images, which discard
@@ -1900,6 +1917,9 @@ bool BF2Engine::mainLoop()
         ((DebugCounterManager*)debugCounterManager)->update();      // vtable +0x14
 
     updateStatusMonitor(false);
+
+    if (ServerTickProfiler::isEnabled())
+        ServerTickProfiler::endTick();
 
     // Limit dedicated frames to 30 Hz.
     if (isDedicated())                                              // BF2.exe 0x40CA80: the frame limiter is server-only

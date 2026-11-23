@@ -1307,6 +1307,11 @@ bool Player::getNetUpdate(io::BitStream& stream, io::BaseLineData* /*baseline*/,
     return true;
 }
 
+void Player::addNetWriteBits(int bits)
+{
+    g_playerStats.m_writeBits += bits;
+}
+
 // . IPlayer +0x158. The whole body is one load - RAW-verified
 // (`mov eax, [eax+0D4h]`), which also re-confirms m_spawnGroup's offset a third time
 // (the ctor's store, IPlayer.h's "(int +0xD4)" annotation, and now this).

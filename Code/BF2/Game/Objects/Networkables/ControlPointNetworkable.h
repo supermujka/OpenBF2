@@ -59,6 +59,12 @@ public:
 
     static io::RegistredNetworkStats m_stats;        // "ControlPointNetworkable"
 
+    // [CHOSEN, not recovered] Non-virtual read-only baseline accessor for NetPipeline snapshot.
+    const BaseLine* getBaselineAt(int slot) const
+    {
+        return (m_baselines && slot >= 0 && slot < 4) ? &m_baselines[slot] : 0;
+    }
+
 protected:
     // layout +0x50..+0x5B (NetworkableBase 0x00..0x3B, NetworkableObjectBase 0x3C..0x4F)
     /* +0x50 */ int                  m_refCount;     // ctor 1

@@ -41,6 +41,7 @@
 #include "../Objects/ObjectLayoutAccess.h"    // physicsNode (+0x44) / objectTemplate (+0x14)
 #include "../../Physics/IPhysicsNode.h"       // getPositionalSpeed (+0x60) - the priority speed factor
 #include "../../IO/Network/INetworkableObject.h"   // m_ownerId / m_object - the scope pass reads both
+#include "../Utility/Vars.h"                      // net-scopeDistance, net-scopeHysteresis
 #include "../../Core/Debug.h"                 // the attested line-98 "Control object not found"
 #include <cstdlib>                            // std::abort - the shipped asserts in clientSendDatabase
 #include <cmath>                              // std::sqrt - calculateObjectPriority's distance
@@ -97,6 +98,16 @@ void cameraTransform(world::ICameraObject* camera, Mat4& out)
 unsigned short networkableNetId(io::INetworkable* networkable)
 {
     return networkable->m_networkableId;
+}
+
+float getSingleThreadScopeHysteresis()
+{
+    static float* const s_scopeDist  = Vars::getFloat("net-scopeDistance", 0.0f);
+    static float* const s_hysteresis = Vars::getFloat("net-scopeHysteresis", 0.0f);
+    if (!s_scopeDist || *s_scopeDist <= 0.0f || !s_hysteresis || *s_hysteresis <= 0.0f)
+        return 0.0f;
+    const float raw = *s_hysteresis;
+    return raw > 200.0f ? 200.0f : raw;
 }
 
 } // namespace
@@ -190,6 +201,21 @@ void ServerConnection::addStaticGhosts()
 // which has no camera viewpoint to cull against.
 void ServerConnection::getAllObjects()
 {
+    if (io::isFastStateMasksEnabled())
+    {
+        const io::FastScopableRootBuffer& fastRoots = io::getFastScopableRootBuffer();
+        for (int g = static_cast<int>(fastRoots.groups.size()) - 1; g >= 0; --g)
+        {
+            for (unsigned int idx = fastRoots.groups[g].firstEntry;
+                 idx != 0xFFFFFFFFu;
+                 idx = fastRoots.entries[idx].nextInGroup)
+            {
+                m_ghostManager->ghostObject(fastRoots.entries[idx].descriptor, 1.0f, false);
+            }
+        }
+        return;
+    }
+
     typedef std::list<std::pair<io::INetworkableObject*, io::NetworkableDescriptor*> > Group;
     std::list<Group>& roots = io::networkManager->getScopableRootDescriptors();
 
@@ -698,53 +724,161 @@ void ServerConnection::getRelevantObjects(Mat4& viewTransform, float range)
     }
 
     const float fovThreshold = player->getFov() * 0.5f * 1.3333334f;
+    const float hysteresis   = getSingleThreadScopeHysteresis();
+    const float outerRange   = range + hysteresis;
+    const float outerRangeSq = outerRange * outerRange;
 
-    typedef std::list<std::pair<io::INetworkableObject*, io::NetworkableDescriptor*> > Group;
-    std::list<Group>& roots = io::networkManager->getScopableRootDescriptors();
-
-    for (std::list<Group>::iterator group = roots.begin(); group != roots.end(); ++group)
+    if (io::isFastStateMasksEnabled())
     {
-        float priority = -1.0f;                          // "not scored yet"
-
-        // first walk: is any member of this group mine?
-        for (Group::iterator it = group->begin(); it != group->end(); ++it)
+        const io::FastScopableRootBuffer& fastRoots = io::getFastScopableRootBuffer();
+        for (int g = static_cast<int>(fastRoots.groups.size()) - 1; g >= 0; --g)
         {
-            if (it->first->m_ownerId == player->getId())
+            const unsigned int firstIdx = fastRoots.groups[g].firstEntry;
+            float priority = -1.0f;                      // "not scored yet"
+
+            // first walk: is any member of this group mine?
+            for (unsigned int idx = firstIdx;
+                 idx != 0xFFFFFFFFu;
+                 idx = fastRoots.entries[idx].nextInGroup)
             {
-                priority = 9999.0f;                      // my own vehicle's group
-                break;
+                if (fastRoots.entries[idx].netObject->m_ownerId == player->getId())
+                {
+                    priority = 9999.0f;                  // my own vehicle's group
+                    break;
+                }
+            }
+
+            // second walk: ghost every member that is not mine
+            for (unsigned int idx = firstIdx;
+                 idx != 0xFFFFFFFFu;
+                 idx = fastRoots.entries[idx].nextInGroup)
+            {
+                io::INetworkableObject* const objEntry = fastRoots.entries[idx].netObject;
+                if (objEntry->m_ownerId == player->getId())
+                    continue;                            // my own seat: the control channel's job
+
+                io::NetworkableDescriptor* const descriptor = fastRoots.entries[idx].descriptor;
+                if (priority < 0.0f)
+                {
+                    // scored once, on the first not-mine member, and shared by the group.
+                    priority = calculateObjectPriority(descriptor, fovThreshold, player,
+                                                       viewTransform, rootVelocity,
+                                                       range, range * range, true);
+                    if (priority <= 0.0f && hysteresis > 0.0f)
+                    {
+                        bool alreadyTracked = false;
+                        for (unsigned int chk = firstIdx;
+                             chk != 0xFFFFFFFFu;
+                             chk = fastRoots.entries[chk].nextInGroup)
+                        {
+                            io::NetworkableDescriptor* const d = fastRoots.entries[chk].descriptor;
+                            if (d && !d->properties.empty() && !d->properties[0].networkables.empty())
+                            {
+                                const unsigned short nid = d->properties[0].networkables[0]->m_networkableId;
+                                if (m_ghostManager->findGhostObjectInHash(nid) != 0)
+                                {
+                                    alreadyTracked = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (alreadyTracked)
+                        {
+                            priority = calculateObjectPriority(descriptor, fovThreshold, player,
+                                                               viewTransform, rootVelocity,
+                                                               outerRange, outerRangeSq, true);
+                        }
+                    }
+                }
+                if (priority <= 0.0f)
+                    break;                               // drops the rest of the group
+
+                float bonus = 0.0f;
+                if (objEntry->m_object)
+                {
+                    bonus = objEntry->m_object->queryInterface(world::IID_IProjectileObject) != 0
+                                ? 0.30000001f : 0.0f;
+                }
+                m_ghostManager->ghostObject(
+                    descriptor,
+                    (bonus + priority)
+                        * descriptor->properties[0].networkables[0]->m_basePriority,   // +0x10
+                    false);
             }
         }
+    }
+    else
+    {
+        typedef std::list<std::pair<io::INetworkableObject*, io::NetworkableDescriptor*> > Group;
+        std::list<Group>& roots = io::networkManager->getScopableRootDescriptors();
 
-        // second walk: ghost every member that is not mine
-        for (Group::iterator it = group->begin(); it != group->end(); ++it)
+        for (std::list<Group>::iterator group = roots.begin(); group != roots.end(); ++group)
         {
-            io::INetworkableObject* const objEntry = it->first;
-            if (objEntry->m_ownerId == player->getId())
-                continue;                                // my own seat: the control channel's job
+            float priority = -1.0f;                          // "not scored yet"
 
-            io::NetworkableDescriptor* const descriptor = it->second;
-            if (priority < 0.0f)
+            // first walk: is any member of this group mine?
+            for (Group::iterator it = group->begin(); it != group->end(); ++it)
             {
-                // scored once, on the first not-mine member, and shared by the group.
-                priority = calculateObjectPriority(descriptor, fovThreshold, player,
-                                                   viewTransform, rootVelocity,
-                                                   range, range * range, true);
+                if (it->first->m_ownerId == player->getId())
+                {
+                    priority = 9999.0f;                      // my own vehicle's group
+                    break;
+                }
             }
-            if (priority <= 0.0f)
-                break;                                   // drops the rest of the group
 
-            float bonus = 0.0f;
-            if (objEntry->m_object)
+            // second walk: ghost every member that is not mine
+            for (Group::iterator it = group->begin(); it != group->end(); ++it)
             {
-                bonus = objEntry->m_object->queryInterface(world::IID_IProjectileObject) != 0
-                            ? 0.30000001f : 0.0f;
+                io::INetworkableObject* const objEntry = it->first;
+                if (objEntry->m_ownerId == player->getId())
+                    continue;                                // my own seat: the control channel's job
+
+                io::NetworkableDescriptor* const descriptor = it->second;
+                if (priority < 0.0f)
+                {
+                    // scored once, on the first not-mine member, and shared by the group.
+                    priority = calculateObjectPriority(descriptor, fovThreshold, player,
+                                                       viewTransform, rootVelocity,
+                                                       range, range * range, true);
+                    if (priority <= 0.0f && hysteresis > 0.0f)
+                    {
+                        bool alreadyTracked = false;
+                        for (Group::iterator chk = group->begin(); chk != group->end(); ++chk)
+                        {
+                            io::NetworkableDescriptor* const d = chk->second;
+                            if (d && !d->properties.empty() && !d->properties[0].networkables.empty())
+                            {
+                                const unsigned short nid = d->properties[0].networkables[0]->m_networkableId;
+                                if (m_ghostManager->findGhostObjectInHash(nid) != 0)
+                                {
+                                    alreadyTracked = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (alreadyTracked)
+                        {
+                            priority = calculateObjectPriority(descriptor, fovThreshold, player,
+                                                               viewTransform, rootVelocity,
+                                                               outerRange, outerRangeSq, true);
+                        }
+                    }
+                }
+                if (priority <= 0.0f)
+                    break;                                   // drops the rest of the group
+
+                float bonus = 0.0f;
+                if (objEntry->m_object)
+                {
+                    bonus = objEntry->m_object->queryInterface(world::IID_IProjectileObject) != 0
+                                ? 0.30000001f : 0.0f;
+                }
+                m_ghostManager->ghostObject(
+                    descriptor,
+                    (bonus + priority)
+                        * descriptor->properties[0].networkables[0]->m_basePriority,   // +0x10
+                    false);
             }
-            m_ghostManager->ghostObject(
-                descriptor,
-                (bonus + priority)
-                    * descriptor->properties[0].networkables[0]->m_basePriority,   // +0x10
-                false);
         }
     }
 

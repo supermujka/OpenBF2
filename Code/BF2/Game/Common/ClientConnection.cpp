@@ -24,6 +24,7 @@
 #include "../../Physics/LatencyCompensation.h"  // world::LatencyCompensation::getLocalLatency (local only)
 #include "../../Physics/HitregTelemetry.h"      // [CHOSEN, not recovered] per-packet RTT/loss sampling
 #include "../GameServer/ServerSettings.h"       // sv.demoQuality - demoQualityFromSettings' single read
+#include "../Utility/Vars.h"                    // net-maxPacketBytes, net-maxGhostsPerPacket
 
 namespace dice {
 namespace hfe {
@@ -65,6 +66,24 @@ int demoQualityFromSettings()
 inline unsigned int packetStatusManagerMask(const PacketStatus& status)
 {
     return status.m_streamManagerMask;
+}
+
+int getNetMaxPacketBytesOverride()
+{
+    static int* const s_maxPacketBytes = Vars::getInt("net-maxPacketBytes", 0);
+    const int raw = s_maxPacketBytes ? *s_maxPacketBytes : 0;
+    if (raw <= 0)
+        return 0;
+    return raw < 320 ? 320 : (raw > 1400 ? 1400 : raw);
+}
+
+int getNetMaxGhostsPerPacketOverride()
+{
+    static int* const s_maxGhosts = Vars::getInt("net-maxGhostsPerPacket", 0);
+    const int raw = s_maxGhosts ? *s_maxGhosts : 0;
+    if (raw <= 0)
+        return 0;
+    return raw < 40 ? 40 : (raw > 255 ? 255 : raw);
 }
 
 } // namespace
@@ -132,7 +151,18 @@ ClientConnection::ClientConnection(ConnectionDemoMode demoMode)
 {
     // Ping samples remain uninitialized until collected; averaging starts only after all 32 are written.
     // Recording uses a staging stream 64 times larger than normal traffic.
-    m_bitStream = new io::BitStream(m_demoMode == 1 ? 0x10000u : 0x400u);   // new(0x64)
+    unsigned int streamAllocBytes = 0x400u;
+    if (m_demoMode == 1)
+    {
+        streamAllocBytes = 0x10000u;
+    }
+    else
+    {
+        const int pktOverride = getNetMaxPacketBytesOverride();
+        if (pktOverride > 0 && static_cast<unsigned int>(pktOverride) > streamAllocBytes)
+            streamAllocBytes = static_cast<unsigned int>(pktOverride);
+    }
+    m_bitStream = new io::BitStream(streamAllocBytes);   // new(0x64)
     // `if (!m_bitStream)` + Debug(6, ..., 81) "failed to create bitstream" - unreachable, see above.
 
     // 2. the four managers, in the ELF's order.
@@ -154,8 +184,15 @@ ClientConnection::ClientConnection(ConnectionDemoMode demoMode)
     }
     else
     {
+        int ghostCapacity = 40;
+        if (m_demoMode == 0)
+        {
+            const int capOverride = getNetMaxGhostsPerPacketOverride();
+            if (capOverride > 0)
+                ghostCapacity = capOverride;
+        }
         m_ghostManager = new GhostManager(
-            static_cast<GhostManagerMode>(m_demoMode == 2 ? 2 : 0), 40);
+            static_cast<GhostManagerMode>(m_demoMode == 2 ? 2 : 0), ghostCapacity);
     }
     // `if (!m_ghostManager)` + Debug(6, ..., 126) - unreachable.
 
@@ -300,12 +337,22 @@ void ClientConnection::setConnectionId(int connectionId)
 // Clears outgoing data, selects write mode, and sets the packet limit in bytes.
 void ClientConnection::newPacket(int sizeBytes)
 {
+    if (m_demoMode != 1 && sizeBytes > 0
+        && static_cast<unsigned int>(sizeBytes) > m_bitStream->getSizeBytes())
+    {
+        delete m_bitStream;
+        m_bitStream = new io::BitStream(static_cast<unsigned int>(sizeBytes));
+    }
+
     m_bitStream->clear();                                // > m_highWaterBits = 0
     m_bitStream->setWriteMode();                         //   [eax+34h] = 0
 
     // Set capacity in bits while leaving the cleared high-water mark at zero;
     // an empty packet must remain empty for the send loop.
-    const unsigned int limitBits = static_cast<unsigned int>(sizeBytes) * 8;
+    unsigned int effectiveBytes = (sizeBytes > 0) ? static_cast<unsigned int>(sizeBytes) : 0u;
+    if (effectiveBytes > m_bitStream->getSizeBytes())
+        effectiveBytes = m_bitStream->getSizeBytes();
+    const unsigned int limitBits = effectiveBytes * 8;
     if (m_bitStream->m_bitLimit != limitBits)            // the ELF's redundant compare-then-store
         m_bitStream->m_bitLimit = limitBits;
 }
@@ -337,6 +384,13 @@ bool ClientConnection::transmitMsgs()
     s[5] = 0;                                    // +0x14 m_blockIndex
     s[6] = 0;                                    // +0x18
     s[7] = 0;                                    // +0x1C m_streamManagerMask - the "recorded?" flag
+
+    if (m_demoMode != 1)
+    {
+        const int pktOverride = getNetMaxPacketBytesOverride();
+        if (pktOverride > 0)
+            m_packetSizeOverride = pktOverride;
+    }
 
     newPacket(m_packetSizeOverride);             // +0x18
 

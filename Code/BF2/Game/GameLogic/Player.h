@@ -360,6 +360,10 @@ public:
     // Applies decoded remote weapon ammunition state to the player's live weapons.
     void          forceSetRemoteClientAmmo(unsigned int firedMask);
 
+    // [CHOSEN, not recovered] Non-virtual read-only snapshot helpers for NetPipeline.
+    const NetUpdateSlot* getNetUpdateSlotAt(int slot) const { return (m_netUpdateBuffer && slot >= 0 && slot < kNetUpdateSlots) ? &m_netUpdateBuffer[slot] : 0; }
+    static void addNetWriteBits(int bits);
+
 private:
     // Non-vtable Player helpers, all attested by their ELF manglings and direct callers. Keeping
     // these private avoids inventing a wider gameplay API for implementation details.

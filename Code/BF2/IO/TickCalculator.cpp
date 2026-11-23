@@ -1,9 +1,19 @@
 // Fixed-step tick scheduling. [INFERRED] Source placement.
 
 #include "TickCalculator.h"
+#include "../Game/Utility/Vars.h"
+#include "../Game/GameServer/ServerTickProfiler.h"
 
 namespace dice {
 namespace hfe {
+
+namespace {
+int getMaxCatchUpTicksOverride()
+{
+    static int* const s_svMaxCatchUpTicks = Vars::getInt("sv-maxCatchUpTicks", 0);
+    return s_svMaxCatchUpTicks ? *s_svMaxCatchUpTicks : 0;
+}
+} // namespace
 
 // Stores the reciprocal of ticksPerSecond as the tick interval and the frame catch-up limit.
 TickCalculator::TickCalculator(int maxTicksPerFrame_, float ticksPerSecond)
@@ -24,8 +34,17 @@ int TickCalculator::compute(double currentTime)
 
     if (delta >= tickLength) // An unordered time delta produces no ticks.
     {
+        int effectiveMax = maxTicksPerFrame;
+        const int catchUpClamp = getMaxCatchUpTicksOverride();
+        if (catchUpClamp > 0)
+        {
+            const int clamped = catchUpClamp > 10 ? 10 : catchUpClamp;
+            if (clamped < effectiveMax)
+                effectiveMax = clamped;
+        }
+
         while (delta - tickLength >= 0.0            // pre 0x843898A jb; post 0x84389A7 fucomip/jb
-               && numTicks <= maxTicksPerFrame)     // pre 0x8438991 jg;  post 0x84389AB cmp/jle
+               && numTicks <= effectiveMax)         // pre 0x8438991 jg;  post 0x84389AB cmp/jle
         {                                           //   <= (not <): the count overshoots to max+1,
             delta -= tickLength;                    //   which is what arms the clamp below
             ++numTicks;
@@ -39,10 +58,20 @@ int TickCalculator::compute(double currentTime)
             nextTickTime = time + tickLength;       // 0x84389D4 faddp; 0x84389D6 store +0x18
         }
 
-        if (numTicks > maxTicksPerFrame)            // the clamp
+        if (numTicks > effectiveMax)                // the clamp
         {
+            if (ServerTickProfiler::isEnabled())
+            {
+                const double unconsumed = delta + (numTicks - effectiveMax) * static_cast<double>(tickLength);
+                int dropped = (tickLength > 0.0f)
+                    ? static_cast<int>(unconsumed / static_cast<double>(tickLength))
+                    : (numTicks - effectiveMax);
+                if (dropped < (numTicks - effectiveMax))
+                    dropped = numTicks - effectiveMax;
+                ServerTickProfiler::noteDroppedSteps(dropped);
+            }
             time         = currentTime;             // 0x84389E6   backlog discarded, clocks snap
-            numTicks     = maxTicksPerFrame;        // 0x84389E9   return the cap, not the true count
+            numTicks     = effectiveMax;            // 0x84389E9   return the cap, not the true count
             prevTickTime = currentTime;
             nextTickTime = currentTime;
         }

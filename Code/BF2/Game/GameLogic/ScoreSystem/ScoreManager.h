@@ -112,6 +112,13 @@ public:
 
     void removeAll();
 
+    // [CHOSEN, not recovered] Non-virtual read-only snapshot helpers for NetPipeline.
+    const unsigned char* getScoreRecordAt(int slot) const
+    {
+        return (m_scoreBuffer && slot >= 0 && slot < 4) ? (m_scoreBuffer + 164 * slot) : 0;
+    }
+    static void addNetWriteBits(int bits);
+
 protected:
     // NetworkableBase is a separate base subobject preceding the reference count.
     // Recorded offsets belong to the original x86 layout.

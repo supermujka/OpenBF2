@@ -172,6 +172,9 @@ public:
     bool setNetUpdate(io::BitStream& stream, NetworkableDescriptor* descriptor,
                       float timeMs, bool ghostActive, int precision);
 
+    // [CHOSEN, not recovered] Non-virtual counter merge for NetPipeline Stage C (0 ABI/layout change).
+    void addNetUpdateCounters(int didNotFit, int missingUpdates) { m_dword6C += didNotFit; m_ghostNetworkableUpdatesMissing += missingUpdates; }
+
     // the wire quintet is complete: getNetUpdate / setNetUpdate / getBaseLine /
     // getNetUpdateDelta / setNetUpdateDelta, all defined in Game/Common/GhostManager.cpp.
 
@@ -204,6 +207,31 @@ private:
 };
 
 extern NetworkManager* networkManager;           // ds:0x8AC3D1C - Core/Globals.cpp
+
+// [CHOSEN, not recovered] Zero-allocation flat scopable-root grouping buffer for net-fast-statemasks.
+// Stored outside NetworkManager so sizeof(NetworkManager) and field offsets remain 100% unchanged.
+struct FastScopableRootEntry
+{
+    INetworkableObject*    netObject;
+    NetworkableDescriptor* descriptor;
+    unsigned int           nextInGroup; // 0xFFFFFFFFu at end of group
+};
+
+struct FastScopableRootGroup
+{
+    unsigned int rootId;
+    unsigned int firstEntry;
+    unsigned int lastEntry;
+};
+
+struct FastScopableRootBuffer
+{
+    std::vector<FastScopableRootGroup> groups;
+    std::vector<FastScopableRootEntry> entries;
+};
+
+bool isFastStateMasksEnabled();
+const FastScopableRootBuffer& getFastScopableRootBuffer();
 
 } // namespace io
 } // namespace hfe

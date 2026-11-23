@@ -363,6 +363,29 @@ bool SpawnGroup::getNetUpdate(io::BitStream& stream, io::BaseLineData* /*baselin
     return true;
 }
 
+bool SpawnGroup::getBaselineFieldsAt(
+    int slot, int& outTeam, unsigned char& outActive,
+    unsigned char& outOnlyForAI, unsigned char& outHasSpawnPoints,
+    unsigned char& outPosX, unsigned char& outPosZ, int& outSquad) const
+{
+    if (!m_baselines || slot < 0 || slot >= 4)
+        return false;
+    const BaseLine& b = m_baselines[slot];
+    outTeam           = b.team;
+    outActive         = b.active;
+    outOnlyForAI      = b.onlyForAI;
+    outHasSpawnPoints = b.hasSpawnPoints;
+    outPosX           = b.posX;
+    outPosZ           = b.posZ;
+    outSquad          = b.squad;
+    return true;
+}
+
+void SpawnGroup::addNetWriteBits(int bits)
+{
+    g_spawnGroupStats.m_writeBits += bits;
+}
+
 // Reads changed spawn-group fields into the next baseline, carrying forward unsent values.
 // Position and squad are both decoded, but a position change takes precedence when applying them.
 // Decoded positions have zero Y. World-size settings are reread for each update;

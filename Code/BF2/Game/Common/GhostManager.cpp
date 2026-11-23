@@ -36,6 +36,7 @@
 #include "../../Scene/Object/ObjectTypes/Base/ObjectTemplateManager.h"   // getTemplate(id) +0x60
 #include "../../Core/ClassManager.h"          // getClassName +0x28 - debugShowActiveGhosts
 #include "../../Core/SettingsRepostitory.h"   // GSDebugGhostManager, boolGet +0x50
+#include "../Utility/Vars.h"                  // net-maxGhostsPerPacket, net-resendPriorityBoost
 
 #include <cstring>                            // memset - the 4 KB ghost table
 #include <string>                             // debugShowActiveGhosts' two locals
@@ -44,6 +45,28 @@ namespace dice {
 namespace hfe {
 
 extern ClassManager* classManager;            // Core/Globals.cpp - the per-TU extern convention
+
+namespace {
+
+int getGhostMaxPerPacketOverride()
+{
+    static int* const s_maxGhosts = Vars::getInt("net-maxGhostsPerPacket", 0);
+    const int raw = s_maxGhosts ? *s_maxGhosts : 0;
+    if (raw <= 0)
+        return 0;
+    return raw < 40 ? 40 : (raw > 255 ? 255 : raw);
+}
+
+float getResendPriorityBoostOverride()
+{
+    static float* const s_resendBoost = Vars::getFloat("net-resendPriorityBoost", 0.0f);
+    const float raw = s_resendBoost ? *s_resendBoost : 0.0f;
+    if (!(raw > 0.0f))
+        return 0.0f;
+    return raw > 1000.0f ? 1000.0f : raw;
+}
+
+} // namespace
 
 // Initialize per-connection ghost queues and baseline storage. Ghost ids are seeded
 // lazily on first assignment. State masks and the control-object id are deliberately
@@ -1203,6 +1226,8 @@ GhostManager::allocGhostSaveBuffer(int entries)
 
     std::vector<GhostSaveBufferEntry>* const buffer = m_saveBufferPool.back();
     m_saveBufferPool.pop_back();
+    if (entries > 40 && buffer->capacity() < static_cast<std::size_t>(entries))
+        buffer->reserve(static_cast<std::size_t>(entries));
     return buffer;
 }
 
@@ -1249,6 +1274,8 @@ unsigned int GhostManager::transmit(io::BitStream* stream, PacketStatus& status,
     stream->m_rwSwitchCache = stream->m_readWriteSwitch;
     stream->m_lengthCache   = stream->m_highWaterBits;
 
+    m_ghostsThisPacket = 0;                              // the 8-bit header field
+
     if (!stream->skipBits(42))                           // the 42-bit header - see above
     {
         // not even room for the header. Restore everything and emit the one-bit "no ghosts".
@@ -1265,8 +1292,13 @@ unsigned int GhostManager::transmit(io::BitStream* stream, PacketStatus& status,
     }
     stream->m_byte38 = false;
 
+    if (m_mode == 0)
+    {
+        const int capOverride = getGhostMaxPerPacketOverride();
+        m_capacity = (capOverride > 0) ? capOverride : 40;
+    }
+
     int remaining = m_capacity;                          // the per-transmit ghost budget
-    m_ghostsThisPacket = 0;                              // the 8-bit header field
 
     // ONE local, not four: sendData's fifth parameter is `SaveListEntry&` by its mangled name and
     //   transmit passes the address of this - so the buffer really is its first member.
@@ -1593,6 +1625,10 @@ void GhostManager::handlePacketStatus(PacketStatus& status, bool& delivered)
         }
 
         // 4. fold what survives back into the live ghosts and make them urgent.
+        const float resendBoost = getResendPriorityBoostOverride();
+        const float resendAccumCap = (resendBoost * 4.0f > 100.0f)
+            ? (resendBoost * 4.0f < 1000.0f ? resendBoost * 4.0f : 1000.0f)
+            : 100.0f;
         for (int ghostId = 0; ghostId <= 1023; ++ghostId)
         {
             io::NetworkableStateMask* const scratch = m_networkableStateMasks[ghostId];
@@ -1603,7 +1639,19 @@ void GhostManager::handlePacketStatus(PacketStatus& status, bool& delivered)
                 continue;
             reinterpret_cast<io::NetworkableStateMask*>(ghost->m_stateMask)
                 ->doOperation(*scratch, static_cast<io::StateMaskOp>(1));      // op 1 = OR
-            ghost->m_priority = 10000.0f;                // the ceiling - resend it now
+            if (resendBoost > 0.0f)
+            {
+                if (ghost->m_accumulatedPriority < resendAccumCap)
+                {
+                    ghost->m_accumulatedPriority += resendBoost;
+                    if (ghost->m_accumulatedPriority > resendAccumCap)
+                        ghost->m_accumulatedPriority = resendAccumCap;
+                }
+            }
+            else
+            {
+                ghost->m_priority = 10000.0f;            // the ceiling - resend it now
+            }
         }
     }
 

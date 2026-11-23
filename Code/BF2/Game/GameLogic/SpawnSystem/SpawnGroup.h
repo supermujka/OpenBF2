@@ -81,6 +81,10 @@ public:
     void getUnsignedWorldPosition(unsigned char* outX, unsigned char* outZ);   // 517 B - the
                                                      //   8-bit map position the create event carries
 
+    // [CHOSEN, not recovered] Non-virtual read-only snapshot helpers for NetPipeline.
+    bool getBaselineFieldsAt(int slot, int& outTeam, unsigned char& outActive, unsigned char& outOnlyForAI, unsigned char& outHasSpawnPoints, unsigned char& outPosX, unsigned char& outPosZ, int& outSquad) const;
+    static void addNetWriteBits(int bits);
+
     // The manager reads these raw (getCreateSpawnGroup / _removeGroup / createSpawnGroupOnClients /
     // getGroupsForTeam / canTeamGetAnySpawnGroup) - the ControlPoint/ControlPointTemplate arrangement.
     friend class SpawnManager;
