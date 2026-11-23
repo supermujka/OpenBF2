@@ -186,3 +186,65 @@ Pokrenite identičan profil opterećenja na sva tri preseta (fiksni `--seed 1337
 2. **Klijentska strana (`FINAL A/B SUMMARY` iz `bf2_loadbot`):**
    - **`SnapHz` (`p50 / p95 / p99`) i `max_gap_ms` (`gap ... max=... ms`):** viši `p95`/`p99` SnapHz (bliže 30 Hz) i niži `max_gap_ms` znače manje zastoja u isporuci snapshotova.
    - **Sliding/ekstrapolacioni detektor (`Slide`):** poredite procenat i apsolutni broj bliskih ažuriranja neprijatelja (`< 50 m`) koji kasne **`> 100 ms`** i **`> 200 ms`**, kao i `maxEnemyGapMs`. Cilj Preseta B i C je drastično smanjenje `> 100 ms` i eliminacija `> 200 ms` skokova u odnosu na `hitreg-v1` baseline (Preset A), bez `disc` (diskonekcija) i `protoErr` grešaka.
+
+---
+
+## 6. Praktični scenariji pokretanja (drugi Linux server, WSL2, igranje uživo sa `--bots 62`)
+
+### A) Zlatni standard: Drugi Linux server za botove + pravi `BF2.exe` od kuće (PREPORUČENO)
+- **Linux Server #1 (BF2 server):** vrti samo `bf2` dedicated server (`0%` CPU opterećenja od botova, pravi NIC/kernel UDP/`sendmmsg`, čisti `ServerTickProfiler` brojevi).
+- **Linux Server #2 (`bf2_loadbot`):** ne treba ni puni CMake build ni BF2 fajlove — samo `g++`, `git` i opciono prekopiran `Infantry.qtr` (par stotina KB).
+- **Tvoj Windows PC (`BF2.exe`):** ostaviš 2 slobodna slota (`--bots 62`, tj. `31 vs 31`), spojiš se preko **Multiplayer → Connect to IP** (`<IP_SERVERA_1>:16567`) i uživo provjeravaš hitreg i "klizanje".
+
+Brzi build na **Linux Serveru #2** (~10 sekundi):
+```bash
+sudo apt update && sudo apt install -y g++ git
+git clone https://github.com/supermujka/OpenBF2.git && cd OpenBF2
+git checkout feat/loadbot-64p
+
+# Unit testovi
+g++ -std=c++14 -O2 -fno-strict-aliasing -pthread -I Code/BF2 -I Code/Tools/LoadBot \
+    Code/Tests/bf2_loadbot_tests.cpp \
+    Code/Tools/LoadBot/WireBitStream.cpp \
+    Code/Tools/LoadBot/SWTransport.cpp \
+    Code/Tools/LoadBot/Bf2Protocol.cpp \
+    Code/Tools/LoadBot/NavMesh.cpp \
+    Code/Tools/LoadBot/RouteLoader.cpp \
+    Code/Tools/LoadBot/NetImpairment.cpp \
+    Code/Tools/LoadBot/Telemetry.cpp \
+    Code/Tools/LoadBot/BotBrain.cpp \
+    -o ./bf2_loadbot_tests && ./bf2_loadbot_tests
+
+# Standalone bf2_loadbot binarni fajl
+g++ -std=c++14 -O2 -fno-strict-aliasing -pthread -Wall -Wextra -I Code/Tools/LoadBot \
+    Code/Tools/LoadBot/*.cpp -o ./bf2_loadbot
+```
+
+Pokretanje sa **Linux Servera #2** prema **Serveru #1** (sa `--bots 62` i `--duration-sec 0` da radi do `Ctrl+C`):
+```bash
+# Udaljeni serveri (već postoji realan ping/jitter/loss — isključi vještačku simulaciju nulama):
+./bf2_loadbot --host <IP_SERVERA_1> --port 16567 \
+    --bots 62 --ping-ms 0 --jitter-ms 0 --loss-pct 0 \
+    --duration-sec 0 --navmesh ~/bf2_nav/karkand
+
+# Isti datacentar (ping < 2 ms — uključi determinističku simulaciju igrača):
+./bf2_loadbot --host <IP_SERVERA_1> --port 16567 \
+    --bots 62 --ping-ms 35 --jitter-ms 8 --loss-pct 1.0 \
+    --duration-sec 0 --navmesh ~/bf2_nav/karkand --seed 1337
+```
+> **Napomena za firewall / DDoS filter na Serveru #1:** Svih 62 botova dolazi sa iste IP adrese (Servera #2) preko 62 različita UDP porta (~1,860 paketa/s). Ako na Serveru #1 postoji `iptables` rate-limit ili VPS anti-DDoS zaštita, whitelist-uj IP adresu Servera #2 za UDP port `16567`.
+
+### B) Pokretanje na istom Linux serveru (`127.0.0.1`) uz izolaciju CPU jezgra
+Ako nemaš drugi server, pokreni `bf2_loadbot` na istom serveru zakucan na zadnje CPU jezgro (`taskset`) da ne utiče na `bf2` simulaciju i `ServerTickProfiler`, a ti uđi od kuće sa `BF2.exe`:
+```bash
+taskset -c 3 ./bf2_loadbot --host 127.0.0.1 --port 16567 \
+    --bots 62 --ping-ms 35 --jitter-ms 8 --loss-pct 1.0 \
+    --duration-sec 0 --navmesh ~/bf2_nav/karkand --seed 1337
+```
+
+### C) Pokretanje sa Windows PC-a kroz WSL2 (Ubuntu)
+`bf2_loadbot` koristi Linux/POSIX UDP sokete, ali se na Windowsu može pokrenuti direktno kroz WSL2:
+1. U PowerShell-u (Admin): `wsl --install -d Ubuntu` (jednokratno + restart).
+2. U Ubuntu terminalu: `sudo apt update && sudo apt install -y build-essential cmake ninja-build git python3 unzip`.
+3. Kloniraj u Linux home (`~/OpenBF2`, ne pod `/mnt/c/` radi brzine kompajliranja) i izgradi po gornjim `g++` ili `cmake` komandama.
+4. Za spajanje na udaljeni Linux server koristi `--ping-ms 0 --jitter-ms 0 --loss-pct 0` (vlastiti internet već dodaje realan ping). Pazi da 62 bota troše ~1–2 Mbps upload-a i ~10–25 Mbps download-a kroz kućni ruter.
