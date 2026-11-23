@@ -15,6 +15,7 @@
 #include "../../../../Core/StringUtil.h"
 #include "../../../IGame.h"
 #include "../../../GameServer/ServerSettings.h"
+#include "../../../../Physics/HitregTelemetry.h"
 #include "../../../../Physics/IPhysicsNode.h"
 
 namespace dice {
@@ -136,6 +137,8 @@ void DeviationComp::postFire(WeaponFireEvent& event)
         m_fireDeviation = m_template->getFireDevMax();
 
     node->setPositionalSpeed(speed);
+    if (HitregTelemetry::isEnabled())
+        HitregTelemetry::noteShotDeviation(projectile, speed, deviation);
 }
 
 void DeviationComp::fireComplete(unsigned int) {}

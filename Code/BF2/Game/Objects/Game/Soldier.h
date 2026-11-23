@@ -328,6 +328,8 @@ private:
     friend class ZiplineContainer;
     // [CHOSEN, not recovered] Read-only zero-dt pose snapshots for shadow A/B telemetry.
     friend class HitregTelemetry;
+    // [CHOSEN, not recovered] Hitreg V3 Phase 2 (Option C): inspect m_ragDoll during latency ring capture.
+    friend class SoldierPhysicsNode;
     /* +0x1F4 */ float  m_smoothedStrafe;            // [CHOSEN] name
     /* +0x1F8 */ float  m_smoothedForward;           // [CHOSEN] name
     /* +0x1FC */ int    m_pose;                      // SoldierPose

@@ -31,11 +31,18 @@ public:
     static void notePacketDelivery(const IPlayer* player, bool delivered, int instantPingMs);
     static void notePlayerSimTick(const IPlayer* player, int queueDepth,
                                   int replayCount, bool replayed);
+    static void noteSnapshotSent(const IPlayer* player, int serverTick);
+    static void notePlayerInputConsumed(const IPlayer* player, bool fireHeld);
+    static void notePlayerInputDropped(const IPlayer* player, bool fireHeld, bool isDrainDrop);
     static void forgetPlayer(const IPlayer* player);
 
     // Per-shot lifecycle.
     static void noteShotFired(const IObject* projectile, IPlayer* owner,
-                              const char* weaponName, const Vec3& startPos, float muzzleSpeed);
+                              const char* weaponName, const Vec3& startPos,
+                              const Vec3& launchVel);
+    static void noteShotDeviation(const IObject* projectile, const Vec3& deviatedVel,
+                                  float deviationPct);
+    static void finalizeShotFired(const IObject* projectile);
     static void forgetProjectile(const IObject* projectile);
 
     // Read-only Shadow A/B + pingFactor sweep probe (hits and near-misses <= 2.0 m).

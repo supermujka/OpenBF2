@@ -53,9 +53,12 @@ struct SoldierLatencyMeta
 {
     int           validSamples;
     int           reseedTick;
+    int           lastTick;
+    IObject*      lastParent;
     bool          fromZeroReset;
     BoneRingFrame boneFrames[16];
-    SoldierLatencyMeta() : validSamples(0), reseedTick(0), fromZeroReset(true) {}
+    SoldierLatencyMeta()
+        : validSamples(0), reseedTick(0), lastTick(-1), lastParent(0), fromZeroReset(true) {}
 };
 
 void normalizeQuat(Quat& q)
@@ -539,6 +542,24 @@ void SoldierPhysicsNode::updateLatencyState()
     if (!m_latency)                                                        // +0x104
         return;
 
+    Soldier* const soldier = static_cast<Soldier*>(m_object);
+    SoldierLatencyMeta& meta = soldierLatencyMeta()[this];
+    const int currentTick = WorldPref::getTickCount();
+    IObject* const currentParent = m_object ? static_cast<IObject*>(L::parent(m_object)) : 0;
+
+    // [CHOSEN, not recovered] Hitreg V3 Phase 2 (Option C):
+    // Do not sample disabled/man-down ragdoll ticks into the latency ring (ragdoll sits ~1.0 m
+    // lower than the soldier pivot, which otherwise sinks the revived hitbox underground for 500 ms).
+    const bool spawnRingFix = LatencyCompensation::isSpawnRingFixEnabled();
+    if (spawnRingFix && (!m_enabled || !soldier || soldier->m_ragDoll != 0))
+    {
+        meta.validSamples = 0;
+        meta.fromZeroReset = true;
+        meta.lastTick = -1;
+        meta.lastParent = currentParent;
+        return;
+    }
+
     const Mat4& transform = getAbsoluteTransformation();                   // vslot +0x3C
 
     Vec3 position;
@@ -553,18 +574,20 @@ void SoldierPhysicsNode::updateLatencyState()
     rotation.fromMat(transform);
 
     const unsigned char pose = static_cast<unsigned char>(
-        static_cast<Soldier*>(m_object)->getPose());                       // Soldier +0x278
+        soldier->getPose());                                               // Soldier +0x278
 
     const bool wantBones = m_object
         && (LatencyCompensation::isBoneHistoryEnabled() || HitregTelemetry::isEnabled());
     BoneRingFrame boneFrame;
     if (wantBones)
-        captureBoneFrame(static_cast<Soldier*>(m_object), pose, boneFrame);
+        captureBoneFrame(soldier, pose, boneFrame);
 
-    SoldierLatencyMeta& meta = soldierLatencyMeta()[this];
     const bool initialSeed = (meta.validSamples <= 0);
-    bool teleported = false;
-    if (!initialSeed)
+    const bool parentChanged = (meta.lastTick >= 0 && currentParent != meta.lastParent);
+    const bool tickGap =
+        (meta.lastTick >= 0 && (currentTick - meta.lastTick > 1 || currentTick < meta.lastTick));
+    bool teleported = spawnRingFix && (parentChanged || tickGap);
+    if (!initialSeed && !teleported)
     {
         const int prevIdx = (m_latencyIndex + 15) & 15;
         const float dx = position.x - m_latency[prevIdx].position.x;
@@ -577,8 +600,10 @@ void SoldierPhysicsNode::updateLatencyState()
     {
         meta.fromZeroReset = initialSeed;
         meta.validSamples = 1;
-        meta.reseedTick = WorldPref::getTickCount();
-        if (LatencyCompensation::isSpawnRingFixEnabled())
+        meta.reseedTick = currentTick;
+        meta.lastTick = currentTick;
+        meta.lastParent = currentParent;
+        if (spawnRingFix)
         {
             for (int i = 0; i < 16; ++i)
             {
@@ -600,6 +625,9 @@ void SoldierPhysicsNode::updateLatencyState()
         if (meta.validSamples >= 16)
             meta.fromZeroReset = false;
     }
+
+    meta.lastTick = currentTick;
+    meta.lastParent = currentParent;
 
     LatencyEntry& entry = m_latency[m_latencyIndex];                       // +0x108, entries of 32 B
     entry.position = position;

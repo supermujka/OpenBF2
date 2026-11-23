@@ -1384,13 +1384,11 @@ void GenericProjectile::initOnLaunch()
                 ? weapon->getTemplate()->getName().c_str()
                 : (getTemplate() ? getTemplate()->getName().c_str() : "");
             IPhysicsNode* const pNode = objectPhysicsNode(this);
-            float muzzleSpeed = 0.0f;
+            Vec3 launchVel;
+            launchVel.x = launchVel.y = launchVel.z = 0.0f;
             if (pNode)
-            {
-                const Vec3& vel = pNode->getPositionalSpeed();
-                muzzleSpeed = sqrtf(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
-            }
-            HitregTelemetry::noteShotFired(this, owner, weaponName, m_startPos, muzzleSpeed);
+                launchVel = pNode->getPositionalSpeed();
+            HitregTelemetry::noteShotFired(this, owner, weaponName, m_startPos, launchVel);
         }
     }
     if (getPlayer() && gameLogic->isServer() && getNetworkable())

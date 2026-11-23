@@ -228,8 +228,13 @@ bool HitregTelemetry::isEnabled() { return false; }
 int HitregTelemetry::getLevel() { return 0; }
 void HitregTelemetry::notePacketDelivery(const IPlayer*, bool, int) {}
 void HitregTelemetry::notePlayerSimTick(const IPlayer*, int, int, bool) {}
+void HitregTelemetry::noteSnapshotSent(const IPlayer*, int) {}
+void HitregTelemetry::notePlayerInputConsumed(const IPlayer*, bool) {}
+void HitregTelemetry::notePlayerInputDropped(const IPlayer*, bool, bool) {}
 void HitregTelemetry::forgetPlayer(const IPlayer*) {}
-void HitregTelemetry::noteShotFired(const IObject*, IPlayer*, const char*, const Vec3&, float) {}
+void HitregTelemetry::noteShotFired(const IObject*, IPlayer*, const char*, const Vec3&, const Vec3&) {}
+void HitregTelemetry::noteShotDeviation(const IObject*, const Vec3&, float) {}
+void HitregTelemetry::finalizeShotFired(const IObject*) {}
 void HitregTelemetry::forgetProjectile(const IObject*) {}
 void HitregTelemetry::recordSoldierProbe(IObject*, IPlayer*, IObject*, const SoldierPhysicsNode*,
                                          const anim::Skeleton*, const Vec3&, const Vec3&,

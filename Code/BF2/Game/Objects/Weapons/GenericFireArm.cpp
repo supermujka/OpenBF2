@@ -39,6 +39,7 @@
 #include "../../../IO/Input/PlayerInput.h"
 #include "../../../Math/Mat4.h"
 #include "../../../Physics/HeightmapCluster.h"
+#include "../../../Physics/HitregTelemetry.h"
 #include "../../../Physics/SoldierResponse.h"
 #include "../Projectiles/ProjectileCompTemplates.h"
 #include "../../../Scene/Object/ObjectTypes/Base/ObjectTemplateManager.h"
@@ -1499,6 +1500,8 @@ void GenericFireArm::postFire(FireState requestedState,
 
                 if (m_deviationComp)
                     m_deviationComp->postFire(event);
+                if (HitregTelemetry::isEnabled() && projectileObject)
+                    HitregTelemetry::finalizeShotFired(projectileObject);
 
                 IProjectileObject* projectileFace = projectileObject
                     ? static_cast<IProjectileObject*>(

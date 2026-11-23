@@ -2361,6 +2361,9 @@ inline bool clientConnectionHandlePacketStatusNotification(IClientConnection* c,
     return reinterpret_cast<ClientConnection*>(c)->handlePacketStatusNotification(delivered);
 }
 void clearPlayerActionsPerConnection(IClientConnection* connection);            // the rest of 0x80B4AD0 (325 B): the ActionBuffer trim
+// [CHOSEN, not recovered] Hitreg V3 Phase 2 (Option A): tracks sim steps in the current
+// GameServer::update call so 30 Hz send-rate connections emit once per simulated frame.
+int g_currentUpdateSimSteps = 0;
 } // namespace
 
 // Advances server simulation and network traffic. Negative dt runs only receive,
@@ -2373,6 +2376,7 @@ bool GameServer::update(int steps, float dt)
         processReceivedPackets();
         const float elapsed = getDeltaTime();
         updateConnections(elapsed);
+        g_currentUpdateSimSteps = 0;
         processGameStateAndSendPackets(elapsed);
         return true;
     }
@@ -2403,7 +2407,9 @@ bool GameServer::update(int steps, float dt)
             updateStateMasks();
             const float elapsed = getDeltaTime();
             updateConnections(elapsed);
+            g_currentUpdateSimSteps = 1;
             processGameStateAndSendPackets(elapsed);
+            g_currentUpdateSimSteps = 0;
         }
         // [PLATFORM] NOT  - BF2.exe 0x4D1138..0x4D1151, a listen-server arm the dedicated ELF
         // folded away: `if (!isDedicated() && i == steps - 1)` the sound owner (ds:0xA23DC0) vslot
@@ -2417,7 +2423,9 @@ bool GameServer::update(int steps, float dt)
         updateStateMasks();
         const float elapsed = getDeltaTime();
         updateConnections(elapsed);
+        g_currentUpdateSimSteps = steps;
         processGameStateAndSendPackets(elapsed);
+        g_currentUpdateSimSteps = 0;
     }
 
 #if !DEDICATED
@@ -3094,13 +3102,23 @@ void GameServer::processGameStateAndSendPackets(float dt)
 
         // the packet rate gate. A demo bypasses it; everyone else waits their turn.
         const bool recording = conn->getIsRecordingConnection();
-        if (!recording && !(conn->m_timer1C <= 0.0f))
+        const int sendRate = effectiveServerSendRate(conn);
+        const bool forceFullRateSend =
+            !recording && sendRate >= 30 && g_currentUpdateSimSteps >= 1
+            && world::LatencyCompensation::isImprovedEnabled();
+        if (!recording && !forceFullRateSend && !(conn->m_timer1C <= 0.0f))
             continue;
 
-        if (conn->m_timer1C <= 0.0f)
+        if (forceFullRateSend)
+        {
+            // [CHOSEN, not recovered] Hitreg V3 Phase 2 (Option A): at 30 Hz send rate on a
+            // simulated frame, emit exactly one snapshot per sim step without float-period slip
+            // or post-hitch debt accumulation.
+            conn->m_timer1C = 0.0f;
+        }
+        else if (conn->m_timer1C <= 0.0f)
         {
             // one period back on the clock. m_dword14 is the rate in Hz - default 20.
-            const int sendRate = effectiveServerSendRate(conn);
             const float period = 1.0f / static_cast<float>(sendRate);
             conn->m_timer1C += period;
             if (*g_netServerSendRate > 0 && conn->m_timer1C < -period)
@@ -3175,6 +3193,11 @@ void GameServer::processGameStateAndSendPackets(float dt)
             m_networkableStats->sampleStreamManagerWriteStats(conn, true);
 
         m_netServer->send(conn->m_connectionId);
+        if (world::HitregTelemetry::isEnabled()
+            && conn->m_connectionState == 4 && conn->m_bReset && conn->getPlayer())
+        {
+            world::HitregTelemetry::noteSnapshotSent(conn->getPlayer(), WorldPref::getTickCount());
+        }
     }
 
     if (m_sampleStreamManagerReadStats)
@@ -3206,6 +3229,7 @@ void GameServer::clearPlayerActions()
         {
             while (ab->size() > maxCap)                             // drop oldest while preserving edges
             {
+                const bool droppedFire = (ab->m_entries.front().m_action.m_buttonMaskLow & 1u) != 0u;
                 if (world::LatencyCompensation::isQueueDrainEnabled() && ab->size() >= 2)
                 {
                     const PlayerAction dropped = ab->m_entries.front().m_action;
@@ -3223,6 +3247,8 @@ void GameServer::clearPlayerActions()
                     ab->m_entries.pop_front();
                 }
                 world::LatencyCompensation::noteQueueCapDrop(player);
+                if (world::HitregTelemetry::isEnabled())
+                    world::HitregTelemetry::notePlayerInputDropped(player, droppedFire, false);
             }
             player->resetTickCounter();                              // IPlayer +0xDC
         }
@@ -3465,11 +3491,15 @@ bool GameServer::simulatePlayerUpdate(world::IPlayer* player, float dt)
             }
             if (world::LatencyCompensation::shouldDrainPlayerAction(player, prePopDepth, canDrop))
             {
+                const bool droppedFire =
+                    (buffer->m_entries.front().m_action.m_buttonMaskLow & 1u) != 0u;
                 std::list<ActionBufferEntry>::iterator secondIt = buffer->m_entries.begin();
                 ++secondIt;
                 secondIt->m_action.m_axis[4] = static_cast<short>(mergedAxisX);
                 secondIt->m_action.m_axis[5] = static_cast<short>(mergedAxisY);
                 buffer->m_entries.pop_front();
+                if (world::HitregTelemetry::isEnabled())
+                    world::HitregTelemetry::notePlayerInputDropped(player, droppedFire, true);
             }
 
             // consume the oldest queued action and make it current
@@ -3485,8 +3515,12 @@ bool GameServer::simulatePlayerUpdate(world::IPlayer* player, float dt)
             world::LatencyCompensation::setPlayerActiveQueueDelay(
                 player, front.m_inputIndex, WorldPref::getTickCount() - 1);
             if (world::HitregTelemetry::isEnabled())
+            {
                 world::HitregTelemetry::notePlayerSimTick(
                     player, static_cast<int>(buffer->m_entries.size()), 0, false);
+                world::HitregTelemetry::notePlayerInputConsumed(
+                    player, (front.m_buttonMaskLow & 1u) != 0u);
+            }
 
             buffer->m_entries.erase(buffer->m_entries.begin());
             buffer->m_replayCount = 0;                  // a real action resets the run

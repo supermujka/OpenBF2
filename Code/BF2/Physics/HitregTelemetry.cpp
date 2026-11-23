@@ -61,6 +61,15 @@ struct PlayerNetState
     int           lastReplayCount;
     std::uint32_t replayMask30;
 
+    // [CHOSEN, not recovered] Hitreg V3 Phase 2 forensic counters & send-cadence tracker.
+    std::uint64_t fireHeldCum;
+    std::uint64_t shotsFiredCum;
+    std::uint64_t fireDroppedCum;
+    std::uint64_t earlyNoProbeCum;
+    int           lastSnapTick;
+    int           lastSnapGapTicks;
+    int           lastDrainDropTick;
+
     PlayerNetState()
         : lossMask(0)
         , lossCount(0)
@@ -70,6 +79,13 @@ struct PlayerNetState
         , lastQueueDepth(0)
         , lastReplayCount(0)
         , replayMask30(0)
+        , fireHeldCum(0)
+        , shotsFiredCum(0)
+        , fireDroppedCum(0)
+        , earlyNoProbeCum(0)
+        , lastSnapTick(-1)
+        , lastSnapGapTicks(-1)
+        , lastDrainDropTick(-1)
     {
         std::memset(pingRing, 0, sizeof(pingRing));
     }
@@ -79,6 +95,8 @@ struct ShotRecord
 {
     std::uint64_t shotId;
     int           fireTick;
+    double        fireTimeSec;
+    const IPlayer* ownerPtr;
     int           shooterId;
     std::string   shooterName;
     std::string   weaponName;
@@ -96,6 +114,25 @@ struct ShotRecord
     float         queueDelayMs;
     int           replayCount;
     int           replays30t;
+
+    // [CHOSEN, not recovered] Hitreg V3 Phase 2 forensic shot snapshot.
+    Vec3          aimDir;
+    Vec3          bulletDir;
+    bool          hasAimDir;
+    bool          hasBulletDir;
+    bool          hasDeviation;
+    float         devDeg;
+    float         devConeDeg;
+    bool          hasMuzzleOff;
+    float         muzzleOffM;
+    bool          fireEmitted;
+    bool          hadSoldierProbe;
+    std::uint64_t shHeldCum;
+    std::uint64_t shShotsCum;
+    std::uint64_t shFdropCum;
+    std::uint64_t shEarlyNpCum;
+    int           sndGapTicks;
+    int           qDropAgeT;
 
     // Pending soldier contact arbitration on current tick.
     int           pendingTick;
@@ -127,6 +164,8 @@ struct ShotRecord
     ShotRecord()
         : shotId(0)
         , fireTick(0)
+        , fireTimeSec(0.0)
+        , ownerPtr(0)
         , shooterId(-1)
         , muzzleSpeed(0.0f)
         , v1RewindMs(0.0f)
@@ -141,6 +180,21 @@ struct ShotRecord
         , queueDelayMs(0.0f)
         , replayCount(0)
         , replays30t(0)
+        , hasAimDir(false)
+        , hasBulletDir(false)
+        , hasDeviation(false)
+        , devDeg(0.0f)
+        , devConeDeg(0.0f)
+        , hasMuzzleOff(false)
+        , muzzleOffM(0.0f)
+        , fireEmitted(false)
+        , hadSoldierProbe(false)
+        , shHeldCum(0)
+        , shShotsCum(0)
+        , shFdropCum(0)
+        , shEarlyNpCum(0)
+        , sndGapTicks(-1)
+        , qDropAgeT(-1)
         , pendingTick(-1)
         , pendingTarget(0)
         , pendingTargetId(-1)
@@ -161,6 +215,8 @@ struct ShotRecord
         , killed(false)
     {
         startPos.x = startPos.y = startPos.z = 0.0f;
+        aimDir.x = aimDir.y = aimDir.z = 0.0f;
+        bulletDir.x = bulletDir.y = bulletDir.z = 0.0f;
         pendingRayStart.x = pendingRayStart.y = pendingRayStart.z = 0.0f;
         pendingHitPos.x = pendingHitPos.y = pendingHitPos.z = 0.0f;
         shooterCenterPos.x = shooterCenterPos.y = shooterCenterPos.z = 0.0f;
@@ -244,7 +300,10 @@ const char* kCsvHeader =
     "c17_hit,c17_bone,c17_miss_m,c17_dt_err_ms,"
     "c33_hit,c33_bone,c33_miss_m,c33_dt_err_ms,"
     "outcome,blocker,blocker_mat,override_margin_m,t_wall_m,t_soldier_m,obj_class,eye_clear,"
-    "mat_a,mat_b,base_dmg,mat_mod,angle_mod,final_dmg,hp_before,hp_after,killed,hitmarker\n";
+    "mat_a,mat_b,base_dmg,mat_mod,angle_mod,final_dmg,hp_before,hp_after,killed,hitmarker,"
+    "dev_deg,dev_cone_deg,muzzle_off_m,sh_held_cum,sh_shots_cum,sh_fdrop_cum,sh_early_np_cum,"
+    "snd_gap_ticks,q_drop_age_t,"
+    "aim_hit,aim_miss_m,miss_dy_m,miss_lat_m,tgt_back_dot,tgt_ticks_since_reseed,ring_uf\n";
 
 void flushBufferToDisk(bool forceFlush)
 {
@@ -352,6 +411,25 @@ std::string sanitizeField(const char* raw)
     return out;
 }
 
+int countCommas(const char* s)
+{
+    int count = 0;
+    if (!s)
+        return 0;
+    for (const char* p = s; *p; ++p)
+    {
+        if (*p == ',')
+            ++count;
+    }
+    return count;
+}
+
+int expectedHeaderCommas()
+{
+    static const int kCommas = countCommas(kCsvHeader);
+    return kCommas;
+}
+
 void appendLine(const char* line)
 {
     if (!line || !*line)
@@ -362,6 +440,50 @@ void appendLine(const char* line)
     st.buffer.append(line);
     if (st.buffer.size() >= 16384u)
         flushBufferToDisk(false);
+}
+
+void appendCheckedLine(const char* line, int written, std::size_t cap)
+{
+    if (!line || written <= 0 || static_cast<std::size_t>(written) >= cap)
+    {
+        static bool s_warnedTrunc = false;
+        if (!s_warnedTrunc)
+        {
+            s_warnedTrunc = true;
+            std::fprintf(stderr, "[HITREG] telemetry line truncated (written=%d cap=%u)\n",
+                         written, static_cast<unsigned int>(cap));
+            std::fflush(stderr);
+        }
+        return;
+    }
+    const int commas = countCommas(line);
+    if (commas != expectedHeaderCommas())
+    {
+        static bool s_warnedCols = false;
+        if (!s_warnedCols)
+        {
+            s_warnedCols = true;
+            std::fprintf(stderr, "[HITREG] telemetry column mismatch (commas=%d expected=%d)\n",
+                         commas, expectedHeaderCommas());
+            std::fflush(stderr);
+        }
+    }
+    appendLine(line);
+}
+
+bool normalizeVec3(const Vec3& v, Vec3& out)
+{
+    const float lenSq = v.x * v.x + v.y * v.y + v.z * v.z;
+    if (lenSq <= 1e-8f)
+    {
+        out.x = out.y = out.z = 0.0f;
+        return false;
+    }
+    const float invLen = 1.0f / std::sqrt(lenSq);
+    out.x = v.x * invLen;
+    out.y = v.y * invLen;
+    out.z = v.z * invLen;
+    return true;
 }
 
 int popCount32(std::uint32_t v)
@@ -601,8 +723,8 @@ void ensureTelemetryOpenAndConfigLogged()
     if (st.lastConfigSig != sig)
     {
         st.lastConfigSig = sig;
-        char line[768];
-        std::snprintf(
+        char line[1024];
+        const int written = std::snprintf(
             line, sizeof(line),
             "CONFIG,%d,%.3f"
             ",,,,,,,,,,,,,,,,,,,,"
@@ -611,9 +733,10 @@ void ensureTelemetryOpenAndConfigLogged()
             ",,,,,,,,,,,,,,,,,,,,"
             ",,,,,,,,,,,,,,,,,,,,"
             ",,,,,,,%s"
-            ",,,,,,,,,,,,,,,,,\n",
+            ",,,,,,,,,,,,,,,,,"
+            ",,,,,,,,,,,,,,,,\n",
             WorldPref::getTickCount(), WorldPref::getWorldTime(), sig);
-        appendLine(line);
+        appendCheckedLine(line, written, sizeof(line));
         flushBufferToDisk(true);
     }
 }
@@ -679,7 +802,68 @@ void fillShotNetSnapshot(IPlayer* owner, ShotRecord& shot)
         shot.queueDepth = it->second.lastQueueDepth;
         shot.replayCount = it->second.lastReplayCount;
         shot.replays30t = popCount32(it->second.replayMask30);
+        shot.shHeldCum = it->second.fireHeldCum;
+        shot.shShotsCum = it->second.shotsFiredCum;
+        shot.shFdropCum = it->second.fireDroppedCum;
+        shot.shEarlyNpCum = it->second.earlyNoProbeCum;
+        shot.sndGapTicks = it->second.lastSnapGapTicks;
+        if (it->second.lastDrainDropTick >= 0)
+        {
+            const int age = shot.fireTick - it->second.lastDrainDropTick;
+            shot.qDropAgeT = age >= 0 ? age : 0;
+        }
     }
+}
+
+void emitFireRow(ShotRecord& shot)
+{
+    if (shot.fireEmitted)
+        return;
+    shot.fireEmitted = true;
+
+    TelemetryLoggerState& st = loggerState();
+    if (*g_telemetryLevel < 2 || !st.file)
+        return;
+
+    char devDegBuf[24] = "";
+    char devConeBuf[24] = "";
+    char muzzleOffBuf[24] = "";
+    if (shot.hasDeviation)
+    {
+        std::snprintf(devDegBuf, sizeof(devDegBuf), "%.3f", shot.devDeg);
+        std::snprintf(devConeBuf, sizeof(devConeBuf), "%.3f", shot.devConeDeg);
+    }
+    if (shot.hasMuzzleOff)
+        std::snprintf(muzzleOffBuf, sizeof(muzzleOffBuf), "%.3f", shot.muzzleOffM);
+
+    char line[1024];
+    const int written = std::snprintf(
+        line, sizeof(line),
+        "FIRE,%d,%.3f,%llu,%s,%d,%s,,,"
+        "%u,%d,%.2f,%.2f,%u,%u,"
+        "%d,%.2f,%d,%d,%.2f,%.2f"
+        ",,,,,,,,,,,,,,,,,,,,"
+        ",,,,,,,,,,,,,,,,,,,,"
+        ",,,,,,,,,,,,,,,,,,,,"
+        ",,,,,,,,,,,,,,,,,,,,"
+        ",,,,,,,,,,,,,,,,,,,,"
+        ",,,,,,"
+        ",%s,%s,%s,%llu,%llu,%llu,%llu,%d,%d"
+        ",,,,,,,\n",
+        shot.fireTick, shot.fireTimeSec,
+        static_cast<unsigned long long>(shot.shotId),
+        shot.weaponName.c_str(), shot.shooterId, shot.shooterName.c_str(),
+        shot.pingMs, shot.rawPingMs, shot.rttJitterMs, shot.pktLossDnPct,
+        shot.rawInterpMs, shot.interpMs,
+        shot.queueDepth, shot.queueDelayMs, shot.replayCount, shot.replays30t,
+        shot.v1RewindMs, shot.vanFireRewindMs,
+        devDegBuf, devConeBuf, muzzleOffBuf,
+        static_cast<unsigned long long>(shot.shHeldCum),
+        static_cast<unsigned long long>(shot.shShotsCum),
+        static_cast<unsigned long long>(shot.shFdropCum),
+        static_cast<unsigned long long>(shot.shEarlyNpCum),
+        shot.sndGapTicks, shot.qDropAgeT);
+    appendCheckedLine(line, written, sizeof(line));
 }
 
 } // namespace
@@ -726,6 +910,40 @@ void HitregTelemetry::notePlayerSimTick(const IPlayer* player, int queueDepth,
     ns.replayMask30 = ((ns.replayMask30 << 1) | (replayed ? 1u : 0u)) & 0x3FFFFFFFu;
 }
 
+void HitregTelemetry::noteSnapshotSent(const IPlayer* player, int serverTick)
+{
+    if (!player || *g_telemetryLevel <= 0)
+        return;
+
+    PlayerNetState& ns = playerNetStates()[player];
+    if (ns.lastSnapTick >= 0)
+    {
+        const int gap = serverTick - ns.lastSnapTick;
+        ns.lastSnapGapTicks = gap >= 0 ? gap : 0;
+    }
+    ns.lastSnapTick = serverTick;
+}
+
+void HitregTelemetry::notePlayerInputConsumed(const IPlayer* player, bool fireHeld)
+{
+    if (!player || !fireHeld || *g_telemetryLevel <= 0)
+        return;
+
+    ++playerNetStates()[player].fireHeldCum;
+}
+
+void HitregTelemetry::notePlayerInputDropped(const IPlayer* player, bool fireHeld, bool isDrainDrop)
+{
+    if (!player || *g_telemetryLevel <= 0)
+        return;
+
+    PlayerNetState& ns = playerNetStates()[player];
+    if (fireHeld)
+        ++ns.fireDroppedCum;
+    if (isDrainDrop)
+        ns.lastDrainDropTick = WorldPref::getTickCount();
+}
+
 void HitregTelemetry::forgetPlayer(const IPlayer* player)
 {
     if (player)
@@ -734,7 +952,7 @@ void HitregTelemetry::forgetPlayer(const IPlayer* player)
 
 void HitregTelemetry::noteShotFired(const IObject* projectile, IPlayer* owner,
                                     const char* weaponName, const Vec3& startPos,
-                                    float muzzleSpeed)
+                                    const Vec3& launchVel)
 {
     if (!projectile || !owner || *g_telemetryLevel <= 0)
         return;
@@ -742,15 +960,29 @@ void HitregTelemetry::noteShotFired(const IObject* projectile, IPlayer* owner,
     ensureTelemetryOpenAndConfigLogged();
     TelemetryLoggerState& st = loggerState();
 
+    PlayerNetState& ownerNs = playerNetStates()[owner];
+    ++ownerNs.shotsFiredCum;
+
     ShotRecord& shot = shotRecords()[projectile];
     shot = ShotRecord();
     shot.shotId = st.nextShotId++;
     shot.fireTick = WorldPref::getTickCount();
+    shot.fireTimeSec = WorldPref::getWorldTime();
+    shot.ownerPtr = owner;
     shot.shooterId = owner->getId();
     shot.shooterName = sanitizeField(owner->getName().c_str());
     shot.weaponName = sanitizeField(weaponName);
     shot.startPos = startPos;
-    shot.muzzleSpeed = muzzleSpeed;
+    shot.muzzleSpeed = std::sqrt(launchVel.x * launchVel.x
+                               + launchVel.y * launchVel.y
+                               + launchVel.z * launchVel.z);
+    if (normalizeVec3(launchVel, shot.aimDir))
+    {
+        shot.hasAimDir = true;
+        shot.bulletDir = shot.aimDir;
+        shot.hasBulletDir = true;
+    }
+
     fillShotNetSnapshot(owner, shot);
     shot.v1RewindMs = LatencyCompensation::getProjectileLatency(projectile, owner) * 1000.0f;
 
@@ -766,37 +998,88 @@ void HitregTelemetry::noteShotFired(const IObject* projectile, IPlayer* owner,
             ? camObj->getAbsolutePosition()
             : shooterSoldier->getSkeletonRayTestPoint(Soldier::SkeletonRayTestPointHead);
         shot.hasShooterEye = true;
-    }
 
-    if (*g_telemetryLevel >= 2 && st.file)
-    {
-        char line[768];
-        std::snprintf(
-            line, sizeof(line),
-            "FIRE,%d,%.3f,%llu,%s,%d,%s,,,"
-            "%u,%d,%.2f,%.2f,%u,%u,"
-            "%d,%.2f,%d,%d,%.2f,%.2f"
-            ",,,,,,,,,,,,,,,,,,,,"
-            ",,,,,,,,,,,,,,,,,,,,"
-            ",,,,,,,,,,,,,,,,,,,,"
-            ",,,,,,,,,,,,,,,,,,,,"
-            ",,,,,,,,,,,,,,,,,,,,"
-            ",,,,,,\n",
-            shot.fireTick, WorldPref::getWorldTime(),
-            static_cast<unsigned long long>(shot.shotId),
-            shot.weaponName.c_str(), shot.shooterId, shot.shooterName.c_str(),
-            shot.pingMs, shot.rawPingMs, shot.rttJitterMs, shot.pktLossDnPct,
-            shot.rawInterpMs, shot.interpMs,
-            shot.queueDepth, shot.queueDelayMs, shot.replayCount, shot.replays30t,
-            shot.v1RewindMs, shot.vanFireRewindMs);
-        appendLine(line);
+        if (shot.hasAimDir)
+        {
+            const float ox = startPos.x - shot.shooterEyePos.x;
+            const float oy = startPos.y - shot.shooterEyePos.y;
+            const float oz = startPos.z - shot.shooterEyePos.z;
+            shot.muzzleOffM = ox * shot.aimDir.x + oy * shot.aimDir.y + oz * shot.aimDir.z;
+            shot.hasMuzzleOff = true;
+        }
     }
+}
+
+void HitregTelemetry::noteShotDeviation(const IObject* projectile, const Vec3& deviatedVel,
+                                        float deviationPct)
+{
+    if (!projectile || *g_telemetryLevel <= 0)
+        return;
+
+    std::unordered_map<const IObject*, ShotRecord>& records = shotRecords();
+    std::unordered_map<const IObject*, ShotRecord>::iterator it = records.find(projectile);
+    if (it == records.end())
+        return;
+
+    ShotRecord& shot = it->second;
+    Vec3 bDir;
+    if (normalizeVec3(deviatedVel, bDir))
+    {
+        shot.bulletDir = bDir;
+        shot.hasBulletDir = true;
+        if (shot.hasAimDir)
+        {
+            float d = shot.aimDir.x * bDir.x + shot.aimDir.y * bDir.y + shot.aimDir.z * bDir.z;
+            if (d > 1.0f)
+                d = 1.0f;
+            else if (d < -1.0f)
+                d = -1.0f;
+            shot.devDeg = std::acos(d) * 57.2957795f;
+            shot.devConeDeg = std::atan(deviationPct * 0.01f) * 57.2957795f;
+            shot.hasDeviation = true;
+        }
+    }
+}
+
+void HitregTelemetry::finalizeShotFired(const IObject* projectile)
+{
+    if (!projectile || *g_telemetryLevel <= 0)
+        return;
+
+    std::unordered_map<const IObject*, ShotRecord>& records = shotRecords();
+    std::unordered_map<const IObject*, ShotRecord>::iterator it = records.find(projectile);
+    if (it != records.end())
+        emitFireRow(it->second);
 }
 
 void HitregTelemetry::forgetProjectile(const IObject* projectile)
 {
-    if (projectile)
-        shotRecords().erase(projectile);
+    if (!projectile)
+        return;
+
+    std::unordered_map<const IObject*, ShotRecord>& records = shotRecords();
+    std::unordered_map<const IObject*, ShotRecord>::iterator it = records.find(projectile);
+    if (it == records.end())
+        return;
+
+    ShotRecord& shot = it->second;
+    if (!shot.fireEmitted)
+        emitFireRow(shot);
+
+    if (!shot.hadSoldierProbe && shot.ownerPtr)
+    {
+        const int ageTicks = WorldPref::getTickCount() - shot.fireTick;
+        if (ageTicks >= 0 && ageTicks <= 1)
+        {
+            std::unordered_map<const IPlayer*, PlayerNetState>& states = playerNetStates();
+            std::unordered_map<const IPlayer*, PlayerNetState>::iterator pit =
+                states.find(shot.ownerPtr);
+            if (pit != states.end())
+                ++pit->second.earlyNoProbeCum;
+        }
+    }
+
+    records.erase(it);
 }
 
 void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* owner,
@@ -825,12 +1108,16 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
     if (shotIt == records.end())
     {
         const IObjectTemplate* tmpl = projectileObject->getTemplate();
-        noteShotFired(projectileObject, owner, tmpl ? tmpl->getName().c_str() : "", start, 0.0f);
+        noteShotFired(projectileObject, owner, tmpl ? tmpl->getName().c_str() : "",
+                      start, Vec3::getZero());
         shotIt = records.find(projectileObject);
         if (shotIt == records.end())
             return;
     }
     ShotRecord& shot = shotIt->second;
+    if (!shot.fireEmitted)
+        emitFireRow(shot);
+    shot.hadSoldierProbe = true;
 
     Soldier* const soldier = static_cast<Soldier*>(soldierObject);
     const int tgtLivePose = static_cast<int>(soldier->getPose());
@@ -1145,8 +1432,86 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
     computeVelResidual(pC17, c17Vel, dummyResid, c17DtErrMs);
     computeVelResidual(pC33, c33Vel, dummyResid, c33DtErrMs);
 
-    char line[2560];
-    std::snprintf(
+    // [CHOSEN, not recovered] Hitreg V3 Phase 2 forensic PROBE columns:
+    // zero-deviation aim shadow ray (same startPos as bullet), directional miss, back-shot dot,
+    // target reseed age, and estimated retail 4-slot ring underflow flag.
+    char aimHitBuf[8] = "";
+    char aimMissBuf[24] = "";
+    if (shot.hasAimDir)
+    {
+        const float aimLen = shotDist + 2.5f;
+        Vec3 aimEnd;
+        aimEnd.x = shot.startPos.x + shot.aimDir.x * aimLen;
+        aimEnd.y = shot.startPos.y + shot.aimDir.y * aimLen;
+        aimEnd.z = shot.startPos.z + shot.aimDir.z * aimLen;
+
+        anim::RaySkeletonProbe pAim;
+        if (usedBoneHistory && activeBonePose)
+            skeleton->probeRayVsHistoricalPose(shot.startPos, aimEnd, v1Transform, *activeBonePose, pAim);
+        else
+            skeleton->probeRayVsSkeleton(shot.startPos, aimEnd, v1Transform, pAim);
+
+        const bool aimHit = pAim.hitFirst || pAim.hitClosest;
+        const float aimMissM = aimHit ? 0.0f : (pAim.minSurfaceDist < 999.0f ? pAim.minSurfaceDist : 999.0f);
+        std::snprintf(aimHitBuf, sizeof(aimHitBuf), "%d", aimHit ? 1 : 0);
+        std::snprintf(aimMissBuf, sizeof(aimMissBuf), "%.4f", aimMissM);
+    }
+
+    Vec3 rayDir;
+    Vec3 rayVec;
+    rayVec.x = dxRay;
+    rayVec.y = dyRay;
+    rayVec.z = dzRay;
+    const bool hasRayDir = normalizeVec3(rayVec, rayDir);
+
+    char missDyBuf[24] = "";
+    char missLatBuf[24] = "";
+    if (!v1Hit && pActive.nearestBone >= 0)
+    {
+        const float mdx = pActive.nearestRayPt.x - pActive.nearestCapPt.x;
+        const float mdy = pActive.nearestRayPt.y - pActive.nearestCapPt.y;
+        const float mdz = pActive.nearestRayPt.z - pActive.nearestCapPt.z;
+        std::snprintf(missDyBuf, sizeof(missDyBuf), "%.4f", mdy);
+
+        const Vec3& refDir = shot.hasAimDir ? shot.aimDir : rayDir;
+        if (shot.hasAimDir || hasRayDir)
+        {
+            // BF2 left-handed space: right = normalize(cross((0,1,0), refDir)) = (refDir.z, 0, -refDir.x).
+            Vec3 rightRaw;
+            rightRaw.x = refDir.z;
+            rightRaw.y = 0.0f;
+            rightRaw.z = -refDir.x;
+            Vec3 rightDir;
+            if (normalizeVec3(rightRaw, rightDir))
+            {
+                const float missLat = mdx * rightDir.x + mdz * rightDir.z;
+                std::snprintf(missLatBuf, sizeof(missLatBuf), "%.4f", missLat);
+            }
+        }
+    }
+
+    char tgtBackDotBuf[24] = "";
+    Vec3 tgtFwdRaw;
+    tgtFwdRaw.x = v1Transform.m[8];
+    tgtFwdRaw.y = v1Transform.m[9];
+    tgtFwdRaw.z = v1Transform.m[10];
+    Vec3 tgtFwd;
+    const Vec3& bDir = shot.hasBulletDir ? shot.bulletDir : rayDir;
+    if ((shot.hasBulletDir || hasRayDir) && normalizeVec3(tgtFwdRaw, tgtFwd))
+    {
+        const float backDot = bDir.x * tgtFwd.x + bDir.y * tgtFwd.y + bDir.z * tgtFwd.z;
+        std::snprintf(tgtBackDotBuf, sizeof(tgtBackDotBuf), "%.3f", backDot);
+    }
+
+    const int kEst = static_cast<int>(static_cast<float>(probePingMs) / 33.333333f)
+                   + (shot.queueDepth > 1 ? (shot.queueDepth - 1) : 0);
+    const int ringUf =
+        ((static_cast<float>(probeRawInterpMs) - 15.0f)
+         > static_cast<float>(kEst + 4) * 33.333333f)
+            ? 1 : 0;
+
+    char line[3072];
+    const int written = std::snprintf(
         line, sizeof(line),
         "PROBE,%d,%.3f,%llu,%s,%d,%s,%d,%s,"
         "%u,%d,%.2f,%.2f,%u,%u,"
@@ -1164,7 +1529,9 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
         "%s,%.2f,"
         "%s,%.2f,"
         "%s,%.2f"
-        ",,,,,,,,,,,,,,,,,,\n",
+        ",,,,,,,,,,,,,,,,,,"
+        ",,,,,,,,,"
+        ",%s,%s,%s,%s,%s,%d,%d\n",
         currentTick, WorldPref::getWorldTime(),
         static_cast<unsigned long long>(shot.shotId),
         shot.weaponName.c_str(), shot.shooterId, shot.shooterName.c_str(),
@@ -1187,8 +1554,10 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
         v2VelResidM, v2DtErrMs, v11DtErrMs,
         v2aBuf, v2aDtErrMs,
         c17Buf, c17DtErrMs,
-        c33Buf, c33DtErrMs);
-    appendLine(line);
+        c33Buf, c33DtErrMs,
+        aimHitBuf, aimMissBuf, missDyBuf, missLatBuf, tgtBackDotBuf,
+        ticksSinceReseed, ringUf);
+    appendCheckedLine(line, written, sizeof(line));
 
     if (v1Hit)
     {
@@ -1291,7 +1660,7 @@ void HitregTelemetry::noteProjectileContactDelivered(const IObject* projectileOb
     }
 
     char line[1024];
-    std::snprintf(
+    const int written = std::snprintf(
         line, sizeof(line),
         "DELIVER,%d,%.3f,%llu,%s,%d,%s,%d,%s,"
         ",,,,,,,,,,,,,,,,,,,,"
@@ -1300,14 +1669,15 @@ void HitregTelemetry::noteProjectileContactDelivered(const IObject* projectileOb
         ",,,,,,,,,,,,,,,,,,,,"
         ",,,,,,,,,,,,,,,,,,,,"
         "%s,%s,%d,%.4f,%.4f,%.4f,%s,%d"
-        ",,,,,,,,,,\n",
+        ",,,,,,,,,,"
+        ",,,,,,,,,,,,,,,,\n",
         currentTick, WorldPref::getWorldTime(),
         static_cast<unsigned long long>(shot.shotId),
         shot.weaponName.c_str(), shot.shooterId, shot.shooterName.c_str(),
         shot.pendingTargetId, shot.pendingTargetName.c_str(),
         outcome, blocker.c_str(), contactMaterial, marginM,
         tWallM, tSoldierM, objClass, eyeClear);
-    appendLine(line);
+    appendCheckedLine(line, written, sizeof(line));
 
     shot.pendingTarget = 0;
 }
@@ -1395,10 +1765,11 @@ void HitregTelemetry::finishProjectileCollisionDamage(const IObject* projectileO
 
     int tgtId = -1;
     std::string tgtName;
+    const IPlayer* tgtPlayer = 0;
     if (hitObject && hitObject->getTemplate()
         && hitObject->getTemplate()->getClassID() == CID_SoldierTemplate)
     {
-        IPlayer* const tgtPlayer = static_cast<Soldier*>(hitObject)->getOccupingPlayer();
+        tgtPlayer = static_cast<Soldier*>(hitObject)->getOccupingPlayer();
         if (tgtPlayer)
         {
             tgtId = tgtPlayer->getId();
@@ -1406,8 +1777,30 @@ void HitregTelemetry::finishProjectileCollisionDamage(const IObject* projectileO
         }
     }
 
-    char line[768];
-    std::snprintf(
+    char vHeldBuf[24] = "";
+    char vShotsBuf[24] = "";
+    char vFdropBuf[24] = "";
+    char vEarlyNpBuf[24] = "";
+    if (tgtPlayer)
+    {
+        const std::unordered_map<const IPlayer*, PlayerNetState>& states = playerNetStates();
+        std::unordered_map<const IPlayer*, PlayerNetState>::const_iterator vit =
+            states.find(tgtPlayer);
+        if (vit != states.end())
+        {
+            std::snprintf(vHeldBuf, sizeof(vHeldBuf), "%llu",
+                          static_cast<unsigned long long>(vit->second.fireHeldCum));
+            std::snprintf(vShotsBuf, sizeof(vShotsBuf), "%llu",
+                          static_cast<unsigned long long>(vit->second.shotsFiredCum));
+            std::snprintf(vFdropBuf, sizeof(vFdropBuf), "%llu",
+                          static_cast<unsigned long long>(vit->second.fireDroppedCum));
+            std::snprintf(vEarlyNpBuf, sizeof(vEarlyNpBuf), "%llu",
+                          static_cast<unsigned long long>(vit->second.earlyNoProbeCum));
+        }
+    }
+
+    char line[1024];
+    const int written = std::snprintf(
         line, sizeof(line),
         "DAMAGE,%d,%.3f,%llu,%s,%d,%s,%d,%s,"
         ",,,,,,,,,,,,,,,,,,,,"
@@ -1416,7 +1809,9 @@ void HitregTelemetry::finishProjectileCollisionDamage(const IObject* projectileO
         ",,,,,,,,,,,,,,,,,,,,"
         ",,,,,,,,,,,,,,,,,,,,"
         ",,,,,,,,"
-        "%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d\n",
+        "%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d"
+        ",,,,%s,%s,%s,%s,,"
+        ",,,,,,,\n",
         WorldPref::getTickCount(), WorldPref::getWorldTime(),
         static_cast<unsigned long long>(shot.shotId),
         shot.weaponName.c_str(), shot.shooterId, shot.shooterName.c_str(),
@@ -1426,8 +1821,9 @@ void HitregTelemetry::finishProjectileCollisionDamage(const IObject* projectileO
         shot.hasServerDmg ? shot.hpBefore : 0.0f,
         shot.hasServerDmg ? shot.hpAfter : 0.0f,
         (shot.hasServerDmg && shot.killed) ? 1 : 0,
-        hitmarker ? 1 : 0);
-    appendLine(line);
+        hitmarker ? 1 : 0,
+        vHeldBuf, vShotsBuf, vFdropBuf, vEarlyNpBuf);
+    appendCheckedLine(line, written, sizeof(line));
 
     shot.hasDmgCalc = false;
     shot.hasServerDmg = false;
