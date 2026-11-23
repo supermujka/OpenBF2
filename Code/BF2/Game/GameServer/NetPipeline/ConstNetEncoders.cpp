@@ -11,14 +11,53 @@ namespace netpipeline {
 
 namespace {
 
+inline void writeBit(io::BitStream& stream, bool value)
+{
+    const unsigned int bit = value ? 1u : 0u;
+    stream.writeBits(&bit, 1);
+}
+
 inline void writeSignedMagnitude(io::BitStream& stream, int value, unsigned int magBits)
 {
     const unsigned int sign = (value < 0) ? 1u : 0u;
     const unsigned int mag  = (value < 0)
-        ? static_cast<unsigned int>(-value)
+        ? (0u - static_cast<unsigned int>(value))
         : static_cast<unsigned int>(value);
     stream.writeBits(&sign, 1);
     stream.writeBits(&mag, magBits);
+}
+
+inline void writeSigned17(io::BitStream& stream, int value)
+{
+    writeSignedMagnitude(stream, value, 17);
+}
+
+inline int scoreRecordInt(const unsigned char* record, int offset)
+{
+    int value = 0;
+    std::memcpy(&value, record + offset, sizeof(value));
+    return value;
+}
+
+inline int playerSlotDword(const NetUpdateSlot& slot, int offset)
+{
+    int value = 0;
+    std::memcpy(&value, &slot.buff[offset], sizeof(value));
+    return value;
+}
+
+inline unsigned short playerSlotWord(const NetUpdateSlot& slot, int offset)
+{
+    unsigned short value = 0;
+    std::memcpy(&value, &slot.buff[offset], sizeof(value));
+    return value;
+}
+
+inline float playerSlotFloat(const NetUpdateSlot& slot, int offset)
+{
+    float value = 0.0f;
+    std::memcpy(&value, &slot.buff[offset], sizeof(value));
+    return value;
 }
 
 inline void writePositiveFlagAsSigned3(io::BitStream& stream, bool flag)
@@ -31,12 +70,12 @@ inline void writePositiveFlagAsSigned3(io::BitStream& stream, bool flag)
 
 inline void writeQuantizedTakeOver(io::BitStream& stream, float v)
 {
-    double norm = (static_cast<double>(v) / 1.25 + 1.0) * 0.5;
-    if (norm > 1.0)
-        norm = 1.0;
-    else if (norm < 0.0)
-        norm = 0.0;
-    const unsigned int q = static_cast<unsigned int>(norm * 65535.0);
+    double t = (static_cast<double>(v) / 1.25 + 1.0) * 0.5;
+    if (t < 0.0)
+        t = 0.0;
+    else if (t > 1.0)
+        t = 1.0;
+    const unsigned int q = static_cast<unsigned int>(static_cast<int>(t * 65535.0));
     stream.writeBits(&q, 16);
 }
 
@@ -131,6 +170,7 @@ bool ConstNetEncoders::encodeSoldier(
 
         unsigned int payloadBits = 0;
         stream.skipBits(9);
+        const unsigned int ragdollPayloadStart = stream.getBitPosition();
 
         const Vec3* reference = 0;
         const unsigned int count = snap.ragdollParticleCount;
@@ -156,7 +196,7 @@ bool ConstNetEncoders::encodeSoldier(
             }
         }
 
-        payloadBits = stream.getBitPosition() - lengthFieldPos.m_position - 9u;
+        payloadBits = stream.getBitPosition() - ragdollPayloadStart;
         stream.setWritePosition(lengthFieldPos);
         stream.writeBits(&payloadBits, 9);
         stream.resetWritePosition();
@@ -423,19 +463,20 @@ bool ConstNetEncoders::encodeSoldier(
 
         if ((mask & 0x80000u) != 0)
         {
-            const unsigned char maskedAmmo = static_cast<unsigned char>(rec.ammoStatus & 0x0Fu);
+            const unsigned int maskedAmmo = static_cast<unsigned int>(rec.ammoStatus & 0x0Fu);
             stream.writeBits(&maskedAmmo, 5);
         }
     }
 
-    if (outBitsWritten)
-        *outBitsWritten = static_cast<int>(stream.getBitPosition() - startBitPos);
-
     if (stream.hasError())
     {
         stream.clearError();
+        if (outBitsWritten)
+            *outBitsWritten = 0;
         return false;
     }
+    if (outBitsWritten)
+        *outBitsWritten = static_cast<int>(stream.getBitPosition() - startBitPos);
     return true;
 }
 
@@ -473,19 +514,20 @@ bool ConstNetEncoders::encodeItem(
         writeSignedMagnitude(stream, rec.ownerId, 8);
 
     if (stateMask & 0x08u)
-        stream.writeBits(&rec.enabled, 1);
+        writeBit(stream, rec.enabled);
 
     if (stateMask & 0x10u)
         writeSignedMagnitude(stream, rec.team, 4);
 
-    if (outBitsWritten)
-        *outBitsWritten = static_cast<int>(stream.getBitPosition() - startBitPos);
-
     if (stream.hasError())
     {
         stream.clearError();
+        if (outBitsWritten)
+            *outBitsWritten = 0;
         return false;
     }
+    if (outBitsWritten)
+        *outBitsWritten = static_cast<int>(stream.getBitPosition() - startBitPos);
     return true;
 }
 
@@ -563,14 +605,15 @@ bool ConstNetEncoders::encodeGenericProjectile(
         writeRangedIntOffset(stream, value, snap.armorLower, snap.armorUpper);
     }
 
-    if (outBitsWritten)
-        *outBitsWritten = static_cast<int>(stream.getBitPosition() - startBitPos);
-
     if (stream.hasError())
     {
         stream.clearError();
+        if (outBitsWritten)
+            *outBitsWritten = 0;
         return false;
     }
+    if (outBitsWritten)
+        *outBitsWritten = static_cast<int>(stream.getBitPosition() - startBitPos);
     return true;
 }
 
@@ -588,31 +631,32 @@ bool ConstNetEncoders::encodeControlPoint(
     stream.writeBits(&stateMask, 7);
 
     if (stateMask & 0x01u)
-        writeSignedMagnitude(stream, rec.m_team, 3);
+        writeSignedMagnitude(stream, rec.team, 3);
     if (stateMask & 0x02u)
-        stream.writeBits(&rec.m_bool158, 1);
+        writeBit(stream, rec.bool158);
     if (stateMask & 0x04u)
     {
-        writeQuantizedTakeOver(stream, rec.m_takeOverCounter);
-        writeQuantizedTakeOver(stream, rec.m_takeOverChangePerSecond);
+        writeQuantizedTakeOver(stream, rec.takeOverCounter);
+        writeQuantizedTakeOver(stream, rec.takeOverChangePerSecond);
     }
     if (stateMask & 0x08u)
-        writePositiveFlagAsSigned3(stream, rec.m_allowCaptureByTeam1);
+        writePositiveFlagAsSigned3(stream, rec.allowCaptureByTeam1);
     if (stateMask & 0x10u)
-        writePositiveFlagAsSigned3(stream, rec.m_allowCaptureByTeam2);
+        writePositiveFlagAsSigned3(stream, rec.allowCaptureByTeam2);
     if (stateMask & 0x20u)
-        writeSignedMagnitude(stream, rec.m_flagTeam, 3);
+        writeSignedMagnitude(stream, rec.flagTeam, 3);
     if (stateMask & 0x40u)
-        writeSignedMagnitude(stream, rec.m_capturingState, 3);
-
-    if (outBitsWritten)
-        *outBitsWritten = static_cast<int>(stream.getBitPosition() - startBitPos);
+        writeSignedMagnitude(stream, rec.capturingState, 3);
 
     if (stream.hasError())
     {
         stream.clearError();
+        if (outBitsWritten)
+            *outBitsWritten = 0;
         return false;
     }
+    if (outBitsWritten)
+        *outBitsWritten = static_cast<int>(stream.getBitPosition() - startBitPos);
     return true;
 }
 
@@ -700,9 +744,9 @@ bool ConstNetEncoders::encodeSimpleObject(
         if ((stateMask & 0x200u) != 0)
             stream.writeCompressedVector(rec.vec74, zeroVec, 0.000099999997f);
         if ((stateMask & 0x80u) != 0)
-            stream.writeBits(&rec.byte9C, 1);
+            writeBit(stream, rec.byte9C != 0);
         if ((stateMask & 0x8000u) != 0)
-            stream.writeBits(&rec.supplyB0, 1);
+            writeBit(stream, rec.supplyB0 != 0);
     }
 
     if (snap.hasArmor && (stateMask & 0x10u) != 0)
@@ -712,7 +756,10 @@ bool ConstNetEncoders::encodeSimpleObject(
     }
 
     if ((stateMask & 0x400u) != 0)
-        stream.writeBits(&rec.replicationState, 2);
+    {
+        const unsigned int repState = rec.replicationState;
+        stream.writeBits(&repState, 2);
+    }
 
     if (snap.hasPco)
     {
@@ -720,11 +767,16 @@ bool ConstNetEncoders::encodeSimpleObject(
         {
             if ((stateMask & 0x2000u) != 0)
             {
-                const unsigned int value = static_cast<unsigned int>(rec.parachuteAC);
-                if (value <= 7u)
-                    stream.writeBits(&value, 4);
+                const int value = rec.parachuteAC;
+                if (value <= 7)
+                {
+                    const unsigned int out = static_cast<unsigned int>(value);
+                    stream.writeBits(&out, 4);
+                }
                 else
+                {
                     stream.setError(4);
+                }
             }
         }
         else
@@ -734,39 +786,49 @@ bool ConstNetEncoders::encodeSimpleObject(
             {
                 if ((stateMask & kWeaponSlotMasks[slot]) != 0)
                 {
-                    const unsigned int value = static_cast<unsigned int>(rec.weaponIndex[slot] + 1);
-                    if (value <= 8u)
-                        stream.writeBits(&value, 4);
+                    const int value = rec.weaponIndex[slot] + 1;
+                    if (value <= 8)
+                    {
+                        const unsigned int out = static_cast<unsigned int>(value);
+                        stream.writeBits(&out, 4);
+                    }
                     else
+                    {
                         stream.setError(4);
+                    }
                 }
             }
 
             if ((stateMask & 0x10000u) != 0)
             {
-                const unsigned int value = static_cast<unsigned int>(rec.pcoB4);
-                if (value <= 15u)
-                    stream.writeBits(&value, 4);
+                const int value = rec.pcoB4;
+                if (value <= 15)
+                {
+                    const unsigned int out = static_cast<unsigned int>(value);
+                    stream.writeBits(&out, 5);
+                }
                 else
+                {
                     stream.setError(4);
+                }
             }
 
             if ((stateMask & 0x40000u) != 0)
             {
-                const unsigned int duckBit = rec.isDucking ? 1u : 0u;
-                stream.writeBits(&duckBit, 1);
+                writeBit(stream, rec.isDucking);
             }
         }
     }
 
-    if (outBitsWritten)
-        *outBitsWritten = static_cast<int>(stream.getBitPosition() - startBitPos);
-
     if (stream.hasError())
     {
         stream.clearError();
+        if (outBitsWritten)
+            *outBitsWritten = 0;
         return false;
     }
+    if (outBitsWritten)
+        *outBitsWritten = static_cast<int>(stream.getBitPosition() - startBitPos);
     return true;
 }
 
@@ -775,191 +837,193 @@ bool ConstNetEncoders::encodePlayer(
     io::BitStream& stream,
     io::BaseLineData* /*baseline*/,
     unsigned int stateMask,
-    int /*precision*/,
+    int precision,
     int* outBitsWritten)
 {
     const unsigned int startBitPos = stream.getBitPosition();
     const NetUpdateSlot& slot = snap.slot;
 
-    stream.writeBits(&stateMask, 28);
+    unsigned int mask = stateMask;
+    stream.writeBits(&mask, 28);
 
-    if (stateMask & 0x04u)
+    if (stateMask & 0x00000001u)
+        writeBit(stream, slot.isAlive != 0);
+
+    if (stateMask & 0x00000002u)
+        writeRangedIntOffset(stream, playerSlotDword(slot, 36), 0, 255);
+
+    if (stateMask & 0x00000008u)
     {
-        const unsigned int spawned = slot.m_spawned ? 1u : 0u;
-        stream.writeBits(&spawned, 1);
-        const unsigned int down = slot.m_down ? 1u : 0u;
-        stream.writeBits(&down, 1);
+        writeSignedMagnitude(stream, playerSlotDword(slot, 12), 11);
+        writeRangedIntOffset(stream, slot.someScore2, 0, 2047);
+        writeRangedIntOffset(stream, playerSlotDword(slot, 0), 0, 2047);
+        writeSignedMagnitude(stream, playerSlotDword(slot, 4), 11);
+        writeRangedIntOffset(stream, playerSlotDword(slot, 8), 0, 2047);
     }
 
-    if (stateMask & 0x08u)
-        writeRangedUIntZeroBased(stream, slot.m_spawnGroupId + 1, 100u, 7);
+    if (stateMask & 0x00200000u)
+        writeBit(stream, slot.buff[68] != 0);
+    if (stateMask & 0x00000010u)
+        writeBit(stream, slot.buff[69] != 0);
 
-    if (stateMask & 0x10u)
-        writeRangedUIntZeroBased(stream, slot.m_team, 15u, 4);
-
-    if (stateMask & 0x20u)
-        stream.writeBits(&slot.m_score, 16);
-
-    if (stateMask & 0x800u)
-        stream.writeBits(&slot.m_skillScore, 16);
-
-    if (stateMask & 0x40u)
-        stream.writeBits(&slot.m_teamWorkScore, 16);
-
-    if (stateMask & 0x100u)
-        writeRangedUIntZeroBased(stream, slot.m_rank, 31u, 5);
-
-    if (stateMask & 0x200u)
-        stream.writeBits(&slot.m_kills, 11);
-
-    if (stateMask & 0x400u)
-        stream.writeBits(&slot.m_deaths, 11);
-
-    if ((stateMask & 0x80u) && snap.isConnected)
-        writeRangedUIntZeroBased(stream, slot.m_ping, 1023u, 10);
-
-    if (stateMask & 0x01u)
+    if (io::StatePrecisionGhost == precision)
     {
-        const unsigned int valid = slot.m_vehicleValid ? 1u : 0u;
-        stream.writeBits(&valid, 1);
-        if (slot.m_vehicleValid)
+        static const unsigned int kFiringBits[3] = { 0x00000040u, 0x00000080u, 0x00020000u };
+
+        if (stateMask & 0x02000000u)
         {
-            stream.writeBits(&slot.m_vehicleNetId, 16);
-            writeRangedUIntZeroBased(stream, slot.m_subPcoId + 1, 15u, 4);
-            stream.writeBits(&slot.m_cameraNetId, 16);
+            const unsigned int presses = static_cast<unsigned int>(playerSlotDword(slot, 72)) & 3u;
+            stream.writeBits(&presses, 2);
         }
-    }
 
-    if (stateMask & 0x1000000u)
-    {
-        const unsigned int valid = slot.m_defaultVehicleValid ? 1u : 0u;
-        stream.writeBits(&valid, 1);
-        if (slot.m_defaultVehicleValid)
-            stream.writeBits(&slot.m_defaultVehicleNetId, 16);
-    }
-
-    if (stateMask & 0x02u)
-    {
-        const unsigned int valid = slot.m_kitValid ? 1u : 0u;
-        stream.writeBits(&valid, 1);
-        if (slot.m_kitValid)
-            stream.writeBits(&slot.m_kitTemplateId, 16);
-    }
-
-    if (stateMask & 0x1000u)
-    {
-        const unsigned int inside = slot.m_isInsideCP ? 1u : 0u;
-        stream.writeBits(&inside, 1);
-    }
-
-    if (stateMask & 0x2000u)
-    {
-        double prog = static_cast<double>(slot.m_cpTakeOverProgress) * 0.005 * 255.0;
-        if (prog > 255.0) prog = 255.0;
-        else if (prog < 0.0) prog = 0.0;
-        const unsigned int packedProg = static_cast<unsigned int>(prog);
-        stream.writeBits(&packedProg, 8);
-
-        double spd = (static_cast<double>(slot.m_cpTakeOverSpeed) / 1.25 + 1.0) * 0.5;
-        if (spd > 1.0) spd = 1.0;
-        else if (spd < 0.0) spd = 0.0;
-        const unsigned int packedSpd = static_cast<unsigned int>(spd * 255.0);
-        stream.writeBits(&packedSpd, 8);
-    }
-
-    if (stateMask & 0x10000000u)
-    {
-        const unsigned int fh = slot.m_flagHolder ? 1u : 0u;
-        stream.writeBits(&fh, 1);
-    }
-
-    if (stateMask & 0x4000u)
-        writeRangedUIntZeroBased(stream, slot.m_squadId, 9u, 4);
-
-    if (stateMask & 0x8000u)
-    {
-        const unsigned int sl = slot.m_isSquadLeader ? 1u : 0u;
-        stream.writeBits(&sl, 1);
-    }
-
-    if (stateMask & 0x4000000u)
-    {
-        const unsigned int cmd = slot.m_Commander ? 1u : 0u;
-        stream.writeBits(&cmd, 1);
-    }
-
-    if (stateMask & 0x8000000u)
-    {
-        const unsigned int app = slot.m_commanderApplicantsValid ? 1u : 0u;
-        stream.writeBits(&app, 1);
-    }
-
-    if (stateMask & 0x10000u)
-    {
-        const unsigned int rep = slot.m_ReplenishReq ? 1u : 0u;
-        stream.writeBits(&rep, 1);
-        const unsigned int rpr = slot.m_RepairPoint ? 1u : 0u;
-        stream.writeBits(&rpr, 1);
-        const unsigned int hl = slot.m_HealPoint ? 1u : 0u;
-        stream.writeBits(&hl, 1);
-    }
-
-    static const unsigned int kWeaponMasks[3] = { 0x20000u, 0x40000u, 0x80000u };
-    for (int w = 0; w < 3; ++w)
-    {
-        if (stateMask & kWeaponMasks[w])
+        for (int w = 0; w <= 2; ++w)
         {
-            if (snap.weaponUsesHeat[w])
+            if ((kFiringBits[w] & stateMask) == 0 && (stateMask & 0x00010000u) == 0)
+                continue;
+
+            const bool firing = (slot.buff[24 * w + 76] != 0);
+            writeBit(stream, firing);
+
+            if (!firing && (stateMask & 0x00010000u) == 0)
+                continue;
+
+            writeRangedIntOffset(stream, playerSlotDword(slot, 24 * w + 80) + 1, 0, 63);
             {
-                double q = static_cast<double>(slot.m_heat[w]);
-                if (q > 1.0) q = 1.0;
-                else if (q < 0.0) q = 0.0;
-                const unsigned int packed = static_cast<unsigned int>(q * 127.0);
-                stream.writeBits(&packed, 7);
+                const unsigned int scratch = static_cast<unsigned int>(playerSlotDword(slot, 24 * w + 84));
+                stream.writeBits(&scratch, 2);
+            }
+            writeBit(stream, slot.buff[24 * w + 88] != 0);
+
+            const float heatVal = playerSlotFloat(slot, 24 * w + 92);
+            const bool hot = snap.weaponUsesHeat[w] && (heatVal >= 1.0f);
+            writeBit(stream, hot);
+            if (hot)
+            {
+                double scaled = static_cast<double>(heatVal) / 10.0;
+                if (scaled < 0.0)
+                    scaled = 0.0;
+                else if (scaled > 1.0)
+                    scaled = 1.0;
+                const unsigned int quantised = static_cast<unsigned int>(scaled * 255.0);
+                stream.writeBits(&quantised, 8);
             }
             else
             {
-                writeRangedUIntZeroBased(stream, slot.m_ammo[w] + 1, 1023u, 10);
-                writeRangedUIntZeroBased(stream, slot.m_nrOfMags[w] + 1, 31u, 5);
+                double scaled = static_cast<double>(heatVal);
+                if (scaled < 0.0)
+                    scaled = 0.0;
+                else if (scaled > 1.0)
+                    scaled = 1.0;
+                const unsigned int quantised = static_cast<unsigned int>(scaled * 63.0);
+                stream.writeBits(&quantised, 6);
+            }
+
+            {
+                const unsigned int scratch = static_cast<unsigned int>(playerSlotDword(slot, 24 * w + 96));
+                stream.writeBits(&scratch, 4);
             }
         }
     }
 
-    if (stateMask & 0x100000u)
-        writeRangedUIntZeroBased(stream, slot.m_fireRateMod[0], 15u, 4);
-
-    if (stateMask & 0x200000u)
-        writeRangedUIntZeroBased(stream, slot.m_fireRateMod[1], 15u, 4);
-
-    if (stateMask & 0x400000u)
-        writeRangedUIntZeroBased(stream, slot.m_fireRateMod[2], 15u, 4);
-
-    if (stateMask & 0x800000u)
+    if (stateMask & 0x00040000u)
     {
-        writeRangedUIntZeroBased(stream, slot.m_LockonState, 7u, 3);
-        if (slot.m_LockonState > 1)
+        writeBit(stream, slot.buff[148] != 0);
+        writeBit(stream, slot.buff[149] != 0);
+    }
+
+    if (stateMask & 0x00000100u)
+        writeRangedIntOffset(stream, static_cast<int>(playerSlotWord(slot, 158)), 0, 1023);
+
+    if (stateMask & 0x00000020u)
+    {
+        const unsigned int spawnTick = static_cast<unsigned int>(playerSlotDword(slot, 152));
+        stream.writeBits(&spawnTick, 32);
+        writeBit(stream, slot.buff[156] != 0);
+    }
+
+    if (stateMask & 0x00000200u)
+        writeRangedIntOffset(stream, playerSlotDword(slot, 16) + 1, 0, 3);
+
+    if (stateMask & 0x00000400u)
+    {
+        writeRangedIntOffset(stream, playerSlotDword(slot, 32), 0, 8);
+        writeBit(stream, slot.buff[162] != 0);
+    }
+
+    if (stateMask & 0x00000800u)
+    {
+        const unsigned int timeOutside = slot.buff[160];
+        stream.writeBits(&timeOutside, 9);
+    }
+    if (stateMask & 0x00001000u)
+    {
+        const unsigned int kitByte = slot.buff[161];
+        stream.writeBits(&kitByte, 9);
+    }
+
+    if (stateMask & 0x00002000u)
+        writeRangedIntOffset(stream, playerSlotDword(slot, 40), 0, 15);
+    if (stateMask & 0x00004000u)
+    {
+        writeRangedIntOffset(stream, playerSlotDword(slot, 44) + 1, 0, 31);
+        writeRangedIntOffset(stream, playerSlotDword(slot, 20), 0, 255);
+        writeRangedIntOffset(stream, playerSlotDword(slot, 24), 0, 255);
+        writeRangedIntOffset(stream, playerSlotDword(slot, 28), 0, 255);
+    }
+
+    if (stateMask & 0x00008000u)
+        writeBit(stream, slot.buff[163] != 0);
+    if (stateMask & 0x00400000u)
+        writeBit(stream, slot.buff[164] != 0);
+    if (stateMask & 0x00800000u)
+    {
+        const unsigned int inviteMask = slot.buff[165];
+        stream.writeBits(&inviteMask, 8);
+    }
+    if (stateMask & 0x01000000u)
+        writeRangedIntOffset(stream, playerSlotDword(slot, 168) + 1, 0, 65536);
+
+    writeBit(stream, slot.buff[48] != 0);
+
+    if (stateMask & 0x04000000u)
+    {
+        const bool commander = (slot.buff[49] != 0);
+        writeBit(stream, commander);
+        if (commander)
         {
-            stream.writeBits(&slot.m_targetNetId, 16);
-            stream.writeBits(&slot.m_subControllerIndex, 3);
+            writeBit(stream, slot.buff[50] != 0);
+            writeBit(stream, slot.buff[51] != 0);
+            writeBit(stream, slot.buff[52] != 0);
+            writeBit(stream, slot.buff[53] != 0);
+            writeBit(stream, slot.buff[54] != 0);
+
+            for (int f = 0; f < 3; ++f)
+            {
+                double scaled = static_cast<double>(playerSlotFloat(slot, 56 + 4 * f));
+                if (scaled < 0.0)
+                    scaled = 0.0;
+                else if (scaled > 1.0)
+                    scaled = 1.0;
+                const unsigned int quantised = static_cast<unsigned int>(scaled * 255.0);
+                stream.writeBits(&quantised, 8);
+            }
         }
     }
 
-    if (stateMask & 0x2000000u)
-    {
-        const unsigned int voip = slot.m_VoipOn ? 1u : 0u;
-        stream.writeBits(&voip, 1);
-        const unsigned int slVoip = slot.m_SquadLeaderVoipOn ? 1u : 0u;
-        stream.writeBits(&slVoip, 1);
-    }
+    writeBit(stream, snap.isConnected);
 
-    if (outBitsWritten)
-        *outBitsWritten = static_cast<int>(stream.getBitPosition() - startBitPos);
+    if (stateMask & 0x08000000u)
+        writeRangedIntOffset(stream, playerSlotDword(slot, 172), 0, 3);
 
     if (stream.hasError())
     {
         stream.clearError();
+        if (outBitsWritten)
+            *outBitsWritten = 0;
         return false;
     }
+    if (outBitsWritten)
+        *outBitsWritten = static_cast<int>(stream.getBitPosition() - startBitPos);
     return true;
 }
 
@@ -971,29 +1035,14 @@ bool ConstNetEncoders::encodeScoreManager(
     int /*precision*/,
     int* outBitsWritten)
 {
-    static const unsigned int kTeam1Masks[15] = {
-        0x00000001u, 0x00000002u, 0x00000004u, 0x00000008u, 0x00000010u,
-        0x00000020u, 0x00000040u, 0x00000080u, 0x00000100u, 0x00000200u,
-        0x00000400u, 0x00000800u, 0x00001000u, 0x00002000u, 0x00004000u
-    };
-    static const unsigned int kTeam2Masks[15] = {
-        0x00008000u, 0x00010000u, 0x00020000u, 0x00040000u, 0x00080000u,
-        0x00100000u, 0x00200000u, 0x00400000u, 0x00800000u, 0x01000000u,
-        0x02000000u, 0x04000000u, 0x08000000u, 0x10000000u, 0x20000000u
-    };
-    static const int kFieldByteOffsets[15] = {
-        4, 8, 12, 16, 20, 24, 28, 32, 40, 44, 52, 56, 60, 72, 76
-    };
-    static const unsigned int kFieldMagBits[15] = {
-        16, 16, 16, 15, 16, 16, 16, 16, 16, 16, 16, 16, 16, 7, 16
-    };
-
     if (stateMask != 0)
     {
-        int setBits = 0;
-        for (unsigned int m = stateMask; m != 0; m &= (m - 1))
-            ++setBits;
-        const int requiredBits = 32 + 16 * setBits;
+        int requiredBits = 32;
+        for (unsigned int bit = 0; bit < 32; ++bit)
+        {
+            if (stateMask & (1u << bit))
+                requiredBits += 16;
+        }
         if (requiredBits > static_cast<int>(stream.getRemainingBitCapacity()))
         {
             if (outBitsWritten)
@@ -1003,48 +1052,96 @@ bool ConstNetEncoders::encodeScoreManager(
     }
 
     const unsigned int startBitPos = stream.getBitPosition();
-    const unsigned char* rec = snap.record;
+    const unsigned char* const record = snap.record;
 
     stream.writeBits(&stateMask, 32);
 
-    for (int i = 0; i < 15; ++i)
+    // Team one (exact ScoreManager::getNetUpdate wire order & offsets).
+    if (stateMask & 0x00000001u) writeSigned17(stream, scoreRecordInt(record, 0x04));
+    if (stateMask & 0x00000002u) writeSigned17(stream, scoreRecordInt(record, 0x08));
+    if (stateMask & 0x01000000u)
     {
-        if (stateMask & kTeam1Masks[i])
-        {
-            const int value = *reinterpret_cast<const int*>(rec + kFieldByteOffsets[i]);
-            writeSignedMagnitude(stream, value, kFieldMagBits[i]);
-        }
+        writeSigned17(stream, scoreRecordInt(record, 0x0C));
+        writeSigned17(stream, scoreRecordInt(record, 0x40));
     }
+    if (stateMask & 0x04000000u) writeSigned17(stream, scoreRecordInt(record, 0x10));
+    if (stateMask & 0x10000000u) writeSigned17(stream, scoreRecordInt(record, 0x14));
+    if (stateMask & 0x00000004u) writeSigned17(stream, scoreRecordInt(record, 0x18));
+    if (stateMask & 0x00000008u) writeSigned17(stream, scoreRecordInt(record, 0x1C));
+    if (stateMask & 0x00000010u)
+    {
+        writeSigned17(stream, scoreRecordInt(record, 0x20));
+        writeSigned17(stream, scoreRecordInt(record, 0x3C));
+    }
+    if (stateMask & 0x00000020u) writeSigned17(stream, scoreRecordInt(record, 0x24));
+    if (stateMask & 0x00000040u) writeSigned17(stream, scoreRecordInt(record, 0x28));
+    if (stateMask & 0x00000080u) writeSigned17(stream, scoreRecordInt(record, 0x2C));
+    if (stateMask & 0x00000100u) writeSigned17(stream, scoreRecordInt(record, 0x30));
+    if (stateMask & 0x00000200u) writeSigned17(stream, scoreRecordInt(record, 0x34));
+    if (stateMask & 0x00000400u)
+    {
+        writeSigned17(stream, scoreRecordInt(record, 0x44));
+        writeBit(stream, record[0x50] != 0);
+        writeSigned17(stream, scoreRecordInt(record, 0x4C));
+    }
+    if (stateMask & 0x00000800u) writeSigned17(stream, scoreRecordInt(record, 0x48));
 
-    for (int i = 0; i < 15; ++i)
+    // Team two (exact ScoreManager::getNetUpdate wire order & offsets).
+    if (stateMask & 0x00001000u) writeSigned17(stream, scoreRecordInt(record, 0x54));
+    if (stateMask & 0x00002000u) writeSigned17(stream, scoreRecordInt(record, 0x58));
+    if (stateMask & 0x02000000u)
     {
-        if (stateMask & kTeam2Masks[i])
-        {
-            const int value = *reinterpret_cast<const int*>(rec + 80 + kFieldByteOffsets[i]);
-            writeSignedMagnitude(stream, value, kFieldMagBits[i]);
-        }
+        writeSigned17(stream, scoreRecordInt(record, 0x5C));
+        writeSigned17(stream, scoreRecordInt(record, 0x90));
     }
+    if (stateMask & 0x08000000u) writeSigned17(stream, scoreRecordInt(record, 0x60));
+    if (stateMask & 0x20000000u) writeSigned17(stream, scoreRecordInt(record, 0x64));
+    if (stateMask & 0x00004000u) writeSigned17(stream, scoreRecordInt(record, 0x68));
+    if (stateMask & 0x00008000u) writeSigned17(stream, scoreRecordInt(record, 0x6C));
+    if (stateMask & 0x00010000u)
+    {
+        writeSigned17(stream, scoreRecordInt(record, 0x70));
+        writeSigned17(stream, scoreRecordInt(record, 0x8C));
+    }
+    if (stateMask & 0x00020000u) writeSigned17(stream, scoreRecordInt(record, 0x74));
+    if (stateMask & 0x00040000u) writeSigned17(stream, scoreRecordInt(record, 0x78));
+    if (stateMask & 0x00080000u) writeSigned17(stream, scoreRecordInt(record, 0x7C));
+    if (stateMask & 0x00100000u) writeSigned17(stream, scoreRecordInt(record, 0x80));
+    if (stateMask & 0x00200000u) writeSigned17(stream, scoreRecordInt(record, 0x84));
+    if (stateMask & 0x00400000u)
+    {
+        writeSigned17(stream, scoreRecordInt(record, 0x94));
+        writeBit(stream, record[0xA0] != 0);
+        writeSigned17(stream, scoreRecordInt(record, 0x9C));
+    }
+    if (stateMask & 0x00800000u) writeSigned17(stream, scoreRecordInt(record, 0x98));
 
     if (stateMask & 0x40000000u)
     {
-        const int winner = *reinterpret_cast<const int*>(rec + 160);
-        writeSignedMagnitude(stream, winner, 2);
+        const unsigned int sign = 0;
+        const unsigned int winner = record[0x00];
+        stream.writeBits(&sign, 1);
+        stream.writeBits(&winner, 2);
     }
-
     if (stateMask & 0x80000000u)
     {
-        const int victoryType = *reinterpret_cast<const int*>(rec + 156);
-        writeSignedMagnitude(stream, victoryType, 4);
+        const unsigned int sign = 0;
+        const unsigned int victoryType = record[0x01];
+        stream.writeBits(&sign, 1);
+        stream.writeBits(&victoryType, 2);
+        writeSigned17(stream, scoreRecordInt(record, 0x38));
+        writeSigned17(stream, scoreRecordInt(record, 0x88));
     }
-
-    if (outBitsWritten)
-        *outBitsWritten = static_cast<int>(stream.getBitPosition() - startBitPos);
 
     if (stream.hasError())
     {
         stream.clearError();
+        if (outBitsWritten)
+            *outBitsWritten = 0;
         return false;
     }
+    if (outBitsWritten)
+        *outBitsWritten = static_cast<int>(stream.getBitPosition() - startBitPos);
     return true;
 }
 
@@ -1061,24 +1158,26 @@ bool ConstNetEncoders::encodeSpawnGroup(
     stream.writeBits(&stateMask, 6);
 
     if (stateMask & 0x10u)
-        stream.writeBits(&snap.hasSpawnPoints, 1);
+        writeBit(stream, snap.hasSpawnPoints);
 
     if (stateMask & 0x02u)
     {
-        const unsigned char teamByte = static_cast<unsigned char>(snap.team);
-        stream.writeBits(&teamByte, 4);
+        const unsigned int teamVal = static_cast<unsigned int>(snap.team);
+        stream.writeBits(&teamVal, 4);
     }
 
     if (stateMask & 0x04u)
-        stream.writeBits(&snap.active, 1);
+        writeBit(stream, snap.active);
 
     if (stateMask & 0x08u)
-        stream.writeBits(&snap.onlyForAI, 1);
+        writeBit(stream, snap.onlyForAI);
 
     if (stateMask & 0x01u)
     {
-        stream.writeBits(&snap.posX, 8);
-        stream.writeBits(&snap.posZ, 8);
+        const unsigned int posX = static_cast<unsigned int>(snap.posX);
+        const unsigned int posZ = static_cast<unsigned int>(snap.posZ);
+        stream.writeBits(&posX, 8);
+        stream.writeBits(&posZ, 8);
     }
 
     if (stateMask & 0x20u)
@@ -1087,14 +1186,15 @@ bool ConstNetEncoders::encodeSpawnGroup(
         stream.writeBits(&wireSquad, 8);
     }
 
-    if (outBitsWritten)
-        *outBitsWritten = static_cast<int>(stream.getBitPosition() - startBitPos);
-
     if (stream.hasError())
     {
         stream.clearError();
+        if (outBitsWritten)
+            *outBitsWritten = 0;
         return false;
     }
+    if (outBitsWritten)
+        *outBitsWritten = static_cast<int>(stream.getBitPosition() - startBitPos);
     return true;
 }
 
@@ -1216,7 +1316,8 @@ bool ConstNetEncoders::encodeDescriptor(
     bool ghostTier,
     WorldNetSnapshot::TypeWriteBitStats* outStats,
     unsigned int* outDidNotFitCount,
-    unsigned int* outMissingUpdatesCount)
+    unsigned int* outMissingUpdatesCount,
+    std::vector<unsigned int>* outEncodedRecords)
 {
     if (!descriptor)
         return false;
@@ -1267,20 +1368,22 @@ bool ConstNetEncoders::encodeDescriptor(
                             ++(*outMissingUpdatesCount);
                         return false;
                     }
+                    if (outEncodedRecords && !worldSnap.m_records.empty())
+                        outEncodedRecords->push_back(static_cast<unsigned int>(recSnap - &worldSnap.m_records[0]));
                     const unsigned int propMask = ghostTier
                         ? (mask->m_opaque[slot] & recSnap->ghostStateMask)
                         : mask->m_opaque[slot];
                     int bitsWritten = 0;
                     const bool walkOk = encodeRecord(
                         worldSnap, *recSnap, stream, 0, propMask, targetPrecision, &bitsWritten);
-                    if (outStats)
-                        outStats->bitsByType[static_cast<unsigned int>(recSnap->type)] += bitsWritten;
                     if (!walkOk)
                     {
                         if (outMissingUpdatesCount)
                             ++(*outMissingUpdatesCount);
                         return false;
                     }
+                    if (outStats)
+                        outStats->bitsByType[static_cast<unsigned int>(recSnap->type)] += bitsWritten;
                 }
                 ++it;
                 ++slot;
@@ -1310,20 +1413,22 @@ bool ConstNetEncoders::encodeDescriptor(
                             ++(*outMissingUpdatesCount);
                         return false;
                     }
+                    if (outEncodedRecords && !worldSnap.m_records.empty())
+                        outEncodedRecords->push_back(static_cast<unsigned int>(recSnap - &worldSnap.m_records[0]));
                     const unsigned int propMask = ghostTier
                         ? recSnap->ghostStateMask
                         : 0xFFFFFFFFu;
                     int bitsWritten = 0;
                     const bool walkOk = encodeRecord(
                         worldSnap, *recSnap, stream, 0, propMask, targetPrecision, &bitsWritten);
-                    if (outStats)
-                        outStats->bitsByType[static_cast<unsigned int>(recSnap->type)] += bitsWritten;
                     if (!walkOk)
                     {
                         if (outMissingUpdatesCount)
                             ++(*outMissingUpdatesCount);
                         return false;
                     }
+                    if (outStats)
+                        outStats->bitsByType[static_cast<unsigned int>(recSnap->type)] += bitsWritten;
                 }
                 ++it;
                 if (it == end)
@@ -1345,7 +1450,8 @@ bool ConstNetEncoders::encodeDescriptorDelta(
     bool ghostTier,
     bool resetBaseLineCursor,
     WorldNetSnapshot::TypeWriteBitStats* outStats,
-    unsigned int* outMissingUpdatesCount)
+    unsigned int* outMissingUpdatesCount,
+    std::vector<unsigned int>* outEncodedRecords)
 {
     if (!descriptor)
         return false;
@@ -1389,20 +1495,22 @@ bool ConstNetEncoders::encodeDescriptorDelta(
                             ++(*outMissingUpdatesCount);
                         return false;
                     }
+                    if (outEncodedRecords && !worldSnap.m_records.empty())
+                        outEncodedRecords->push_back(static_cast<unsigned int>(recSnap - &worldSnap.m_records[0]));
                     const unsigned int propMask = ghostTier
                         ? (mask->m_opaque[slot] & recSnap->ghostStateMask)
                         : mask->m_opaque[slot];
                     int bitsWritten = 0;
                     const bool walkOk = encodeRecord(
                         worldSnap, *recSnap, stream, &baseLine, propMask, targetPrecision, &bitsWritten);
-                    if (outStats)
-                        outStats->bitsByType[static_cast<unsigned int>(recSnap->type)] += bitsWritten;
                     if (!walkOk)
                     {
                         if (outMissingUpdatesCount)
                             ++(*outMissingUpdatesCount);
                         return false;
                     }
+                    if (outStats)
+                        outStats->bitsByType[static_cast<unsigned int>(recSnap->type)] += bitsWritten;
                 }
                 ++it;
                 ++slot;
@@ -1431,20 +1539,22 @@ bool ConstNetEncoders::encodeDescriptorDelta(
                             ++(*outMissingUpdatesCount);
                         return false;
                     }
+                    if (outEncodedRecords && !worldSnap.m_records.empty())
+                        outEncodedRecords->push_back(static_cast<unsigned int>(recSnap - &worldSnap.m_records[0]));
                     const unsigned int propMask = ghostTier
                         ? recSnap->ghostStateMask
                         : 0xFFFFFFFFu;
                     int bitsWritten = 0;
                     const bool walkOk = encodeRecord(
                         worldSnap, *recSnap, stream, &baseLine, propMask, targetPrecision, &bitsWritten);
-                    if (outStats)
-                        outStats->bitsByType[static_cast<unsigned int>(recSnap->type)] += bitsWritten;
                     if (!walkOk)
                     {
                         if (outMissingUpdatesCount)
                             ++(*outMissingUpdatesCount);
                         return false;
                     }
+                    if (outStats)
+                        outStats->bitsByType[static_cast<unsigned int>(recSnap->type)] += bitsWritten;
                 }
                 ++it;
                 if (it == end)
@@ -1531,8 +1641,12 @@ bool ConstNetEncoders::verifyBitExactAgainstLegacy(
     if (okA != okB)
         return false;
 
-    if (optionalBaseline && baseA.m_cursor != baseB.m_cursor)
-        return false;
+    if (optionalBaseline)
+    {
+        if (baseA.m_cursor != baseB.m_cursor)
+            return false;
+        optionalBaseline->m_cursor = baseA.m_cursor;
+    }
 
     return compareBitStreamsBitExact(streamA, streamB);
 }

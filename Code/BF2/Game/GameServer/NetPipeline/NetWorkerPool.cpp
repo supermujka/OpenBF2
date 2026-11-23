@@ -77,6 +77,9 @@ bool NetWorkerPool::isVerifyEnabled()
 
 float NetWorkerPool::getScopeHysteresis()
 {
+    static float* const s_scopeDist  = Vars::getFloat("net-scopeDistance", 0.0f);
+    if (!s_scopeDist || !(*s_scopeDist > 0.0f))
+        return 0.0f;
     static float* const s_hysteresis = Vars::getFloat("net-scopeHysteresis", 0.0f);
     const float raw = s_hysteresis ? *s_hysteresis : 0.0f;
     if (raw <= 0.0f)
@@ -154,6 +157,7 @@ void NetWorkerPool::shutdown()
         std::lock_guard<std::mutex> lock(m_mutex);
         m_workers.clear();
         m_stopping      = false;
+        m_generation    = 0;
         m_activeWorkers = 0;
         m_taskCount     = 0;
         m_taskThunk     = 0;
@@ -228,9 +232,7 @@ void NetWorkerPool::workerLoop()
                     break;
                 thunk(ctx, idx);
             }
-        }
 
-        {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_activeWorkers > 0)
             {
@@ -344,6 +346,7 @@ void stageBGhostObject(
     gm->m_ghostIdPool.pop_front();
     if (gm->m_ghostObjects[ghostId])
     {
+        gm->m_ghostIdPool.push_front(ghostId);
         outSerialFallback = true;
         return;
     }
@@ -473,10 +476,7 @@ void stageBScopeConnection(
         if (!(distance >= 1.1920929e-07f))
             distance = 0.001f;
 
-        const float inv     = 1.0f / distance;
-        const float falloff = inHysteresisBand
-            ? (1.0f - distance / outerRange)
-            : (1.0f - distance / range);
+        const float inv = 1.0f / distance;
 
         float cone = 0.0f;
         if (dy * inv * view[9] + dx * inv * view[8] + dz * inv * view[10] >= task.fovThreshold)
@@ -494,9 +494,31 @@ void stageBScopeConnection(
                 speed = 1.0f;
         }
 
-        float priority = cone + falloff + speed;
-        if (inHysteresisBand && priority <= 0.0f)
-            priority = 0.001f;
+        float priority = 0.0f;
+        if (!inHysteresisBand)
+        {
+            priority = cone + (1.0f - distance / range) + speed;
+            if (priority <= 0.0f && hysteresis > 0.0f)
+            {
+                bool alreadyTracked = false;
+                for (unsigned int e = 0; e < root.entryCount; ++e)
+                {
+                    const unsigned short netId = worldSnap.m_scopableEntries[root.entryStart + e].networkableId;
+                    if (gm->findGhostObjectInHash(netId) != 0)
+                    {
+                        alreadyTracked = true;
+                        break;
+                    }
+                }
+                if (alreadyTracked)
+                    priority = cone + (1.0f - distance / outerRange) + speed;
+            }
+        }
+        else
+        {
+            priority = cone + (1.0f - distance / outerRange) + speed;
+        }
+
         if (priority <= 0.0f)
             return;
 
@@ -725,18 +747,23 @@ bool stageBWriteControlObjectState(
             gm->m_baseLineData + 1026 * gm->m_baseLineIndex);
 
         if (verifyEnabled)
+        {
+            baseLine.m_cursor = 0;
             recordVerifyEntry(task, task.controlDescriptor, 0, false, io::StatePrecisionFull, *stream, true, &baseLine);
+        }
 
         bool failed = !ConstNetEncoders::encodeDescriptorDelta(
             worldSnap, task.controlDescriptor, *stream, baseLine, 0,
             io::StatePrecisionFull, false, true,
-            &task.writeBitStats, &task.missingUpdatesCount);
+            &task.writeBitStats, &task.missingUpdatesCount, &task.encodedRecordIndices);
         if (!failed && hasParachuteSoldier)
         {
+            if (verifyEnabled)
+                recordVerifyEntry(task, task.parachuteDescriptor, 0, false, io::StatePrecisionFull, *stream, true, &baseLine);
             failed = !ConstNetEncoders::encodeDescriptorDelta(
                 worldSnap, task.parachuteDescriptor, *stream, baseLine, 0,
                 io::StatePrecisionFull, false, false,
-                &task.writeBitStats, &task.missingUpdatesCount);
+                &task.writeBitStats, &task.missingUpdatesCount, &task.encodedRecordIndices);
         }
         if (failed)
             return rollback();
@@ -762,13 +789,15 @@ bool stageBWriteControlObjectState(
         bool failed = !ConstNetEncoders::encodeDescriptor(
             worldSnap, task.controlDescriptor, *stream, 0,
             io::StatePrecisionFull, false,
-            &task.writeBitStats, &task.didNotFitCount, &task.missingUpdatesCount);
+            &task.writeBitStats, &task.didNotFitCount, &task.missingUpdatesCount, &task.encodedRecordIndices);
         if (!failed && hasParachuteSoldier)
         {
+            if (verifyEnabled)
+                recordVerifyEntry(task, task.parachuteDescriptor, 0, false, io::StatePrecisionFull, *stream, false, 0);
             failed = !ConstNetEncoders::encodeDescriptor(
                 worldSnap, task.parachuteDescriptor, *stream, 0,
                 io::StatePrecisionFull, false,
-                &task.writeBitStats, &task.didNotFitCount, &task.missingUpdatesCount);
+                &task.writeBitStats, &task.didNotFitCount, &task.missingUpdatesCount, &task.encodedRecordIndices);
         }
         if (failed)
             return rollback();
@@ -779,6 +808,8 @@ bool stageBWriteControlObjectState(
     }
 
     // 10-bit-wrapped Player::getStateSync block (pre-captured on main thread in Stage A).
+    if (task.stateSyncError || task.stateSyncBits > 0x3FFu)
+        return rollback();
     stream->writeBits(&task.stateSyncBits, 10);
     if (task.stateSyncBits > 0)
         writeRawBitBuffer(*stream, task.stateSyncBuf, task.stateSyncBits);
@@ -850,7 +881,8 @@ bool stageBWriteData(
         if (!ConstNetEncoders::encodeDescriptor(
                 worldSnap, ghost->m_descriptor, stream, maskPtr,
                 io::StatePrecisionGhost, true,
-                &task.writeBitStats, &task.didNotFitCount, &task.missingUpdatesCount))
+                &task.writeBitStats, &task.didNotFitCount, &task.missingUpdatesCount,
+                &task.encodedRecordIndices))
         {
             return false;
         }
@@ -966,7 +998,6 @@ void stageBGhostTransmit(
         const unsigned int zero = 0;
         stream->writeBits(&zero, 1);
 
-        gm->m_writeBits = 1;
         task.conn->m_streamManagerStats[task.ghostStreamMgrId].m_opaque[0]  = 0;
         task.conn->m_streamManagerStats[task.ghostStreamMgrId].m_opaque[1] += 0;
         task.txOk = (gm->getError() == 0);
@@ -1156,10 +1187,10 @@ void NetWorkerPool::prepareConnectionStageA(
     {
         outTask.skipTransmitBackpressure = true;
         outTask.txOk = true;
-        return;
     }
 
     // 1. Update control object & capture camera/commander state on main thread.
+    //    Runs even under backpressure (m_sentData == true), matching vanilla GameServer.
     if (conn->m_connectionState == 4 && conn->m_bReset)
     {
         conn->updatePlayerControlObject(frameCount);
@@ -1200,6 +1231,9 @@ void NetWorkerPool::prepareConnectionStageA(
             }
         }
     }
+
+    if (outTask.skipTransmitBackpressure)
+        return;
 
     // 2. Pre-ghost portion of ClientConnection::transmitMsgs() (PlayerActionManager + GameEventManager).
     if (conn->m_player && !conn->m_player->getIsRemote() && io::networkManager)
@@ -1325,6 +1359,9 @@ void NetWorkerPool::prepareConnectionStageA(
             if (gm->m_player)
                 gm->m_player->getStateSync(&syncStream, targetObj);
             outTask.stateSyncBits     = syncStream.getBitPosition();
+            outTask.stateSyncError    = syncStream.hasError() || (outTask.stateSyncBits > 0x3FFu);
+            if (syncStream.hasError())
+                syncStream.clearError();
             outTask.stateSyncCaptured = true;
             outTask.hasControlToWrite = true;
         }
@@ -1349,10 +1386,10 @@ void NetWorkerPool::executeConnectionStageB(
     if (task.applyStateMasks && !worldSnap.m_updatedStateMasks.empty())
         gm->updateStateMasks(worldSnap.m_updatedStateMasks);
 
-    if (!task.dueToSend || task.skipTransmitBackpressure || task.recording)
+    if (!task.dueToSend || task.recording)
         return;
 
-    // 2. Scope & build priority heap.
+    // 2. Scope & build priority heap (runs even under backpressure, matching vanilla GameServer).
     if (task.connectionState == 4 && task.bReset)
     {
         if (task.shouldScope)
@@ -1373,7 +1410,7 @@ void NetWorkerPool::executeConnectionStageB(
             task.packUs += ServerTickProfiler::elapsedUs(tHeap, ServerTickProfiler::now());
     }
 
-    if (!task.preGhostOk || task.serialFallback)
+    if (task.skipTransmitBackpressure || !task.preGhostOk || task.serialFallback)
         return;
 
     // 3. Preflight hybrid-fallback check BEFORE touching BitStream or popping queues/heap.
@@ -1489,8 +1526,6 @@ unsigned int NetWorkerPool::finishConnectionStageC(
                 continue;
             const int targetPrecision = ve.ghostTier ? ve.precision : static_cast<int>(io::StatePrecisionFull);
             io::BaseLineData runningBase = ve.baselineBefore;
-            if (ve.isDelta)
-                runningBase.m_cursor = 0;
 
             for (std::size_t p = 0; p < ve.descriptor->properties.size(); ++p)
             {

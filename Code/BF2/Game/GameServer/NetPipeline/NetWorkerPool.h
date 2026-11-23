@@ -15,6 +15,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -87,6 +88,7 @@ struct ConnectionStageTask
     io::BaseLineData                 freshBaseLine;
     unsigned char                    stateSyncBuf[136];
     unsigned int                     stateSyncBits;
+    bool                             stateSyncError;
 
     // Pre-ghost stream state (PlayerActionManager + GameEventManager already packed in Stage A)
     PacketStatus                     status;
@@ -103,6 +105,7 @@ struct ConnectionStageTask
     WorldNetSnapshot::TypeWriteBitStats writeBitStats;
     unsigned int                     didNotFitCount;
     unsigned int                     missingUpdatesCount;
+    std::vector<unsigned int>        encodedRecordIndices;
     std::vector<VerifyDescriptorEntry> verifyEntries;
 
     ConnectionStageTask()
@@ -158,6 +161,7 @@ struct ConnectionStageTask
         std::memset(&freshBaseLine, 0, sizeof(freshBaseLine));
         std::memset(stateSyncBuf, 0, sizeof(stateSyncBuf));
         stateSyncBits             = 0;
+        stateSyncError            = false;
 
         std::memset(&status, 0, sizeof(status));
         ghostBitLimit             = 0;
@@ -172,6 +176,7 @@ struct ConnectionStageTask
         writeBitStats             = WorldNetSnapshot::TypeWriteBitStats();
         didNotFitCount            = 0;
         missingUpdatesCount       = 0;
+        encodedRecordIndices.clear();
         verifyEntries.clear();
     }
 };

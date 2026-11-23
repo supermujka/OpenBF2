@@ -111,7 +111,8 @@ public:
         bool ghostTier,
         WorldNetSnapshot::TypeWriteBitStats* outStats = 0,
         unsigned int* outDidNotFitCount = 0,
-        unsigned int* outMissingUpdatesCount = 0);
+        unsigned int* outMissingUpdatesCount = 0,
+        std::vector<unsigned int>* outEncodedRecords = 0);
 
     // Thread-safe equivalent of io::NetworkManager::getNetUpdateDelta().
     static bool encodeDescriptorDelta(
@@ -124,7 +125,8 @@ public:
         bool ghostTier,
         bool resetBaseLineCursor,
         WorldNetSnapshot::TypeWriteBitStats* outStats = 0,
-        unsigned int* outMissingUpdatesCount = 0);
+        unsigned int* outMissingUpdatesCount = 0,
+        std::vector<unsigned int>* outEncodedRecords = 0);
 
     // Compares two BitStreams for exact bit position, high-water mark, and bit-for-bit buffer payload.
     static bool compareBitStreamsBitExact(

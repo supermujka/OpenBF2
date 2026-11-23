@@ -589,10 +589,18 @@ void WorldNetSnapshot::buildFromLiveWorld(
     }
 }
 
-void WorldNetSnapshot::commitMainThreadSideEffects(const TypeWriteBitStats* optionalBitStats) const
+void WorldNetSnapshot::commitMainThreadSideEffects(
+    const TypeWriteBitStats* optionalBitStats,
+    const std::vector<unsigned char>* encodedRecordFlags) const
 {
+    const bool filterByEncoded = (encodedRecordFlags != 0
+        && encodedRecordFlags->size() == m_records.size());
+
     for (std::size_t i = 0; i < m_records.size(); ++i)
     {
+        if (filterByEncoded && (*encodedRecordFlags)[i] == 0)
+            continue;
+
         const NetRecordSnap& meta = m_records[i];
         io::INetworkable* const live = meta.liveNetworkable;
         if (!live)

@@ -30,6 +30,7 @@ class SoldierSound;          // dedicated no-op sound voice; see Sound/SoldierSo
 class ISound;
 class SoldierNetworkable;    // the wire wrapper - a friend below; see Networkables.h
 namespace geom { class NametagManager; }   // RendDX9's - a friend below
+namespace netpipeline { class WorldNetSnapshot; } // [CHOSEN, not recovered] MT snapshot capture - a friend below
 
 namespace world {
 
@@ -330,6 +331,8 @@ private:
     friend class HitregTelemetry;
     // [CHOSEN, not recovered] Hitreg V3 Phase 2 (Option C): inspect m_ragDoll during latency ring capture.
     friend class SoldierPhysicsNode;
+    // [CHOSEN, not recovered] Phase 2 MT NetPipeline: read-only m_ragDoll capture on main thread.
+    friend class ::dice::hfe::netpipeline::WorldNetSnapshot;
     /* +0x1F4 */ float  m_smoothedStrafe;            // [CHOSEN] name
     /* +0x1F8 */ float  m_smoothedForward;           // [CHOSEN] name
     /* +0x1FC */ int    m_pose;                      // SoldierPose

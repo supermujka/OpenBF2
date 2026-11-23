@@ -8,6 +8,7 @@
 #endif
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <netinet/in.h>
 #include <errno.h>
 #endif
@@ -402,8 +403,10 @@ std::size_t sendBatchImpl(io::NetServer* netServer,
             }
 
             // A single connection's send ring holds at most 32 packets (<= 31 window-eligible),
-            // which always fits inside kMaxChunkSize (64). Flush first if adding eligibleCount
-            // would overflow the current 64-message mmsghdr array.
+            // which always fits inside kMaxChunkSize (64). Clamp defensively and flush first if
+            // adding eligibleCount would overflow the current 64-message mmsghdr array.
+            if (eligibleCount > LinuxBatchSender::kMaxChunkSize)
+                eligibleCount = LinuxBatchSender::kMaxChunkSize;
             if (sub.msgCount > 0u
                 && (sub.msgCount + eligibleCount > LinuxBatchSender::kMaxChunkSize))
             {
@@ -432,7 +435,7 @@ std::size_t sendBatchImpl(io::NetServer* netServer,
                 unsigned char* const slot =
                     static_cast<unsigned char*>(const_cast<void*>(front->pvoid14));
 
-                // Rewrite the 60-bit basic + extended header in place with live counters,
+                // Rewrite the 56-bit basic + extended header in place with live counters,
                 // bit-for-bit identical to SWConnection::send().
                 c->m_sendStream->setBuffer(slot, 0x5C1u);
                 io::writeBasicHeader(

@@ -3439,6 +3439,8 @@ void GameServer::processGameStateAndSendPackets(float dt)
         unsigned int mergedMissingUpdates = 0;
         long long sumWorkerScopeUs        = 0;
         long long sumWorkerPackUs         = 0;
+        static std::vector<unsigned char> s_encodedFlags;
+        s_encodedFlags.assign(worldSnap.m_records.size(), 0);
 
         const ServerTickProfiler::TimePoint tStageCFallbackStart = prof
             ? ServerTickProfiler::now()
@@ -3449,50 +3451,57 @@ void GameServer::processGameStateAndSendPackets(float dt)
             netpipeline::ConnectionStageTask& task = tasks[idx];
             ServerConnection* const conn = task.conn;
 
+            if (task.dueToSend)
+            {
+                if (task.recording)
+                {
+                    if (conn->m_connectionState == 4 && conn->m_bReset)
+                    {
+                        conn->updatePlayerControlObject(m_frameCount);
+                        --ghostBudget;
+                        conn->updateGhostManager(viewDistance);
+                        conn->m_timer20 = 0.1f;
+                        conn->m_ghostManager->update(WorldPref::getTickCount());
+                    }
+                    if (!conn->transmitMsgs())
+                    {
+                        m_disconnectTypes[conn->m_connectionId] =
+                            DisconnectType(conn->m_connectionId, 28, std::string());
+                    }
+                    unsigned int demoBytes = conn->m_bitStream->m_highWaterBits >> 3;
+                    if (conn->m_bitStream->m_highWaterBits & 7)
+                        ++demoBytes;
+                    if (demoBytes)
+                    {
+                        const int tick = (conn->m_connectionState == 4) ? WorldPref::getTickCount() : -1;
+                        if (m_demoRecorder)
+                            m_demoRecorder->writeData(tick, conn->m_bitStream);
+                        bool delivered = true;
+                        conn->handlePacketStatusNotification(delivered);
+                    }
+                    continue;
+                }
+
+                netpipeline::NetWorkerPool::finishConnectionStageC(worldSnap, task, verifyEnabled);
+                if (!task.txOk)
+                {
+                    m_disconnectTypes[conn->m_connectionId] =
+                        DisconnectType(conn->m_connectionId, 28, std::string());
+                }
+            }
+
+            // Merge stats and encoded-record flags AFTER Stage C so hybrid fallback writes are included.
             sumWorkerScopeUs += task.scopeUs;
             sumWorkerPackUs  += task.packUs;
             for (int t = 0; t < 10; ++t)
                 mergedWriteBits.bitsByType[t] += task.writeBitStats.bitsByType[t];
             mergedDidNotFit      += task.didNotFitCount;
             mergedMissingUpdates += task.missingUpdatesCount;
-
-            if (!task.dueToSend)
-                continue;
-
-            if (task.recording)
+            for (std::size_t ei = 0; ei < task.encodedRecordIndices.size(); ++ei)
             {
-                if (conn->m_connectionState == 4 && conn->m_bReset)
-                {
-                    conn->updatePlayerControlObject(m_frameCount);
-                    --ghostBudget;
-                    conn->updateGhostManager(viewDistance);
-                    conn->m_timer20 = 0.1f;
-                    conn->m_ghostManager->update(WorldPref::getTickCount());
-                }
-                if (!conn->transmitMsgs())
-                {
-                    m_disconnectTypes[conn->m_connectionId] =
-                        DisconnectType(conn->m_connectionId, 28, std::string());
-                }
-                unsigned int demoBytes = conn->m_bitStream->m_highWaterBits >> 3;
-                if (conn->m_bitStream->m_highWaterBits & 7)
-                    ++demoBytes;
-                if (demoBytes)
-                {
-                    const int tick = (conn->m_connectionState == 4) ? WorldPref::getTickCount() : -1;
-                    if (m_demoRecorder)
-                        m_demoRecorder->writeData(tick, conn->m_bitStream);
-                    bool delivered = true;
-                    conn->handlePacketStatusNotification(delivered);
-                }
-                continue;
-            }
-
-            netpipeline::NetWorkerPool::finishConnectionStageC(worldSnap, task, verifyEnabled);
-            if (!task.txOk)
-            {
-                m_disconnectTypes[conn->m_connectionId] =
-                    DisconnectType(conn->m_connectionId, 28, std::string());
+                const unsigned int rIdx = task.encodedRecordIndices[ei];
+                if (rIdx < s_encodedFlags.size())
+                    s_encodedFlags[rIdx] = 1;
             }
         }
 
@@ -3514,8 +3523,9 @@ void GameServer::processGameStateAndSendPackets(float dt)
             ServerTickProfiler::addPhaseUs(ServerTickProfiler::PHASE_GHOST_PACK, stageAPackUs + wallPackUs + stageCFallbackUs);
         }
 
-        // Commit main-thread INetworkable side effects (m_next = m_head, ammoStatus &= 0xF, stats) once.
-        worldSnap.commitMainThreadSideEffects(&mergedWriteBits);
+        // Commit main-thread INetworkable side effects (m_next = m_head, ammoStatus &= 0xF, stats)
+        // strictly for records encoded this tick.
+        worldSnap.commitMainThreadSideEffects(&mergedWriteBits, &s_encodedFlags);
         if (io::networkManager && (mergedDidNotFit || mergedMissingUpdates))
         {
             io::networkManager->addNetUpdateCounters(

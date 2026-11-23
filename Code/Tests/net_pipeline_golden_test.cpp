@@ -83,6 +83,16 @@ int StatePrecisionLow    = 1;
 int StatePrecisionLowest = 0;
 } // namespace io
 
+SimpleObjectNetworkable::UPDATE::UPDATE()
+{
+    std::memset(this, 0, sizeof(*this));
+}
+
+SoldierNetworkable::UPDATE::UPDATE()
+{
+    std::memset(this, 0, sizeof(*this));
+}
+
 } // namespace hfe
 } // namespace dice
 
@@ -447,7 +457,7 @@ void testAllNineConstNetEncoders()
         s.ragdollParticleStart       = 0;
         s.ragdollParticleCount       = 0;
 
-        const unsigned char origAmmoStatus = s.rec.ammoStatus;
+        const int origAmmoStatus = s.rec.ammoStatus;
 
         // Ghost precision with compression vector
         {
@@ -630,14 +640,14 @@ void testAllNineConstNetEncoders()
     // 5. ControlPointNetworkable
     {
         ControlPointRecordSnap cpSnap;
-        cpSnap.rec.m_team                    = -1;
-        cpSnap.rec.m_bool158                 = true;
-        cpSnap.rec.m_takeOverCounter         = 0.75f;
-        cpSnap.rec.m_takeOverChangePerSecond = -0.5f;
-        cpSnap.rec.m_allowCaptureByTeam1     = true;
-        cpSnap.rec.m_allowCaptureByTeam2     = false;
-        cpSnap.rec.m_flagTeam                = 2;
-        cpSnap.rec.m_capturingState          = -2;
+        cpSnap.rec.team                    = -1;
+        cpSnap.rec.bool158                 = true;
+        cpSnap.rec.takeOverCounter         = 0.75f;
+        cpSnap.rec.takeOverChangePerSecond = -0.5f;
+        cpSnap.rec.allowCaptureByTeam1     = true;
+        cpSnap.rec.allowCaptureByTeam2     = false;
+        cpSnap.rec.flagTeam                = 2;
+        cpSnap.rec.capturingState          = -2;
 
         unsigned char bufA[128] = { 0 };
         unsigned char bufB[128] = { 0 };
@@ -650,9 +660,10 @@ void testAllNineConstNetEncoders()
         streamB.writeBits(&mask, 7);
         const unsigned int s1 = 1u, m1 = 1u;
         streamB.writeBits(&s1, 1); streamB.writeBits(&m1, 3);
-        streamB.writeBits(&cpSnap.rec.m_bool158, 1);
-        const unsigned int qCounter = static_cast<unsigned int>(((0.75 / 1.25 + 1.0) * 0.5) * 65535.0);
-        const unsigned int qRate    = static_cast<unsigned int>(((-0.5 / 1.25 + 1.0) * 0.5) * 65535.0);
+        const unsigned int b158 = cpSnap.rec.bool158 ? 1u : 0u;
+        streamB.writeBits(&b158, 1);
+        const unsigned int qCounter = static_cast<unsigned int>(static_cast<int>(((0.75 / 1.25 + 1.0) * 0.5) * 65535.0));
+        const unsigned int qRate    = static_cast<unsigned int>(static_cast<int>(((-0.5 / 1.25 + 1.0) * 0.5) * 65535.0));
         streamB.writeBits(&qCounter, 16);
         streamB.writeBits(&qRate, 16);
         const unsigned int z0 = 0u, flag1 = 1u, flag0 = 0u;
@@ -682,14 +693,14 @@ void testAllNineConstNetEncoders()
         soSnap.rec.vec74            = makeVec3(0.0f, -0.01f, 0.0f);
         soSnap.rec.vec80            = makeVec3(1.0f, 0.0f, 0.0f);
         soSnap.rec.vec8C            = makeVec3(0.0f, 1.0f, 0.0f);
-        soSnap.rec.byte9C           = 1;
+        soSnap.rec.byte9C           = true;
         soSnap.rec.hitPoints        = 300;
         soSnap.rec.replicationState = 2;
         soSnap.rec.weaponIndex[0]   = 0;
         soSnap.rec.weaponIndex[1]   = 2;
         soSnap.rec.weaponIndex[2]   = -1;
-        soSnap.rec.supplyB0         = 1;
-        soSnap.rec.pcoB4            = 5;
+        soSnap.rec.supplyB0         = 4; // non-canonical even truthy int -> must normalize to 1
+        soSnap.rec.pcoB4            = 15; // exercises 5-bit bitsToHold(16) width
         soSnap.rec.isDucking        = true;
         soSnap.isMobilePhysics      = true;
         soSnap.hasArmor             = true;
@@ -720,7 +731,7 @@ void testAllNineConstNetEncoders()
             const bool okA = ConstNetEncoders::encodeSimpleObject(
                 soSnap, streamA, &baseA, mask, io::StatePrecisionGhost);
 
-            // Reference baseline delta encode
+            // Reference baseline delta encode (matching SimpleObjectNetworkable::getNetUpdate)
             const Vec3 zeroVec = { 0.0f, 0.0f, 0.0f };
             streamB.writeBits(&mask, 19);
             const Vec3* refB = reinterpret_cast<const Vec3*>(baseB.m_data + baseB.m_cursor * 2);
@@ -735,114 +746,282 @@ void testAllNineConstNetEncoders()
             streamB.writeCompressedVector(soSnap.rec.vec68, zeroVec, 0.000099999997f);
             streamB.writeCompressedVector(soSnap.rec.vec50, zeroVec, 0.000099999997f);
             streamB.writeCompressedVector(soSnap.rec.vec74, zeroVec, 0.000099999997f);
-            streamB.writeBits(&soSnap.rec.byte9C, 1);
-            streamB.writeBits(&soSnap.rec.supplyB0, 1);
+            const unsigned int b9c = 1u, sb0 = 1u;
+            streamB.writeBits(&b9c, 1);
+            streamB.writeBits(&sb0, 1);
             const unsigned int hpOff = 350u; // 300 + 50 in [0..500] -> 9 bits
             streamB.writeBits(&hpOff, 9);
-            streamB.writeBits(&soSnap.rec.replicationState, 2);
-            const unsigned int w0 = 1u, w1 = 3u, w2 = 0u, pcoB4 = 5u, duck = 1u;
+            const unsigned int repState = soSnap.rec.replicationState;
+            streamB.writeBits(&repState, 2);
+            const unsigned int w0 = 1u, w1 = 3u, w2 = 0u, pcoB4 = 15u, duck = 1u;
             streamB.writeBits(&w0, 4);
             streamB.writeBits(&w1, 4);
             streamB.writeBits(&w2, 4);
-            streamB.writeBits(&pcoB4, 4);
+            streamB.writeBits(&pcoB4, 5); // bitsToHold(16) == 5 bits!
             streamB.writeBits(&duck, 1);
 
             checkCond(okA && baseA.m_cursor == baseB.m_cursor && baseA.m_cursor == 42,
                       "SimpleObjectNetworkable baseline cursor advances by +36");
             checkCond(ConstNetEncoders::compareBitStreamsBitExact(streamA, streamB),
-                      "SimpleObjectNetworkable baseline delta bit-exact match");
+                      "SimpleObjectNetworkable baseline delta bit-exact match (5-bit pcoB4 + normalized bools)");
         }
     }
 
-    // 7. Player
+    // 7. Player (bit-exact match against Player::getNetUpdate for Full and Ghost precision)
     {
+        auto setSlotDword = [](NetUpdateSlot& s, int off, int v) {
+            std::memcpy(&s.buff[off], &v, sizeof(v));
+        };
+        auto setSlotWord = [](NetUpdateSlot& s, int off, unsigned short v) {
+            std::memcpy(&s.buff[off], &v, sizeof(v));
+        };
+        auto setSlotFloat = [](NetUpdateSlot& s, int off, float v) {
+            std::memcpy(&s.buff[off], &v, sizeof(v));
+        };
+        auto writeBitRef = [](io::BitStream& bs, bool v) {
+            const unsigned int b = v ? 1u : 0u;
+            bs.writeBits(&b, 1);
+        };
+        auto writeRangedRef = [](io::BitStream& bs, int val, int lo, int hi) {
+            const unsigned int span = static_cast<unsigned int>(hi - lo) + 1u;
+            unsigned int bits = 0;
+            do { ++bits; } while (span > (1u << bits) - 1u);
+            const unsigned int off = static_cast<unsigned int>(val - lo);
+            bs.writeBits(&off, bits);
+        };
+
         PlayerRecordSnap pSnap;
         std::memset(&pSnap, 0, sizeof(pSnap));
-        pSnap.slot.m_spawned                  = true;
-        pSnap.slot.m_down                     = false;
-        pSnap.slot.m_spawnGroupId             = 4;
-        pSnap.slot.m_team                     = 1;
-        pSnap.slot.m_score                    = 42;
-        pSnap.slot.m_skillScore               = 19;
-        pSnap.slot.m_teamWorkScore            = 23;
-        pSnap.slot.m_rank                     = 7;
-        pSnap.slot.m_kills                    = 15;
-        pSnap.slot.m_deaths                   = 6;
-        pSnap.slot.m_ping                     = 38;
-        pSnap.slot.m_vehicleValid             = true;
-        pSnap.slot.m_vehicleNetId             = 1024;
-        pSnap.slot.m_subPcoId                 = 0;
-        pSnap.slot.m_cameraNetId              = 1025;
-        pSnap.slot.m_defaultVehicleValid      = true;
-        pSnap.slot.m_defaultVehicleNetId      = 2048;
-        pSnap.slot.m_kitValid                 = true;
-        pSnap.slot.m_kitTemplateId            = 333;
-        pSnap.slot.m_isInsideCP               = true;
-        pSnap.slot.m_cpTakeOverProgress       = 100.0f;
-        pSnap.slot.m_cpTakeOverSpeed          = 0.5f;
-        pSnap.slot.m_flagHolder               = false;
-        pSnap.slot.m_squadId                  = 2;
-        pSnap.slot.m_isSquadLeader            = true;
-        pSnap.slot.m_Commander                = false;
-        pSnap.slot.m_commanderApplicantsValid = true;
-        pSnap.slot.m_ReplenishReq             = true;
-        pSnap.slot.m_RepairPoint              = false;
-        pSnap.slot.m_HealPoint                = true;
-        pSnap.slot.m_ammo[0]                  = 29;
-        pSnap.slot.m_nrOfMags[0]              = 5;
-        pSnap.slot.m_heat[1]                  = 0.6f;
-        pSnap.slot.m_ammo[2]                  = 1;
-        pSnap.slot.m_nrOfMags[2]              = 3;
-        pSnap.slot.m_fireRateMod[0]           = 1;
-        pSnap.slot.m_fireRateMod[1]           = 0;
-        pSnap.slot.m_fireRateMod[2]           = 2;
-        pSnap.slot.m_LockonState              = 3;
-        pSnap.slot.m_targetNetId              = 777;
-        pSnap.slot.m_subControllerIndex       = 2;
-        pSnap.slot.m_VoipOn                   = true;
-        pSnap.slot.m_SquadLeaderVoipOn        = false;
-        pSnap.isConnected                     = true;
-        pSnap.weaponUsesHeat[0]               = false;
-        pSnap.weaponUsesHeat[1]               = true;
-        pSnap.weaponUsesHeat[2]               = false;
+        pSnap.slot.isAlive    = 1;
+        pSnap.slot.someScore2 = 123;
+        setSlotDword(pSnap.slot, 0, 45);      // m_field14
+        setSlotDword(pSnap.slot, 4, -17);     // m_field04 (signed 1+11)
+        setSlotDword(pSnap.slot, 8, 99);      // m_field18
+        setSlotDword(pSnap.slot, 12, -42);    // totalScore (signed 1+11)
+        setSlotDword(pSnap.slot, 16, 1);      // team (team+1 = 2 in [0..3])
+        setSlotDword(pSnap.slot, 20, 11);     // m_field54
+        setSlotDword(pSnap.slot, 24, 22);     // m_field58
+        setSlotDword(pSnap.slot, 28, 33);     // m_field5C
+        setSlotDword(pSnap.slot, 32, 3);      // cameraViewMode
+        setSlotDword(pSnap.slot, 36, 4);      // spawnGroup
+        setSlotDword(pSnap.slot, 40, 2);      // squadId
+        setSlotDword(pSnap.slot, 44, 7);      // rank (rank+1 = 8 in [0..31])
+        pSnap.slot.buff[48]   = 1;            // isSquadLeader (unmasked)
+        pSnap.slot.buff[49]   = 1;            // commander
+        pSnap.slot.buff[50]   = 1;            // uavReady
+        pSnap.slot.buff[51]   = 0;            // satelliteReady
+        pSnap.slot.buff[52]   = 1;
+        pSnap.slot.buff[53]   = 0;
+        pSnap.slot.buff[54]   = 1;
+        setSlotFloat(pSnap.slot, 56, 0.25f);
+        setSlotFloat(pSnap.slot, 60, 0.50f);
+        setSlotFloat(pSnap.slot, 64, 0.75f);
+        pSnap.slot.buff[68]   = 1;            // flagHolder
+        pSnap.slot.buff[69]   = 1;            // callForMedic
+        setSlotDword(pSnap.slot, 72, 2);      // firePressCount
+        // Weapon 0: firing, non-heat
+        pSnap.slot.buff[76]   = 1;
+        setSlotDword(pSnap.slot, 80, 10);     // deviation (+1 = 11)
+        setSlotDword(pSnap.slot, 84, 2);      // 2-bit
+        pSnap.slot.buff[88]   = 1;
+        setSlotFloat(pSnap.slot, 92, 0.6f);   // cold 6-bit
+        setSlotDword(pSnap.slot, 96, 5);      // 4-bit
+        // Weapon 1: firing, uses heat, hot (>= 1.0f -> 8-bit / 10.0)
+        pSnap.slot.buff[100]  = 1;
+        setSlotDword(pSnap.slot, 104, 20);
+        setSlotDword(pSnap.slot, 108, 1);
+        pSnap.slot.buff[112]  = 0;
+        setSlotFloat(pSnap.slot, 116, 4.5f);
+        setSlotDword(pSnap.slot, 120, 9);
+        // Weapon 2: not firing, not forced
+        pSnap.slot.buff[124]  = 0;
+        pSnap.slot.buff[148]  = 1;            // sprint
+        pSnap.slot.buff[149]  = 0;            // sprintLastTick
+        setSlotDword(pSnap.slot, 152, 98765); // spawnAtTick
+        pSnap.slot.buff[156]  = 1;            // isManDown
+        setSlotWord(pSnap.slot, 158, 38);     // ping
+        pSnap.slot.buff[160]  = 12;           // timeOutside (9-bit)
+        pSnap.slot.buff[161]  = 3;            // kitByte (9-bit)
+        pSnap.slot.buff[162]  = 1;
+        pSnap.slot.buff[163]  = 1;            // freeCameraEnabled
+        pSnap.slot.buff[164]  = 0;            // overheadCameraEnabled
+        pSnap.slot.buff[165]  = 0x5Au;        // squadInviteMask (8-bit)
+        setSlotDword(pSnap.slot, 168, 42);    // tracePlayerId (+1 = 43)
+        setSlotDword(pSnap.slot, 172, 2);     // maskSetting
+        pSnap.isConnected       = true;
+        pSnap.weaponUsesHeat[0] = false;
+        pSnap.weaponUsesHeat[1] = true;
+        pSnap.weaponUsesHeat[2] = false;
+
+        // Test Ghost precision (includes weapon section) and Full precision (omits weapon section)
+        const unsigned int mask = 0x0FFFFFFFu & ~0x00010000u; // weapon 2 skips rest when not firing
+        for (int precIdx = 0; precIdx < 2; ++precIdx)
+        {
+            const int precision = (precIdx == 0) ? io::StatePrecisionGhost : io::StatePrecisionFull;
+            unsigned char bufA[256] = { 0 };
+            unsigned char bufB[256] = { 0 };
+            io::BitStream streamA(bufA, sizeof(bufA));
+            io::BitStream streamB(bufB, sizeof(bufB));
+
+            const bool okA = ConstNetEncoders::encodePlayer(pSnap, streamA, 0, mask, precision);
+
+            // Reference Player::getNetUpdate bitstream
+            streamB.writeBits(&mask, 28);
+            writeBitRef(streamB, true);                         // 0x1 isAlive
+            writeRangedRef(streamB, 4, 0, 255);                 // 0x2 spawnGroup
+            {                                                   // 0x8 score block
+                const unsigned int s1 = 1u, m1 = 42u;
+                streamB.writeBits(&s1, 1); streamB.writeBits(&m1, 11);
+                writeRangedRef(streamB, 123, 0, 2047);
+                writeRangedRef(streamB, 45, 0, 2047);
+                const unsigned int s2 = 1u, m2 = 17u;
+                streamB.writeBits(&s2, 1); streamB.writeBits(&m2, 11);
+                writeRangedRef(streamB, 99, 0, 2047);
+            }
+            writeBitRef(streamB, true);                         // 0x200000 flagHolder
+            writeBitRef(streamB, true);                         // 0x10 callForMedic
+            if (precision == io::StatePrecisionGhost)
+            {
+                const unsigned int presses = 2u;
+                streamB.writeBits(&presses, 2);                 // 0x2000000
+                // w = 0
+                writeBitRef(streamB, true);
+                writeRangedRef(streamB, 11, 0, 63);
+                const unsigned int g0a = 2u, g0b = 5u;
+                streamB.writeBits(&g0a, 2);
+                writeBitRef(streamB, true);
+                writeBitRef(streamB, false);
+                const unsigned int q0 = static_cast<unsigned int>(static_cast<double>(0.6f) * 63.0);
+                streamB.writeBits(&q0, 6);
+                streamB.writeBits(&g0b, 4);
+                // w = 1 (hot)
+                writeBitRef(streamB, true);
+                writeRangedRef(streamB, 21, 0, 63);
+                const unsigned int g1a = 1u, g1b = 9u;
+                streamB.writeBits(&g1a, 2);
+                writeBitRef(streamB, false);
+                writeBitRef(streamB, true);
+                const unsigned int q1 = static_cast<unsigned int>((static_cast<double>(4.5f) / 10.0) * 255.0);
+                streamB.writeBits(&q1, 8);
+                streamB.writeBits(&g1b, 4);
+                // w = 2 (not firing -> 1 bit only)
+                writeBitRef(streamB, false);
+            }
+            writeBitRef(streamB, true);                         // 0x40000 sprint
+            writeBitRef(streamB, false);
+            writeRangedRef(streamB, 38, 0, 1023);               // 0x100 ping
+            {
+                const unsigned int st = 98765u;
+                streamB.writeBits(&st, 32);                     // 0x20 spawnAtTick
+                writeBitRef(streamB, true);                     // isManDown
+            }
+            writeRangedRef(streamB, 2, 0, 3);                   // 0x200 team+1
+            writeRangedRef(streamB, 3, 0, 8);                   // 0x400 cameraViewMode
+            writeBitRef(streamB, true);
+            {
+                const unsigned int tOut = 12u, kByte = 3u;
+                streamB.writeBits(&tOut, 9);                    // 0x800
+                streamB.writeBits(&kByte, 9);                   // 0x1000
+            }
+            writeRangedRef(streamB, 2, 0, 15);                  // 0x2000 squadId
+            writeRangedRef(streamB, 8, 0, 31);                  // 0x4000 rank+1
+            writeRangedRef(streamB, 11, 0, 255);
+            writeRangedRef(streamB, 22, 0, 255);
+            writeRangedRef(streamB, 33, 0, 255);
+            writeBitRef(streamB, true);                         // 0x8000 freeCam
+            writeBitRef(streamB, false);                        // 0x400000 overheadCam
+            {
+                const unsigned int inv = 0x5Au;
+                streamB.writeBits(&inv, 8);                     // 0x800000
+            }
+            writeRangedRef(streamB, 43, 0, 65536);              // 0x1000000 tracePlayerId+1
+            writeBitRef(streamB, true);                         // unmasked isSquadLeader
+            {                                                   // 0x4000000 commander
+                writeBitRef(streamB, true);
+                writeBitRef(streamB, true);
+                writeBitRef(streamB, false);
+                writeBitRef(streamB, true);
+                writeBitRef(streamB, false);
+                writeBitRef(streamB, true);
+                const unsigned int f0 = static_cast<unsigned int>(0.25 * 255.0);
+                const unsigned int f1 = static_cast<unsigned int>(0.50 * 255.0);
+                const unsigned int f2 = static_cast<unsigned int>(0.75 * 255.0);
+                streamB.writeBits(&f0, 8);
+                streamB.writeBits(&f1, 8);
+                streamB.writeBits(&f2, 8);
+            }
+            writeBitRef(streamB, true);                         // unmasked m_isConnected
+            writeRangedRef(streamB, 2, 0, 3);                   // 0x8000000 maskSetting
+
+            checkCond(okA, precision == io::StatePrecisionGhost
+                ? "Player Ghost precision encode returns true"
+                : "Player Full precision encode returns true");
+            checkCond(ConstNetEncoders::compareBitStreamsBitExact(streamA, streamB),
+                precision == io::StatePrecisionGhost
+                ? "Player Ghost precision bit-exact match vs Player::getNetUpdate"
+                : "Player Full precision bit-exact match vs Player::getNetUpdate");
+        }
+    }
+
+    // 8. ScoreManager (bit-exact match against ScoreManager::getNetUpdate + capacity preflight)
+    {
+        auto writeSigned17Ref = [](io::BitStream& bs, int v) {
+            const unsigned int sign = (v < 0) ? 1u : 0u;
+            const unsigned int mag  = (v < 0) ? (0u - static_cast<unsigned int>(v)) : static_cast<unsigned int>(v);
+            bs.writeBits(&sign, 1);
+            bs.writeBits(&mag, 17);
+        };
+        auto setRecInt = [](unsigned char* rec, int off, int v) {
+            std::memcpy(rec + off, &v, sizeof(v));
+        };
+
+        ScoreManagerRecordSnap smSnap;
+        std::memset(&smSnap, 0, sizeof(smSnap));
+        smSnap.record[0x00] = 2;     // winner
+        smSnap.record[0x01] = 1;     // victoryType
+        setRecInt(smSnap.record, 0x04, 1250);  // T1 0x00000001
+        setRecInt(smSnap.record, 0x0C, -50);   // T1 0x01000000 first
+        setRecInt(smSnap.record, 0x40, 77);    // T1 0x01000000 second
+        setRecInt(smSnap.record, 0x38, 13);    // T1 0x80000000 m_block[13]
+        setRecInt(smSnap.record, 0x44, 185);   // T1 0x00000400 tickets
+        smSnap.record[0x50] = 1;               // T1 0x00000400 bleed
+        setRecInt(smSnap.record, 0x4C, -2);    // T1 0x00000400 ticketState
+        setRecInt(smSnap.record, 0x88, -14);   // T2 0x80000000 m_block[13]
+        setRecInt(smSnap.record, 0x94, 140);   // T2 0x00400000 tickets
+        smSnap.record[0xA0] = 0;               // T2 0x00400000 bleed
+        setRecInt(smSnap.record, 0x9C, 3);     // T2 0x00400000 ticketState
 
         unsigned char bufA[256] = { 0 };
         unsigned char bufB[256] = { 0 };
         io::BitStream streamA(bufA, sizeof(bufA));
         io::BitStream streamB(bufB, sizeof(bufB));
 
-        const unsigned int mask = 0x1FFFFFFFu;
-        const bool okA = ConstNetEncoders::encodePlayer(pSnap, streamA, 0, mask, io::StatePrecisionFull);
-        const bool okB = ConstNetEncoders::encodePlayer(pSnap, streamB, 0, mask, io::StatePrecisionGhost);
-        checkCond(okA && okB && ConstNetEncoders::compareBitStreamsBitExact(streamA, streamB),
-                  "Player full 28-bit stateMask encode succeeds deterministically");
-        checkCond(streamA.getBitPosition() == 240u, "Player full 28-bit stateMask exact bit length (240 bits)");
-    }
-
-    // 8. ScoreManager (full 32-bit mask + capacity preflight check)
-    {
-        ScoreManagerRecordSnap smSnap;
-        std::memset(&smSnap, 0, sizeof(smSnap));
-        *reinterpret_cast<int*>(smSnap.record + 4)   = 1250; // team 1 score
-        *reinterpret_cast<int*>(smSnap.record + 16)  = 185;  // team 1 tickets (15b mag)
-        *reinterpret_cast<int*>(smSnap.record + 72)  = -12;  // team 1 ticketLossPerMin (7b mag)
-        *reinterpret_cast<int*>(smSnap.record + 84)  = 980;  // team 2 score
-        *reinterpret_cast<int*>(smSnap.record + 96)  = 140;  // team 2 tickets (15b mag)
-        *reinterpret_cast<int*>(smSnap.record + 152) = 8;    // team 2 ticketLossPerMin (7b mag)
-        *reinterpret_cast<int*>(smSnap.record + 160) = 1;    // winner (2b mag)
-        *reinterpret_cast<int*>(smSnap.record + 156) = -3;   // victoryType (4b mag)
-
-        unsigned char bufA[256] = { 0 };
-        io::BitStream streamA(bufA, sizeof(bufA));
-        const unsigned int mask = 0xC0042009u; // 7 bits set
+        // 6 set bits: 0x1, 0x01000000, 0x400, 0x00400000, 0x40000000, 0x80000000
+        const unsigned int mask = 0xC1400401u;
         const bool okA = ConstNetEncoders::encodeScoreManager(smSnap, streamA, 0, mask, io::StatePrecisionFull);
-        // 32 (mask) + (1+16) + (1+15) + (1+7) + (1+16) + (1+15) + (1+3) + (1+5) = 32 + 17 + 16 + 8 + 17 + 16 + 3 + 5 = 114 bits
-        checkCond(okA && streamA.getBitPosition() == 114u,
-                  "ScoreManager exact bit length (114 bits) for signed/variable-width fields");
 
-        // Tight BitStream capacity preflight check: 7 set bits requires 32 + 16*7 = 144 bits remaining
+        streamB.writeBits(&mask, 32);
+        writeSigned17Ref(streamB, 1250);        // 0x00000001
+        writeSigned17Ref(streamB, -50);         // 0x01000000 (+0x0C)
+        writeSigned17Ref(streamB, 77);          // 0x01000000 (+0x40)
+        writeSigned17Ref(streamB, 185);         // 0x00000400 (+0x44)
+        { const unsigned int b = 1u; streamB.writeBits(&b, 1); } // +0x50 bleed
+        writeSigned17Ref(streamB, -2);          // 0x00000400 (+0x4C)
+        writeSigned17Ref(streamB, 140);         // 0x00400000 (+0x94)
+        { const unsigned int b = 0u; streamB.writeBits(&b, 1); } // +0xA0 bleed
+        writeSigned17Ref(streamB, 3);           // 0x00400000 (+0x9C)
+        { const unsigned int s = 0u, w = 2u; streamB.writeBits(&s, 1); streamB.writeBits(&w, 2); } // 0x40000000
+        { const unsigned int s = 0u, v = 1u; streamB.writeBits(&s, 1); streamB.writeBits(&v, 2); } // 0x80000000
+        writeSigned17Ref(streamB, 13);          // +0x38
+        writeSigned17Ref(streamB, -14);         // +0x88
+
+        checkCond(okA, "ScoreManager encode returns true");
+        checkCond(ConstNetEncoders::compareBitStreamsBitExact(streamA, streamB),
+                  "ScoreManager bit-exact match vs ScoreManager::getNetUpdate");
+
+        // Tight BitStream capacity preflight check: 6 set bits requires 32 + 16*6 = 128 bits remaining
         streamA.clear();
-        streamA.m_bitLimit = 143;
+        streamA.m_bitLimit = 127;
         int preflightBits = 99;
         const bool okTight = ConstNetEncoders::encodeScoreManager(
             smSnap, streamA, 0, mask, io::StatePrecisionFull, &preflightBits);
@@ -854,9 +1033,9 @@ void testAllNineConstNetEncoders()
     {
         SpawnGroupRecordSnap sgSnap;
         sgSnap.team           = 2;
-        sgSnap.active         = 1;
+        sgSnap.active         = 2; // non-canonical even truthy byte -> must normalize to 1
         sgSnap.onlyForAI      = 0;
-        sgSnap.hasSpawnPoints = 1;
+        sgSnap.hasSpawnPoints = 4; // non-canonical even truthy byte -> must normalize to 1
         sgSnap.posX           = 128;
         sgSnap.posZ           = 64;
         sgSnap.squad          = 3;
@@ -870,20 +1049,33 @@ void testAllNineConstNetEncoders()
         const bool okA = ConstNetEncoders::encodeSpawnGroup(sgSnap, streamA, 0, mask, io::StatePrecisionFull);
 
         streamB.writeBits(&mask, 6);
-        streamB.writeBits(&sgSnap.hasSpawnPoints, 1);
-        const unsigned char teamByte = static_cast<unsigned char>(sgSnap.team);
-        streamB.writeBits(&teamByte, 4);
-        streamB.writeBits(&sgSnap.active, 1);
-        streamB.writeBits(&sgSnap.onlyForAI, 1);
-        streamB.writeBits(&sgSnap.posX, 8);
-        streamB.writeBits(&sgSnap.posZ, 8);
+        const unsigned int b1 = 1u, b0 = 0u;
+        streamB.writeBits(&b1, 1);
+        const unsigned int teamVal = static_cast<unsigned int>(sgSnap.team);
+        streamB.writeBits(&teamVal, 4);
+        streamB.writeBits(&b1, 1);
+        streamB.writeBits(&b0, 1);
+        const unsigned int px = static_cast<unsigned int>(sgSnap.posX);
+        const unsigned int pz = static_cast<unsigned int>(sgSnap.posZ);
+        streamB.writeBits(&px, 8);
+        streamB.writeBits(&pz, 8);
         const unsigned int wireSquad = static_cast<unsigned int>(sgSnap.squad + 1);
         streamB.writeBits(&wireSquad, 8);
 
         checkCond(okA && streamA.getBitPosition() == 37u,
                   "SpawnGroup exact 37-bit length");
         checkCond(ConstNetEncoders::compareBitStreamsBitExact(streamA, streamB),
-                  "SpawnGroup bit-exact match");
+                  "SpawnGroup bit-exact match (normalized bools + 4-byte widened fields)");
+
+        // Error-path stats test: overflowing stream must return false and report 0 bitsWritten
+        unsigned char tinyBuf[4] = { 0 };
+        io::BitStream tinyStream(tinyBuf, sizeof(tinyBuf));
+        tinyStream.m_bitLimit = 10;
+        int errBits = 999;
+        const bool okErr = ConstNetEncoders::encodeSpawnGroup(
+            sgSnap, tinyStream, 0, mask, io::StatePrecisionFull, &errBits);
+        checkCond(!okErr && errBits == 0,
+                  "Encoder error path reports 0 bitsWritten (matching live stats behavior)");
 
         // Test encodeDescriptor via WorldNetSnapshot
         DummyStubNetworkable stubSg(77, 0x3Fu, 37);
@@ -1095,10 +1287,10 @@ void testNetWorkerPoolStress()
     }
     {
         ControlPointRecordSnap cp;
-        cp.rec.m_team = 1; cp.rec.m_bool158 = true;
-        cp.rec.m_takeOverCounter = 0.25f; cp.rec.m_takeOverChangePerSecond = 0.1f;
-        cp.rec.m_allowCaptureByTeam1 = true; cp.rec.m_allowCaptureByTeam2 = true;
-        cp.rec.m_flagTeam = 1; cp.rec.m_capturingState = 0;
+        cp.rec.team = 1; cp.rec.bool158 = true;
+        cp.rec.takeOverCounter = 0.25f; cp.rec.takeOverChangePerSecond = 0.1f;
+        cp.rec.allowCaptureByTeam1 = true; cp.rec.allowCaptureByTeam2 = true;
+        cp.rec.flagTeam = 1; cp.rec.capturingState = 0;
         snap.m_controlPointRecords.push_back(cp);
         NetRecordSnap r;
         r.type = NetEncType::ControlPoint; r.networkableId = 105; r.typeRecordIndex = 0;
@@ -1124,9 +1316,11 @@ void testNetWorkerPoolStress()
     {
         PlayerRecordSnap pr;
         std::memset(&pr, 0, sizeof(pr));
-        pr.slot.m_spawned = true; pr.slot.m_team = 2; pr.slot.m_score = 55;
-        pr.slot.m_kills = 9; pr.slot.m_deaths = 4; pr.slot.m_ping = 27;
-        pr.slot.m_ammo[0] = 30; pr.slot.m_nrOfMags[0] = 6;
+        pr.slot.isAlive = 1;
+        pr.slot.someScore2 = 55;
+        int teamVal = 2; std::memcpy(&pr.slot.buff[16], &teamVal, sizeof(teamVal));
+        unsigned short pingVal = 27; std::memcpy(&pr.slot.buff[158], &pingVal, sizeof(pingVal));
+        pr.slot.buff[76] = 1;
         pr.isConnected = true;
         snap.m_playerRecords.push_back(pr);
         NetRecordSnap r;
@@ -1136,11 +1330,14 @@ void testNetWorkerPoolStress()
     {
         ScoreManagerRecordSnap sm;
         std::memset(&sm, 0, sizeof(sm));
-        *reinterpret_cast<int*>(sm.record + 4)   = 400;
-        *reinterpret_cast<int*>(sm.record + 16)  = 150;
-        *reinterpret_cast<int*>(sm.record + 84)  = 350;
-        *reinterpret_cast<int*>(sm.record + 96)  = 120;
-        *reinterpret_cast<int*>(sm.record + 160) = 0;
+        sm.record[0x00] = 1;
+        sm.record[0x01] = 2;
+        int t1s = 400, t1t = 150, t2s = 350, t2t = 120;
+        std::memcpy(sm.record + 0x04, &t1s, sizeof(t1s));
+        std::memcpy(sm.record + 0x44, &t1t, sizeof(t1t));
+        std::memcpy(sm.record + 0x54, &t2s, sizeof(t2s));
+        std::memcpy(sm.record + 0x94, &t2t, sizeof(t2t));
+        sm.record[0x50] = 1;
         snap.m_scoreManagerRecords.push_back(sm);
         NetRecordSnap r;
         r.type = NetEncType::ScoreManager; r.networkableId = 108; r.typeRecordIndex = 0;
@@ -1281,6 +1478,31 @@ void testNetWorkerPoolStress()
     pool.shutdown();
     checkCond(pool.workerCount() == 0, "NetWorkerPool::shutdown() cleanly joined all worker threads");
     checkCond(allTicksExact, "NetWorkerPool 4-thread x 64-conn x 8-tick stress test: 0 bits diff & 0 spatial mismatches");
+
+    // Verify shutdown() -> restart lifecycle (regression test for m_generation reset race).
+    bool restartExact = true;
+    for (int cycle = 0; cycle < 4; ++cycle)
+    {
+        pool.ensureStarted(4);
+        pool.runParallel(kConnections, [&](std::size_t idx) {
+            jobs[idx].ok = runOneConnection(
+                jobs[idx], jobs[idx].mtBuf, jobs[idx].mtBitPos, jobs[idx].mtHighWater, jobs[idx].mtHits);
+        });
+        for (std::size_t c = 0; c < kConnections; ++c)
+        {
+            if (!jobs[c].ok
+                || jobs[c].mtBitPos != jobs[c].goldenBitPos
+                || jobs[c].mtHighWater != jobs[c].goldenHighWater
+                || jobs[c].mtHits != jobs[c].goldenHits)
+            {
+                restartExact = false;
+                break;
+            }
+        }
+        pool.shutdown();
+    }
+    checkCond(restartExact && pool.workerCount() == 0,
+              "NetWorkerPool shutdown/restart 4-cycle stress test: 0 races & bit-exact output");
 }
 
 } // anonymous namespace

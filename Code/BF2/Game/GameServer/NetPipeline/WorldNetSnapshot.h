@@ -468,7 +468,9 @@ public:
             std::memset(bitsByType, 0, sizeof(bitsByType));
         }
     };
-    void commitMainThreadSideEffects(const TypeWriteBitStats* optionalBitStats = 0) const;
+    void commitMainThreadSideEffects(
+        const TypeWriteBitStats* optionalBitStats = 0,
+        const std::vector<unsigned char>* encodedRecordFlags = 0) const;
 
 public:
     // Dense state masks from NetworkManager::updateStateMasks().
