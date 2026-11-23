@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 namespace bf2bot {
 
@@ -54,6 +55,94 @@ BitStream::BitStream(const uint8_t* buf, uint32_t sizeBytes)
       m_errorCode(0),
       m_compressionVector(),
       m_hasCompressionVector(false) {}
+
+BitStream::BitStream(const BitStream& other)
+    : m_ownedBuf(other.m_ownedBuf),
+      m_writeBuf(other.m_writeBuf),
+      m_readBuf(other.m_readBuf),
+      m_capacityBits(other.m_capacityBits),
+      m_bitLimit(other.m_bitLimit),
+      m_bitOffset(other.m_bitOffset),
+      m_highWaterBits(other.m_highWaterBits),
+      m_error(other.m_error),
+      m_errorCode(other.m_errorCode),
+      m_compressionVector(other.m_compressionVector),
+      m_hasCompressionVector(other.m_hasCompressionVector) {
+    if (!m_ownedBuf.empty()) {
+        m_writeBuf = &m_ownedBuf[0];
+        m_readBuf = &m_ownedBuf[0];
+    }
+}
+
+BitStream& BitStream::operator=(const BitStream& other) {
+    if (this == &other) {
+        return *this;
+    }
+    m_ownedBuf = other.m_ownedBuf;
+    m_writeBuf = other.m_writeBuf;
+    m_readBuf = other.m_readBuf;
+    m_capacityBits = other.m_capacityBits;
+    m_bitLimit = other.m_bitLimit;
+    m_bitOffset = other.m_bitOffset;
+    m_highWaterBits = other.m_highWaterBits;
+    m_error = other.m_error;
+    m_errorCode = other.m_errorCode;
+    m_compressionVector = other.m_compressionVector;
+    m_hasCompressionVector = other.m_hasCompressionVector;
+    if (!m_ownedBuf.empty()) {
+        m_writeBuf = &m_ownedBuf[0];
+        m_readBuf = &m_ownedBuf[0];
+    }
+    return *this;
+}
+
+BitStream::BitStream(BitStream&& other)
+    : m_ownedBuf(std::move(other.m_ownedBuf)),
+      m_writeBuf(other.m_writeBuf),
+      m_readBuf(other.m_readBuf),
+      m_capacityBits(other.m_capacityBits),
+      m_bitLimit(other.m_bitLimit),
+      m_bitOffset(other.m_bitOffset),
+      m_highWaterBits(other.m_highWaterBits),
+      m_error(other.m_error),
+      m_errorCode(other.m_errorCode),
+      m_compressionVector(other.m_compressionVector),
+      m_hasCompressionVector(other.m_hasCompressionVector) {
+    if (!m_ownedBuf.empty()) {
+        m_writeBuf = &m_ownedBuf[0];
+        m_readBuf = &m_ownedBuf[0];
+    }
+    other.m_writeBuf = nullptr;
+    other.m_readBuf = nullptr;
+    other.m_capacityBits = 0;
+    other.m_highWaterBits = 0;
+}
+
+BitStream& BitStream::operator=(BitStream&& other) {
+    if (this == &other) {
+        return *this;
+    }
+    m_ownedBuf = std::move(other.m_ownedBuf);
+    m_writeBuf = other.m_writeBuf;
+    m_readBuf = other.m_readBuf;
+    m_capacityBits = other.m_capacityBits;
+    m_bitLimit = other.m_bitLimit;
+    m_bitOffset = other.m_bitOffset;
+    m_highWaterBits = other.m_highWaterBits;
+    m_error = other.m_error;
+    m_errorCode = other.m_errorCode;
+    m_compressionVector = other.m_compressionVector;
+    m_hasCompressionVector = other.m_hasCompressionVector;
+    if (!m_ownedBuf.empty()) {
+        m_writeBuf = &m_ownedBuf[0];
+        m_readBuf = &m_ownedBuf[0];
+    }
+    other.m_writeBuf = nullptr;
+    other.m_readBuf = nullptr;
+    other.m_capacityBits = 0;
+    other.m_highWaterBits = 0;
+    return *this;
+}
 
 void BitStream::clear() {
     if (m_writeBuf && m_capacityBits > 0) {

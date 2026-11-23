@@ -1,13 +1,17 @@
 #include "LoadBotClient.h"
 
-#include <arpa/inet.h>
+#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+
+#ifndef _WIN32
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 namespace bf2bot {
 
@@ -27,7 +31,8 @@ LoadBotClient::LoadBotClient(const LoadBotConfig& cfg,
                              Telemetry* telemetry)
     : m_config(cfg),
       m_serverAddr(serverAddr),
-      m_sockFd(-1),
+      m_sockFd(kInvalidBotSocket),
+      m_rawSendHook(),
       m_playerName(),
       m_profileId(100000 + static_cast<int32_t>(cfg.botIndex + 1u)),
       m_state(BOT_DISCONNECTED),
@@ -39,6 +44,7 @@ LoadBotClient::LoadBotClient(const LoadBotConfig& cfg,
       m_lastDataPacketRxUs(0),
       m_nextDeliveryId(1u),
       m_packetGhostCount(0u),
+      m_unackedDataPackets(0u),
       m_useContentChecking(false),
       m_sentInitialJoin(false),
       m_conn(),
@@ -81,30 +87,48 @@ LoadBotClient::~LoadBotClient() {
 }
 
 bool LoadBotClient::initSocket() {
-    if (m_sockFd >= 0) {
+    if (m_sockFd != kInvalidBotSocket) {
         return true;
     }
-    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+#ifdef _WIN32
+    const BotSocket fd = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd == kInvalidBotSocket) {
+        return false;
+    }
+    u_long nonBlocking = 1u;
+    if (::ioctlsocket(fd, FIONBIO, &nonBlocking) != 0) {
+        ::closesocket(fd);
+        return false;
+    }
+    int rcvBuf = 256 * 1024;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvBuf),
+                 static_cast<int>(sizeof(rcvBuf)));
+#else
+    const BotSocket fd = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
         return false;
     }
-
     const int flags = ::fcntl(fd, F_GETFL, 0);
     if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
         ::close(fd);
         return false;
     }
-
     int rcvBuf = 256 * 1024;
     ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvBuf, sizeof(rcvBuf));
+#endif
 
     sockaddr_in localAddr;
     std::memset(&localAddr, 0, sizeof(localAddr));
     localAddr.sin_family = AF_INET;
     localAddr.sin_addr.s_addr = htonl(INADDR_ANY);
     localAddr.sin_port = htons(0);
-    if (::bind(fd, reinterpret_cast<const sockaddr*>(&localAddr), sizeof(localAddr)) < 0) {
+    if (::bind(fd, reinterpret_cast<const sockaddr*>(&localAddr),
+               static_cast<int>(sizeof(localAddr))) < 0) {
+#ifdef _WIN32
+        ::closesocket(fd);
+#else
         ::close(fd);
+#endif
         return false;
     }
 
@@ -113,9 +137,13 @@ bool LoadBotClient::initSocket() {
 }
 
 void LoadBotClient::closeSocket() {
-    if (m_sockFd >= 0) {
+    if (m_sockFd != kInvalidBotSocket) {
+#ifdef _WIN32
+        ::closesocket(m_sockFd);
+#else
         ::close(m_sockFd);
-        m_sockFd = -1;
+#endif
+        m_sockFd = kInvalidBotSocket;
     }
 }
 
@@ -126,11 +154,14 @@ uint32_t LoadBotClient::localTimeMs(uint64_t nowUs) const {
     return static_cast<uint32_t>((nowUs - m_originUs) / 1000ULL);
 }
 
-uint32_t LoadBotClient::fnv1a32(const std::string& s) {
-    uint32_t h = 2166136261u;
+uint32_t LoadBotClient::djb2LowerName(const std::string& s) {
+    uint32_t h = 5381u;
     for (size_t i = 0; i < s.size(); ++i) {
-        h ^= static_cast<uint8_t>(s[i]);
-        h *= 16777619u;
+        int c = static_cast<unsigned char>(s[i]);
+        if (std::isupper(c)) {
+            c = std::tolower(c);
+        }
+        h = static_cast<uint32_t>(c) ^ (33u * h);
     }
     return h;
 }
@@ -149,6 +180,7 @@ void LoadBotClient::resetSession(uint64_t reconnectAtUs) {
     m_lastRxUs = 0;
     m_lastDataPacketRxUs = 0;
     m_nextDeliveryId = 1u;
+    m_unackedDataPackets = 0u;
     m_useContentChecking = false;
     m_sentInitialJoin = false;
 
@@ -189,12 +221,40 @@ void LoadBotClient::resetSession(uint64_t reconnectAtUs) {
 }
 
 void LoadBotClient::sendDirectSocket(const uint8_t* data, size_t len) {
-    if (m_sockFd < 0 || !data || len == 0) {
+    if (!data || len == 0) {
         return;
     }
+    if (m_rawSendHook) {
+        m_rawSendHook(data, len);
+        return;
+    }
+    if (m_sockFd == kInvalidBotSocket) {
+        return;
+    }
+#ifdef _WIN32
+    ::sendto(m_sockFd, reinterpret_cast<const char*>(data), static_cast<int>(len), 0,
+             reinterpret_cast<const sockaddr*>(&m_serverAddr),
+             static_cast<int>(sizeof(m_serverAddr)));
+#else
     ::sendto(m_sockFd, data, len, 0,
              reinterpret_cast<const sockaddr*>(&m_serverAddr),
              static_cast<socklen_t>(sizeof(m_serverAddr)));
+#endif
+}
+
+void LoadBotClient::injectRawDatagram(const uint8_t* data, size_t len, uint64_t nowUs) {
+    if (!data || len == 0 || m_state == BOT_STOPPED) {
+        return;
+    }
+    if (m_originUs == 0) {
+        m_originUs = nowUs;
+    }
+    m_currentNowUs = nowUs;
+    if (m_downlinkImpair.isActive()) {
+        m_downlinkImpair.enqueue(nowUs, data, len);
+    } else {
+        processIncomingDatagram(data, len, nowUs);
+    }
 }
 
 void LoadBotClient::sendRawDatagram(const uint8_t* data, size_t len, uint64_t nowUs) {
@@ -212,7 +272,7 @@ void LoadBotClient::sendRawDatagram(const uint8_t* data, size_t len, uint64_t no
 }
 
 void LoadBotClient::onSocketReadable(uint64_t nowUs) {
-    if (m_sockFd < 0 || m_state == BOT_STOPPED) {
+    if (m_sockFd == kInvalidBotSocket || m_state == BOT_STOPPED) {
         return;
     }
     if (m_originUs == 0) {
@@ -223,6 +283,22 @@ void LoadBotClient::onSocketReadable(uint64_t nowUs) {
     uint8_t buf[2048];
     for (;;) {
         sockaddr_in fromAddr;
+#ifdef _WIN32
+        int fromLen = static_cast<int>(sizeof(fromAddr));
+        const int n = ::recvfrom(m_sockFd, reinterpret_cast<char*>(buf),
+                                 static_cast<int>(sizeof(buf)), 0,
+                                 reinterpret_cast<sockaddr*>(&fromAddr), &fromLen);
+        if (n < 0) {
+            const int err = ::WSAGetLastError();
+            if (err == WSAEWOULDBLOCK) {
+                break;
+            }
+            if (err == WSAECONNRESET || err == WSAEINTR) {
+                continue;
+            }
+            break;
+        }
+#else
         socklen_t fromLen = static_cast<socklen_t>(sizeof(fromAddr));
         const ssize_t n = ::recvfrom(m_sockFd, buf, sizeof(buf), 0,
                                      reinterpret_cast<sockaddr*>(&fromAddr), &fromLen);
@@ -235,6 +311,7 @@ void LoadBotClient::onSocketReadable(uint64_t nowUs) {
             }
             break;
         }
+#endif
         if (n == 0) {
             continue;
         }
@@ -346,6 +423,7 @@ void LoadBotClient::processIncomingDatagram(const uint8_t* data, size_t len, uin
         const size_t respLen = buildPingResponse(respBuf, sizeof(respBuf), m_conn,
                                                  dgram.pingTimestampMs, localTimeMs(nowUs));
         if (respLen > 0) {
+            m_unackedDataPackets = 0u;
             sendRawDatagram(respBuf, respLen, nowUs);
         }
         break;
@@ -370,6 +448,7 @@ void LoadBotClient::processIncomingDatagram(const uint8_t* data, size_t len, uin
         if (!m_conn.acceptIncomingDataSeq(dgram.seq)) {
             break; // Duplicate or out-of-window sequence
         }
+        ++m_unackedDataPackets;
         m_conn.handleRemoteAck(dgram.ack, dgram.ackMask,
             [this](uint32_t deliveryId, bool delivered) {
                 m_codec.onPacketStatus(deliveryId, delivered);
@@ -443,17 +522,20 @@ void LoadBotClient::tick30Hz(uint64_t nowUs, float dtSec) {
     }
 
     // Periodic PingRequest keepalive every 2.0 s
+    bool sentAckCarrier = false;
     if (nowUs >= m_nextPingUs) {
         uint8_t pingBuf[64];
         const size_t pingLen = buildPingRequest(pingBuf, sizeof(pingBuf), m_conn, localTimeMs(nowUs));
         if (pingLen > 0) {
+            m_unackedDataPackets = 0u;
+            sentAckCarrier = true;
             sendRawDatagram(pingBuf, pingLen, nowUs);
         }
         m_nextPingUs = nowUs + kPingIntervalUs;
     }
 
-    // Run Combat & Navigation AI when InGame
-    if (m_state == BOT_IN_GAME) {
+    // Run Combat & Navigation AI once InGame and initial JoinTeam/Kit/Spawn handshake is queued
+    if (m_state == BOT_IN_GAME && m_sentInitialJoin) {
         BotWorldView view;
         view.ownPlayerId = m_ownPlayerId;
         view.ownTeam = m_ownTeam;
@@ -494,8 +576,22 @@ void LoadBotClient::tick30Hz(uint64_t nowUs, float dtSec) {
             if (m_conn.wrapDataPacket(payload, static_cast<uint16_t>(payloadLen),
                                       deliveryId, wireBuf, sizeof(wireBuf), wireLen)) {
                 ++m_nextDeliveryId;
+                m_unackedDataPackets = 0u;
+                sentAckCarrier = true;
                 sendRawDatagram(wireBuf, wireLen, nowUs);
             }
+        }
+    }
+
+    // Keep the server's 31-packet SWConnection window flowing during handshaking bursts
+    // (initial CreateObject/CreatePlayer database) when no C->S DataPacket is being sent.
+    if (!sentAckCarrier && m_conn.hasAssignedConnId() &&
+        ((m_state == BOT_HANDSHAKING && m_unackedDataPackets > 0u) || m_unackedDataPackets >= 8u)) {
+        uint8_t pingBuf[64];
+        const size_t pingLen = buildPingRequest(pingBuf, sizeof(pingBuf), m_conn, localTimeMs(nowUs));
+        if (pingLen > 0) {
+            m_unackedDataPackets = 0u;
+            sendRawDatagram(pingBuf, pingLen, nowUs);
         }
     }
 }
@@ -504,7 +600,7 @@ void LoadBotClient::disconnectGracefully() {
     if (m_state == BOT_STOPPED) {
         return;
     }
-    if (m_conn.hasAssignedConnId() && m_sockFd >= 0) {
+    if (m_conn.hasAssignedConnId() && (m_sockFd != kInvalidBotSocket || m_rawSendHook)) {
         uint8_t discBuf[32];
         const size_t discLen = buildDisconnect(discBuf, sizeof(discBuf),
                                                static_cast<uint8_t>(m_conn.assignedConnId()), 0u);
@@ -527,7 +623,7 @@ void LoadBotClient::onChallenge(const ChallengeEventData& /*data*/) {
     std::memset(response73, 0, sizeof(response73));
     // Deterministic LAN response bytes (sv.internet 0 bypasses GameSpy CD-key validation)
     static const char kHex[] = "0123456789abcdef";
-    uint32_t h = fnv1a32(m_playerName) ^ 0x5A17C3E1u;
+    uint32_t h = djb2LowerName(m_playerName) ^ 0x5A17C3E1u;
     for (int i = 0; i < 72; ++i) {
         h = h * 1664525u + 1013904223u;
         response73[i] = static_cast<uint8_t>(kHex[(h >> 24) & 0x0Fu]);
@@ -541,11 +637,18 @@ void LoadBotClient::onChallenge(const ChallengeEventData& /*data*/) {
 
 void LoadBotClient::onServerInfo(const ServerInfoData& data) {
     m_useContentChecking = data.useContentChecking;
-    m_codec.events().queueClientInfo(m_playerName, fnv1a32(m_playerName),
-                                     m_profileId, "", "", false);
+    // Only answer join ServerInfo (requestResponse == true); periodic updates have requestResponse == false
+    // and answering them triggers a duplicate-player kick (reason 13) in GameServer::handleClientInfo.
+    if (data.requestResponse) {
+        m_codec.events().queueClientInfo(m_playerName, djb2LowerName(m_playerName),
+                                         m_profileId, "", "", false);
+    }
     if (m_config.verbose) {
-        std::fprintf(stderr, "[%s] Rx ServerInfo (contentCheck=%d) -> queued ClientInfo\n",
-                     m_playerName.c_str(), m_useContentChecking ? 1 : 0);
+        std::fprintf(stderr, "[%s] Rx ServerInfo (reqResp=%d contentCheck=%d)%s\n",
+                     m_playerName.c_str(),
+                     data.requestResponse ? 1 : 0,
+                     m_useContentChecking ? 1 : 0,
+                     data.requestResponse ? " -> queued ClientInfo" : "");
     }
 }
 
@@ -576,6 +679,7 @@ void LoadBotClient::onCreatePlayer(const CreatePlayerEventData& data) {
         m_ownPlayerId = data.playerId;
         if (data.teamId != 0) {
             m_ownTeam = static_cast<int32_t>(data.teamId);
+            m_brain.setTeam(m_ownTeam);
         }
     }
 }
@@ -688,6 +792,29 @@ void LoadBotClient::onPostRemoteEvent(const PostRemoteEventData& data) {
                              m_playerName.c_str(), m_brain.assignedTeam(), m_brain.assignedKit(), sg);
             }
         }
+    } else if (data.eventId == NRE_CONFIRM_RESET) {
+        // Round / map reset synchronization (GameClient.cpp ECNetwork 5 -> GameServer::confirmReset).
+        m_codec.events().queueConfirmReset();
+    } else if (data.eventId == NRE_PLAYER_SPAWNED && data.payload.size() >= 4u) {
+        int32_t pid = 0;
+        std::memcpy(&pid, &data.payload[0], sizeof(pid));
+        if (m_hasOwnPlayerId && pid == static_cast<int32_t>(m_ownPlayerId)) {
+            const bool wasAlive = m_ownAlive && !m_ownManDown;
+            m_ownAlive = true;
+            m_ownManDown = false;
+            if (!wasAlive && m_hasOwnPos) {
+                m_brain.onSpawned(m_ownPos, m_currentNowUs);
+            }
+        }
+    } else if (data.eventId == NRE_PLAYER_KILLED && data.payload.size() >= 4u) {
+        int32_t pid = 0;
+        std::memcpy(&pid, &data.payload[0], sizeof(pid));
+        if (m_hasOwnPlayerId && pid == static_cast<int32_t>(m_ownPlayerId)) {
+            if (m_ownAlive) {
+                m_ownAlive = false;
+                m_brain.onDied(m_currentNowUs);
+            }
+        }
     }
 }
 
@@ -704,6 +831,8 @@ void LoadBotClient::onBeginRound(const BeginRoundEventData& /*data*/) {
 }
 
 void LoadBotClient::onEndOfRound(const EndOfRoundEventData& /*data*/) {
+    // Acknowledge end-of-round guard so GameServer::waitForClients does not stall waiting on bots.
+    m_codec.events().queueEndOfRoundAck();
 }
 
 // ============================================================================
@@ -792,6 +921,7 @@ void LoadBotClient::onPlayerGhost(const PlayerGhostState& data) {
     if (m_hasOwnPlayerId && pid == m_ownPlayerId) {
         if (data.hasTeam && data.team != 0) {
             m_ownTeam = data.team;
+            m_brain.setTeam(m_ownTeam);
         }
         const bool prevAlive = m_ownAlive && !m_ownManDown;
         if (data.hasIsAlive) {
@@ -831,8 +961,9 @@ void LoadBotClient::onSoldierGhost(const SoldierGhostState& data) {
     }
     if (data.hasPose) {
         s.pose = data.pose;
-        s.isRagdoll = data.isRagdoll;
     }
+    // Ragdoll flag (mask bit 0x8000) can be set independently of pose (0x20).
+    s.isRagdoll = data.isRagdoll;
     if (data.hasHitPoints) {
         s.hitPointsByte = data.hitPointsByte;
     }

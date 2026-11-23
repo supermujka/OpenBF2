@@ -3,7 +3,6 @@
 #include "RouteLoader.h"
 #include "Telemetry.h"
 
-#include <arpa/inet.h>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -13,15 +12,34 @@
 #include <cstring>
 #include <limits>
 #include <memory>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <poll.h>
 #include <string>
-#include <sys/socket.h>
 #include <utility>
 #include <vector>
 
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#endif
+
 namespace {
+
+#ifdef _WIN32
+struct WinsockGuard {
+    bool ok;
+    WinsockGuard() : ok(false) {
+        WSADATA wsa;
+        ok = (::WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
+    }
+    ~WinsockGuard() {
+        if (ok) {
+            ::WSACleanup();
+        }
+    }
+};
+#endif
 
 volatile sig_atomic_t g_stopRequested = 0;
 
@@ -197,7 +215,11 @@ bool resolveServerAddress(const std::string& host, uint16_t port, sockaddr_in& o
     addrinfo* res = nullptr;
     const int rc = ::getaddrinfo(host.c_str(), portStr, &hints, &res);
     if (rc != 0 || !res) {
+#ifdef _WIN32
+        std::fprintf(stderr, "Failed to resolve host '%s': error %d\n", host.c_str(), rc);
+#else
         std::fprintf(stderr, "Failed to resolve host '%s': %s\n", host.c_str(), ::gai_strerror(rc));
+#endif
         return false;
     }
 
@@ -235,6 +257,15 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+#ifdef _WIN32
+    WinsockGuard winsock;
+    if (!winsock.ok) {
+        std::fprintf(stderr, "[LoadBot] WSAStartup failed\n");
+        return 1;
+    }
+    std::signal(SIGINT, handleSignal);
+    std::signal(SIGTERM, handleSignal);
+#else
     // Install POSIX signal handlers for graceful disconnect + final summary.
     struct sigaction sa;
     std::memset(&sa, 0, sizeof(sa));
@@ -242,6 +273,7 @@ int main(int argc, char** argv) {
     sigemptyset(&sa.sa_mask);
     ::sigaction(SIGINT, &sa, nullptr);
     ::sigaction(SIGTERM, &sa, nullptr);
+#endif
 
     sockaddr_in serverAddr;
     if (!resolveServerAddress(opt.host, opt.port, serverAddr)) {
@@ -315,8 +347,13 @@ int main(int argc, char** argv) {
             &telemetry));
 
         if (!bot->initSocket()) {
+#ifdef _WIN32
+            std::fprintf(stderr, "[LoadBot] Failed to create UDP socket for bot %u (wsaErr=%d)\n",
+                         i, ::WSAGetLastError());
+#else
             std::fprintf(stderr, "[LoadBot] Failed to create UDP socket for bot %u (errno=%d)\n",
                          i, errno);
+#endif
             return 1;
         }
         bots.push_back(std::move(bot));
@@ -338,9 +375,14 @@ int main(int argc, char** argv) {
 
     uint64_t nextTickUs = startUs;
     uint64_t lastTickUs = startUs;
+    uint64_t lastReportUs = startUs;
     uint64_t nextReportUs = startUs + reportPeriodUs;
 
+#ifdef _WIN32
+    std::vector<WSAPOLLFD> pollFds(bots.size());
+#else
     std::vector<pollfd> pollFds(bots.size());
+#endif
 
     while (!g_stopRequested) {
         const uint64_t nowUs = steadyNowUs();
@@ -374,7 +416,11 @@ int main(int argc, char** argv) {
             pollFds[i].revents = 0;
         }
 
+#ifdef _WIN32
+        const int ready = ::WSAPoll(pollFds.data(), static_cast<ULONG>(pollFds.size()), timeoutMs);
+#else
         const int ready = ::poll(pollFds.data(), static_cast<nfds_t>(pollFds.size()), timeoutMs);
+#endif
         const uint64_t afterPollUs = steadyNowUs();
 
         if (ready > 0) {
@@ -407,9 +453,11 @@ int main(int argc, char** argv) {
         if (afterPollUs >= nextReportUs) {
             updateBotCounts(bots, telemetry);
             const double elapsedSec = static_cast<double>(afterPollUs - startUs) / 1000000.0;
-            std::printf("%s\n", telemetry.formatReport("INTERVAL", elapsedSec).c_str());
+            const double windowSec = static_cast<double>(afterPollUs - lastReportUs) / 1000000.0;
+            std::printf("%s\n", telemetry.formatReport("INTERVAL", elapsedSec, windowSec).c_str());
             std::fflush(stdout);
             telemetry.resetWindow();
+            lastReportUs = afterPollUs;
             nextReportUs = afterPollUs + reportPeriodUs;
         }
     }
@@ -422,7 +470,8 @@ int main(int argc, char** argv) {
     }
 
     const double totalElapsedSec = static_cast<double>(finishUs - startUs) / 1000000.0;
-    std::printf("\n%s\n", telemetry.formatReport("FINAL A/B SUMMARY", totalElapsedSec).c_str());
+    const double lastWindowSec = static_cast<double>(finishUs - lastReportUs) / 1000000.0;
+    std::printf("\n%s\n", telemetry.formatReport("FINAL A/B SUMMARY", totalElapsedSec, lastWindowSec).c_str());
     std::fflush(stdout);
     return 0;
 }

@@ -164,6 +164,15 @@ public:
 
     uint32_t botIndex() const { return m_botIndex; }
     int32_t assignedTeam() const { return m_team; }
+    void setTeam(int32_t team) {
+        if (team > 0 && team != m_team) {
+            m_team = team;
+            m_hasRouteTrack = false;
+            m_hasPatrolGoal = false;
+            m_waypoints.clear();
+            m_waypointIdx = 0;
+        }
+    }
     int32_t assignedKit() const { return m_kit; }
 
     int32_t pickSpawnGroup(const std::map<uint8_t, TrackedSpawnGroup>& spawnGroups);

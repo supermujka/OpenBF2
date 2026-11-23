@@ -28,7 +28,7 @@
 ---
 
 ### Faza 2 — Standalone headless 64-player klijent `bf2_loadbot`
-Svi fajlovi se nalaze u `Code/Tools/LoadBot/` i kompajliraju se kao nezavisan C++14 Linux izvršni fajl `bf2_loadbot` (bez zavisnosti od `Code/BF2/` engine biblioteka):
+Svi fajlovi se nalaze u `Code/Tools/LoadBot/` i kompajliraju se kao nezavisan C++14 izvršni fajl `bf2_loadbot` na Linux-u (POSIX soketi) i nativno na Windowsu (`bf2_loadbot.exe`, Winsock2 / `WSAPoll`), bez ikakve zavisnosti od `Code/BF2/` engine biblioteka:
 
 - **Wire & transport sloj (`WireBitStream.{h,cpp}`, `SWTransport.{h,cpp}`, `Bf2Protocol.{h,cpp}`):**
   - Bit-level stream (`1472 B` max datagram, `1458 B` max payload, `9 B` data header).
@@ -93,10 +93,28 @@ g++ -std=c++14 -fno-strict-aliasing -pthread -I Code/BF2 -I Code/Tools/LoadBot \
     Code/Tools/LoadBot/NetImpairment.cpp \
     Code/Tools/LoadBot/Telemetry.cpp \
     Code/Tools/LoadBot/BotBrain.cpp \
+    Code/Tools/LoadBot/LoadBotClient.cpp \
     -o /tmp/bf2_loadbot_tests && /tmp/bf2_loadbot_tests
 ```
 
-### C) Python statička verifikacija (`verify_loadbot_64p.py`)
+### C) Nativni Windows (MSVC) build za `bf2_loadbot.exe` i `bf2_loadbot_tests.exe`
+Iz *x64 Native Tools Command Prompt for VS 2022* (ili nakon `vcvarsall.bat x64`), `bf2_loadbot.exe` se kompajlira nativno preko Winsock2 (`ws2_32.lib`, bez potrebe za WSL2):
+```bat
+cl /nologo /std:c++14 /EHsc /O2 /W3 /I Code\Tools\LoadBot ^
+    Code\Tools\LoadBot\WireBitStream.cpp ^
+    Code\Tools\LoadBot\SWTransport.cpp ^
+    Code\Tools\LoadBot\Bf2Protocol.cpp ^
+    Code\Tools\LoadBot\NavMesh.cpp ^
+    Code\Tools\LoadBot\RouteLoader.cpp ^
+    Code\Tools\LoadBot\NetImpairment.cpp ^
+    Code\Tools\LoadBot\Telemetry.cpp ^
+    Code\Tools\LoadBot\BotBrain.cpp ^
+    Code\Tools\LoadBot\LoadBotClient.cpp ^
+    Code\Tools\LoadBot\main.cpp ^
+    ws2_32.lib /Fe:bf2_loadbot.exe
+```
+
+### D) Python statička verifikacija (`verify_loadbot_64p.py`)
 Proverava granu, nultu ABI/layout/vtable promenu u `Code/BF2/`, default `sv-record-routes = 0`, strogi C++14 standard, izolaciju `LoadBot` include-ova, binarnu parnost `RouteFormat.h` vs `RouteActionRecorder.h` (`32 B` / `36 B`) i CMake targete:
 ```bash
 python3 scripts/verify_loadbot_64p.py
@@ -213,6 +231,7 @@ g++ -std=c++14 -O2 -fno-strict-aliasing -pthread -I Code/BF2 -I Code/Tools/LoadB
     Code/Tools/LoadBot/NetImpairment.cpp \
     Code/Tools/LoadBot/Telemetry.cpp \
     Code/Tools/LoadBot/BotBrain.cpp \
+    Code/Tools/LoadBot/LoadBotClient.cpp \
     -o ./bf2_loadbot_tests && ./bf2_loadbot_tests
 
 # Standalone bf2_loadbot binarni fajl
@@ -242,8 +261,14 @@ taskset -c 3 ./bf2_loadbot --host 127.0.0.1 --port 16567 \
     --duration-sec 0 --navmesh ~/bf2_nav/karkand --seed 1337
 ```
 
-### C) Pokretanje sa Windows PC-a kroz WSL2 (Ubuntu)
-`bf2_loadbot` koristi Linux/POSIX UDP sokete, ali se na Windowsu može pokrenuti direktno kroz WSL2:
+### C) Pokretanje sa Windows PC-a (nativno `bf2_loadbot.exe` ili kroz WSL2)
+`bf2_loadbot` sada podržava nativni Windows build (Winsock2 / `WSAPoll`) putem MSVC-a (vidi sekciju 3C iznad), tako da ga možeš pokrenuti direktno iz PowerShell-a/CMD-a bez WSL2:
+```powershell
+.\bf2_loadbot.exe --host <IP_SERVERA_1> --port 16567 `
+    --bots 62 --ping-ms 0 --jitter-ms 0 --loss-pct 0 `
+    --duration-sec 0 --navmesh C:\bf2_nav\karkand
+```
+Alternativno, na Windowsu se može pokrenuti i Linux build kroz WSL2 (Ubuntu):
 1. U PowerShell-u (Admin): `wsl --install -d Ubuntu` (jednokratno + restart).
 2. U Ubuntu terminalu: `sudo apt update && sudo apt install -y build-essential cmake ninja-build git python3 unzip`.
 3. Kloniraj u Linux home (`~/OpenBF2`, ne pod `/mnt/c/` radi brzine kompajliranja) i izgradi po gornjim `g++` ili `cmake` komandama.

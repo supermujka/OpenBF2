@@ -298,14 +298,17 @@ TelemetrySummary Telemetry::getTotalSummary() const {
     return buildSummary(m_total);
 }
 
-std::string Telemetry::formatReport(const std::string& label, double elapsedSec) const {
+std::string Telemetry::formatReport(const std::string& label, double elapsedSec, double windowSec) const {
     std::lock_guard<std::mutex> lock(m_mutex);
     const TelemetrySummary win = buildSummary(m_window);
     const TelemetrySummary tot = buildSummary(m_total);
 
-    const double safeSec = (elapsedSec > 0.001) ? elapsedSec : 1.0;
-    const double winRxMbps = (static_cast<double>(win.bytesRx) * 8.0) / (safeSec * 1000000.0);
-    const double winTxMbps = (static_cast<double>(win.bytesTx) * 8.0) / (safeSec * 1000000.0);
+    const double safeElapsedSec = (elapsedSec > 0.001) ? elapsedSec : 1.0;
+    const double safeWindowSec = (windowSec > 0.001) ? windowSec : safeElapsedSec;
+    const double winRxMbps = (static_cast<double>(win.bytesRx) * 8.0) / (safeWindowSec * 1000000.0);
+    const double winTxMbps = (static_cast<double>(win.bytesTx) * 8.0) / (safeWindowSec * 1000000.0);
+    const double totRxMbps = (static_cast<double>(tot.bytesRx) * 8.0) / (safeElapsedSec * 1000000.0);
+    const double totTxMbps = (static_cast<double>(tot.bytesTx) * 8.0) / (safeElapsedSec * 1000000.0);
 
     std::ostringstream oss;
     oss << "=== LoadBot Telemetry [" << label << "] (" << fmtDouble(elapsedSec, 1) << "s) ===\n";
@@ -331,8 +334,10 @@ std::string Telemetry::formatReport(const std::string& label, double elapsedSec)
         << fmtDouble(win.gapMsP99, 1) << "/"
         << fmtDouble(win.maxGapMs, 1) << " ms)\n";
 
-    oss << "  Total  : rx=" << tot.packetsRx << " pkts (" << tot.bytesRx << " B, ghosts="
-        << tot.ghostsTotal << ") | tx=" << tot.packetsTx << " pkts (" << tot.bytesTx << " B)\n";
+    oss << "  Total  : rx=" << tot.packetsRx << " pkts (" << tot.bytesRx << " B, "
+        << fmtDouble(totRxMbps, 2) << " Mbps, ghosts=" << tot.ghostsTotal << ")"
+        << " | tx=" << tot.packetsTx << " pkts (" << tot.bytesTx << " B, "
+        << fmtDouble(totTxMbps, 2) << " Mbps)\n";
 
     oss << "  TotHz  : tot p50/p95/p99="
         << fmtDouble(tot.snapHzP50, 1) << "/"

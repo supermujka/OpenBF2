@@ -10,7 +10,11 @@
 //       Code/Tools/LoadBot/RouteLoader.cpp \
 //       Code/Tools/LoadBot/NetImpairment.cpp \
 //       Code/Tools/LoadBot/Telemetry.cpp \
+//       Code/Tools/LoadBot/BotBrain.cpp \
+//       Code/Tools/LoadBot/LoadBotClient.cpp \
 //       -o /tmp/bf2_loadbot_tests && /tmp/bf2_loadbot_tests
+
+#include "../Tools/LoadBot/LoadBotClient.h"
 
 #include "../BF2/Core/Debug.h"
 #include "../BF2/IO/BitStream.h"
@@ -34,6 +38,14 @@
 #include <fstream>
 #include <string>
 #include <vector>
+
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 // Minimal dice::hfe::Debug stub required by ../BF2/IO/BitStream.cpp (matches net_pipeline_golden_test.cpp).
 namespace dice {
@@ -314,7 +326,8 @@ void testSWTransport()
     checkCond(reqLen == 78u, "SWTransport buildConnectRequest is 78 bytes");
 
     {
-        bf2bot::BitStream bs(buf, static_cast<uint32_t>(reqLen));
+        const uint8_t* const readBuf = buf;
+        bf2bot::BitStream bs(readBuf, static_cast<uint32_t>(reqLen));
         const uint32_t type = bs.readUInt(4);
         const uint32_t connId = bs.readUInt(8);
         const uint32_t protoVer = bs.readUInt(32);
@@ -475,9 +488,19 @@ void testPlayerActionManager()
 
     bf2bot::BitStream bs(256u);
     checkCond(sender.transmit(bs), "PlayerActionSender::transmit wrote actions");
-    // 1 (present) + 4 (count) + 9 (interp) + 32 (baseIndex) + 3 * 144 = 478 bits
-    checkCond(bs.getBitOffset() == 478u,
-              "PlayerActionManager exact 3-slot 144-bit wire size (478 bits)");
+    // 1 (present) + 4 (count) + 9 (interp) + 32 (baseIndex) + 3 * 138 (6*16 + 32 + 9 + 1) = 460 bits
+    checkCond(bs.getBitOffset() == 460u,
+              "PlayerActionManager exact 3-slot 138-bit wire size (460 bits)");
+
+    // Verify skipIncoming advances to the exact same bit offset as transmit
+    {
+        bf2bot::BitStream skipReader(bs.data(), bs.getByteSize());
+        skipReader.setBitSize(bs.getBitSize());
+        checkCond(bf2bot::PlayerActionSender::skipIncoming(skipReader) &&
+                  skipReader.getBitOffset() == bs.getBitOffset() &&
+                  !skipReader.hasError(),
+                  "PlayerActionSender::skipIncoming exact 138-bit/slot parity");
+    }
 
     bf2bot::BitStream reader(bs.data(), bs.getByteSize());
     reader.setBitSize(bs.getBitSize());
@@ -661,7 +684,8 @@ void testGameEventManager()
 
         if (reassembled.size() == dbLen && dbLen > 0)
         {
-            bf2bot::BitStream ci(&reassembled[0], static_cast<uint32_t>(reassembled.size()));
+            const uint8_t* const ciBuf = &reassembled[0];
+            bf2bot::BitStream ci(ciBuf, static_cast<uint32_t>(reassembled.size()));
             checkCond(ci.readStringU16() == "LoadBot_Alpha" &&
                       ci.readUInt(32) == 0xDEADBEEFu &&
                       ci.readSignedMag(32) == 4242 &&
@@ -1444,11 +1468,570 @@ void testTelemetryAndSlidingDetector()
               nearDouble(sum.maxEnemyGapMs, 250.0, 0.01),
               "Telemetry nearby-enemy (<50m) sliding detector counts >100ms & >200ms while ignoring 80m");
 
-    const std::string report = tel.formatReport("64p-unit", 10.0);
+    const std::string report = tel.formatReport("64p-unit", 100.0, 10.0);
     checkCond(!report.empty() &&
               report.find("LoadBot Telemetry [64p-unit]") != std::string::npos &&
               report.find("Slide") != std::string::npos,
               "Telemetry::formatReport produces formatted summary");
+}
+
+// ============================================================================
+// Test 10: End-to-end handshake, gameplay, ragdoll, EOR & impairment harness
+// ============================================================================
+void testLoopbackHandshakeAndGameplay()
+{
+#ifdef _WIN32
+    WSADATA wsa;
+    if (::WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+    {
+        checkCond(false, "Loopback test WSAStartup");
+        return;
+    }
+#endif
+
+    sockaddr_in srvAddr;
+    std::memset(&srvAddr, 0, sizeof(srvAddr));
+    srvAddr.sin_family = AF_INET;
+    srvAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    srvAddr.sin_port = htons(19999u);
+
+    bf2bot::Telemetry telemetry;
+    bf2bot::LoadBotConfig cfg;
+    cfg.botIndex = 0u;
+    cfg.modName = "mods/bf2";
+    cfg.worldSize = 1024.0f;
+    cfg.seed = 42u;
+    cfg.startAtUs = 1000000ULL;
+    cfg.uplinkImpair.oneWayDelayMs = 15.0;
+    cfg.uplinkImpair.jitterMs = 3.0;
+    cfg.uplinkImpair.lossPct = 0.0;
+    cfg.uplinkImpair.seed = 101u;
+    cfg.downlinkImpair.oneWayDelayMs = 15.0;
+    cfg.downlinkImpair.jitterMs = 3.0;
+    cfg.downlinkImpair.lossPct = 0.0;
+    cfg.downlinkImpair.seed = 202u;
+
+    bf2bot::LoadBotClient bot(cfg, srvAddr, nullptr, nullptr, &telemetry);
+    checkCond(bot.initSocket(), "LoadBotClient::initSocket succeeds");
+
+    // In-memory bidirectional datagram queues (sandbox-safe & 100% deterministic)
+    std::deque<std::vector<uint8_t> > c2sQueue;
+    std::deque<std::vector<uint8_t> > s2cQueue;
+    bot.setRawSendHook([&](const uint8_t* data, size_t len) {
+        c2sQueue.push_back(std::vector<uint8_t>(data, data + len));
+    });
+
+    const uint8_t kConnId = 7u;
+    bf2bot::SWConnectionState srvConn;
+    srvConn.setAssignedConnId(kConnId);
+    uint32_t srvNextBlockIdx = 0u;
+    uint32_t srvDeliveryId = 1u;
+
+    auto sendSrvRaw = [&](const uint8_t* data, size_t len) {
+        if (!data || len == 0) return;
+        s2cQueue.push_back(std::vector<uint8_t>(data, data + len));
+    };
+
+    auto sendSrvDataPayload = [&](const uint8_t* payload, size_t payloadLen) {
+        uint8_t wire[bf2bot::kMaxDatagramSize];
+        size_t wireLen = 0;
+        if (srvConn.wrapDataPacket(payload, static_cast<uint16_t>(payloadLen),
+                                   srvDeliveryId++, wire, sizeof(wire), wireLen))
+        {
+            sendSrvRaw(wire, wireLen);
+        }
+    };
+
+    auto sendSrvEvents = [&](const std::vector<bf2bot::BitStream>& evs) {
+        bf2bot::BitStream pkt(bf2bot::kMaxDataPayloadSize);
+        pkt.writeBool(false); // PlayerActionManager present = 0
+        pkt.writeBool(true);  // GameEventManager present = 1
+        pkt.writeUInt(static_cast<uint32_t>(evs.size()), 8);
+        pkt.writeUInt(srvNextBlockIdx & 31u, 5);
+        ++srvNextBlockIdx;
+        pkt.writeBool(false); // isResend
+        for (size_t i = 0; i < evs.size(); ++i)
+        {
+            pkt.writeBits(evs[i].data(), evs[i].getBitSize());
+        }
+        pkt.writeBool(false); // GhostManager present = 0
+        sendSrvDataPayload(pkt.data(), pkt.getByteSize());
+    };
+
+    auto appendDataBlockEvents = [&](std::vector<bf2bot::BitStream>& evs,
+                                     uint32_t blockId, const uint8_t* bytes, uint32_t len) {
+        bf2bot::BitStream hdr(32u);
+        hdr.writeUInt(bf2bot::GE_DATA_BLOCK, bf2bot::kGameEventTypeBits);
+        hdr.writeBool(true);
+        hdr.writeUInt(blockId, 32);
+        hdr.writeUInt(len, 32);
+        evs.push_back(hdr);
+
+        uint32_t off = 0u;
+        while (off < len)
+        {
+            uint32_t chunk = len - off;
+            if (chunk > bf2bot::kDataBlockMaxChunkSize) chunk = bf2bot::kDataBlockMaxChunkSize;
+            bf2bot::BitStream ch(96u);
+            ch.writeUInt(bf2bot::GE_DATA_BLOCK, bf2bot::kGameEventTypeBits);
+            ch.writeBool(false);
+            ch.writeUInt(chunk, 8);
+            ch.writeFixedBytes(bytes + off, chunk);
+            evs.push_back(ch);
+            off += chunk;
+        }
+    };
+
+    bool gotConnectReq = false;
+    bool gotConnectAck = false;
+    bool gotChallengeResp = false;
+    int clientInfoCount = 0;
+    uint32_t clientInfoHash = 0u;
+    bool gotMapLoaded = false;
+    bool gotClientReady = false;
+    bool gotConnType = false;
+    bool gotJoinTeam = false;
+    bool gotSelectKit = false;
+    bool gotSelectSpawn = false;
+    bool gotPlayerAction = false;
+    bool gotEndOfRoundAck = false;
+    bool gotConfirmReset = false;
+    bool gotDisconnect = false;
+
+    bool sentChallenge = false;
+    bool sentDbComplete = false;
+    bool sentReadyAck = false;
+    bool sentSpawnGhost = false;
+    bool sentRagdollGhost = false;
+    bool sentEorAndReset = false;
+
+    // Client->Server DataBlock accumulator for verifying ClientInfo
+    bool rxDbActive = false;
+    uint32_t rxDbId = 0u;
+    uint32_t rxDbLen = 0u;
+    std::vector<uint8_t> rxDbBuf;
+
+    auto drainServerSocket = [&]() {
+        while (!c2sQueue.empty())
+        {
+            const std::vector<uint8_t> pkt = c2sQueue.front();
+            c2sQueue.pop_front();
+            const uint8_t* buf = pkt.empty() ? nullptr : &pkt[0];
+            const size_t n = pkt.size();
+            if (!buf || n == 0) continue;
+
+            bf2bot::ParsedDatagram dg;
+            if (!bf2bot::parseIncomingDatagram(buf, n, dg)) continue;
+
+            if (dg.type == bf2bot::UDP_CONNECT_REQUEST)
+            {
+                gotConnectReq = true;
+                uint8_t acc[16];
+                std::memset(acc, 0, sizeof(acc));
+                bf2bot::BitStream bs(acc, sizeof(acc));
+                bs.writeUInt(bf2bot::UDP_CONNECT_ACCEPT, 4);
+                bs.writeUInt(0u, 8);
+                bs.writeUInt(kConnId, 8);
+                bs.writeUInt(1000u, 32);
+                bs.writeBool(false);
+                sendSrvRaw(acc, bs.getByteSize());
+            }
+            else if (dg.type == bf2bot::UDP_CONNECT_ACCEPT_ACK)
+            {
+                gotConnectAck = true;
+                if (!sentChallenge)
+                {
+                    sentChallenge = true;
+                    std::vector<bf2bot::BitStream> evs;
+                    bf2bot::BitStream ch(32u);
+                    ch.writeUInt(bf2bot::GE_CHALLENGE, bf2bot::kGameEventTypeBits);
+                    const uint8_t chal[10] = { 1,2,3,4,5,6,7,8,9,10 };
+                    ch.writeFixedBytes(chal, 10u);
+                    ch.writeUInt(8u, 8);
+                    ch.writeFixedBytes("mods/bf2", 8u);
+                    evs.push_back(ch);
+                    sendSrvEvents(evs);
+                }
+            }
+            else if (dg.type == bf2bot::UDP_DISCONNECT)
+            {
+                gotDisconnect = true;
+            }
+            else if (dg.type == bf2bot::UDP_PING_REQUEST)
+            {
+                srvConn.handleRemoteAck(dg.ack, dg.ackMask, bf2bot::PacketStatusCallback());
+                uint8_t pr[64];
+                const size_t prLen = bf2bot::buildPingResponse(pr, sizeof(pr), srvConn,
+                                                               dg.pingTimestampMs, 2000u);
+                sendSrvRaw(pr, prLen);
+            }
+            else if (dg.type == bf2bot::UDP_DATA_PACKET)
+            {
+                if (!srvConn.acceptIncomingDataSeq(dg.seq)) continue;
+                srvConn.handleRemoteAck(dg.ack, dg.ackMask, bf2bot::PacketStatusCallback());
+
+                bf2bot::BitStream bs(dg.payload, dg.payloadLen);
+                // 0: PlayerActionManager
+                const uint32_t posBeforeAct = bs.getBitOffset();
+                if (!bf2bot::PlayerActionSender::skipIncoming(bs)) continue;
+                if (bs.getBitOffset() > posBeforeAct + 1u)
+                {
+                    gotPlayerAction = true;
+                }
+
+                // 1: GameEventManager
+                const bool evPresent = bs.readBool();
+                if (evPresent && !bs.hasError())
+                {
+                    const uint32_t evCount = bs.readUInt(8);
+                    bs.readUInt(5); // blockIndex
+                    bs.readBool();  // isResend
+                    for (uint32_t i = 0; i < evCount && !bs.hasError(); ++i)
+                    {
+                        const uint32_t tid = bs.readUInt(bf2bot::kGameEventTypeBits);
+                        if (tid == bf2bot::GE_CHALLENGE_RESPONSE)
+                        {
+                            bs.skipBits(73u * 8u + 32u + 32u + 32u);
+                            gotChallengeResp = true;
+                            // Reply with ServerInfo (requestResponse=true)
+                            std::vector<uint8_t> siBytes;
+                            buildServerInfoBlock(siBytes);
+                            std::vector<bf2bot::BitStream> evs;
+                            appendDataBlockEvents(evs, bf2bot::DB_SERVER_INFO,
+                                                  &siBytes[0], static_cast<uint32_t>(siBytes.size()));
+                            sendSrvEvents(evs);
+                        }
+                        else if (tid == bf2bot::GE_CONNECTION_TYPE)
+                        {
+                            bs.skipBits(3u);
+                            gotConnType = true;
+                        }
+                        else if (tid == bf2bot::GE_DATA_BLOCK)
+                        {
+                            const bool isNew = bs.readBool();
+                            if (isNew)
+                            {
+                                rxDbActive = true;
+                                rxDbId = bs.readUInt(32);
+                                rxDbLen = bs.readUInt(32);
+                                rxDbBuf.clear();
+                            }
+                            else
+                            {
+                                const uint32_t sz = bs.readUInt(8);
+                                const size_t oldSz = rxDbBuf.size();
+                                rxDbBuf.resize(oldSz + sz);
+                                if (sz > 0) bs.readFixedBytes(&rxDbBuf[oldSz], sz);
+                                if (rxDbActive && rxDbBuf.size() >= rxDbLen)
+                                {
+                                    if (rxDbId == bf2bot::DB_CLIENT_INFO && rxDbLen > 0)
+                                    {
+                                        ++clientInfoCount;
+                                        const uint8_t* ptr = &rxDbBuf[0];
+                                        bf2bot::BitStream ci(ptr, rxDbLen);
+                                        ci.readStringU16();
+                                        clientInfoHash = ci.readUInt(32);
+                                        if (clientInfoCount == 1)
+                                        {
+                                            // Send a periodic ServerInfo with requestResponse=false (must NOT trigger another ClientInfo!)
+                                            bf2bot::BitStream si2(256u);
+                                            si2.writeStringU16("OpenBF2");
+                                            si2.writeUInt(0u, 16);
+                                            si2.writeBool(false); // requestResponse = false
+                                            si2.writeUInt(0u, 6);
+                                            si2.writeUInt(0u, 32);
+                                            si2.writeUInt(0u, 16);
+                                            si2.writeUInt(0u, 16);
+                                            si2.writeSignedMag(0, 32);
+                                            si2.writeUInt(16567u, 16);
+                                            si2.writeSignedMag(0, 32);
+                                            si2.writeSignedMag(0, 32);
+                                            si2.writeSignedMag(0, 32);
+                                            si2.writeBool(false);
+
+                                            std::vector<uint8_t> mapBytes;
+                                            buildMapInfoBlock(mapBytes);
+
+                                            std::vector<bf2bot::BitStream> evs;
+                                            appendDataBlockEvents(evs, bf2bot::DB_SERVER_INFO,
+                                                                  si2.data(), si2.getByteSize());
+                                            appendDataBlockEvents(evs, bf2bot::DB_MAP_INFO,
+                                                                  &mapBytes[0], static_cast<uint32_t>(mapBytes.size()));
+                                            sendSrvEvents(evs);
+                                        }
+                                    }
+                                    rxDbActive = false;
+                                }
+                            }
+                        }
+                        else if (tid == bf2bot::GE_POST_REMOTE)
+                        {
+                            const uint32_t cat = bs.readUInt(4);
+                            const uint32_t eid = bs.readUInt(32);
+                            bs.readFloat();
+                            const uint32_t plen = bs.readUInt(8);
+                            if (plen > 0) bs.skipBits(plen * 8u);
+                            if (cat == bf2bot::EC_NETWORK)
+                            {
+                                if (eid == bf2bot::NRE_MAP_LOADED)
+                                {
+                                    gotMapLoaded = true;
+                                    if (!sentDbComplete)
+                                    {
+                                        sentDbComplete = true;
+                                        std::vector<bf2bot::BitStream> evs;
+                                        // Own player (id=5, team=1, isRemote=false)
+                                        bf2bot::BitStream cp(64u);
+                                        cp.writeUInt(bf2bot::GE_CREATE_PLAYER, bf2bot::kGameEventTypeBits);
+                                        cp.writeUInt(1u, 3);
+                                        cp.writeUInt(1u, 4);
+                                        cp.writeBool(false);
+                                        cp.writeUInt(5u, 8);
+                                        cp.writeUInt(6u, 16);
+                                        cp.writeUInt(0u, 16);
+                                        cp.writeBool(false);
+                                        char nm[32];
+                                        std::memset(nm, 0, sizeof(nm));
+                                        std::memcpy(nm, " LoadBot_01", 11);
+                                        cp.writeFixedBytes(nm, 32u);
+                                        evs.push_back(cp);
+
+                                        // Enemy player (id=6, team=2, isRemote=true)
+                                        bf2bot::BitStream ep(64u);
+                                        ep.writeUInt(bf2bot::GE_CREATE_PLAYER, bf2bot::kGameEventTypeBits);
+                                        ep.writeUInt(2u, 3);
+                                        ep.writeUInt(2u, 4);
+                                        ep.writeBool(true);
+                                        ep.writeUInt(6u, 8);
+                                        ep.writeUInt(7u, 16);
+                                        ep.writeUInt(0u, 16);
+                                        ep.writeBool(false);
+                                        std::memset(nm, 0, sizeof(nm));
+                                        std::memcpy(nm, " Enemy_01", 9);
+                                        ep.writeFixedBytes(nm, 32u);
+                                        evs.push_back(ep);
+
+                                        // Spawn group for team 1
+                                        bf2bot::BitStream sg(32u);
+                                        sg.writeUInt(bf2bot::GE_CREATE_SPAWN_GROUP, bf2bot::kGameEventTypeBits);
+                                        sg.writeUInt(1u, 8);
+                                        sg.writeUInt(1u, 4);
+                                        sg.writeBool(true);
+                                        sg.writeBool(false);
+                                        sg.writeBool(true);
+                                        sg.writeUInt(128u, 8);
+                                        sg.writeUInt(128u, 8);
+                                        sg.writeUInt(515u, 16);
+                                        evs.push_back(sg);
+
+                                        // Enemy enters soldier netId=710
+                                        bf2bot::BitStream ev(16u);
+                                        ev.writeUInt(bf2bot::GE_ENTER_VEHICLE, bf2bot::kGameEventTypeBits);
+                                        ev.writeUInt(6u, 8);
+                                        ev.writeUInt(710u, 16);
+                                        ev.writeBool(true);
+                                        evs.push_back(ev);
+
+                                        // BeginRound + DBComplete (ECNetwork, 4)
+                                        bf2bot::BitStream br(16u);
+                                        br.writeUInt(bf2bot::GE_BEGIN_ROUND, bf2bot::kGameEventTypeBits);
+                                        br.writeUInt(2u, 32);
+                                        br.writeUInt(0u, 32);
+                                        evs.push_back(br);
+
+                                        bf2bot::BitStream dbc(16u);
+                                        dbc.writeUInt(bf2bot::GE_POST_REMOTE, bf2bot::kGameEventTypeBits);
+                                        dbc.writeUInt(bf2bot::EC_NETWORK, 4);
+                                        dbc.writeUInt(bf2bot::NRE_CLIENT_READY, 32);
+                                        dbc.writeFloat(0.0f);
+                                        dbc.writeUInt(0u, 8);
+                                        evs.push_back(dbc);
+
+                                        sendSrvEvents(evs);
+                                    }
+                                }
+                                else if (eid == bf2bot::NRE_CLIENT_READY)
+                                {
+                                    gotClientReady = true;
+                                    if (!sentReadyAck)
+                                    {
+                                        sentReadyAck = true;
+                                        std::vector<bf2bot::BitStream> evs;
+                                        bf2bot::BitStream ack(16u);
+                                        ack.writeUInt(bf2bot::GE_POST_REMOTE, bf2bot::kGameEventTypeBits);
+                                        ack.writeUInt(bf2bot::EC_NETWORK, 4);
+                                        ack.writeUInt(bf2bot::NRE_CLIENT_READY_ACK, 32);
+                                        ack.writeFloat(0.0f);
+                                        ack.writeUInt(0u, 8);
+                                        evs.push_back(ack);
+                                        sendSrvEvents(evs);
+                                    }
+                                }
+                                else if (eid == bf2bot::NRE_JOIN_TEAM) gotJoinTeam = true;
+                                else if (eid == bf2bot::NRE_SELECT_KIT) gotSelectKit = true;
+                                else if (eid == bf2bot::NRE_SELECT_SPAWN_POINT) gotSelectSpawn = true;
+                                else if (eid == bf2bot::NRE_END_OF_ROUND_ACK) gotEndOfRoundAck = true;
+                                else if (eid == bf2bot::NRE_CONFIRM_RESET) gotConfirmReset = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    // Drive 60 virtual 30 Hz ticks (2.0s) with simulated 30ms RTT +/- 6ms jitter
+    uint64_t nowUs = 1000000ULL;
+    for (int tick = 0; tick < 60; ++tick)
+    {
+        while (!s2cQueue.empty())
+        {
+            const std::vector<uint8_t>& p = s2cQueue.front();
+            bot.injectRawDatagram(&p[0], p.size(), nowUs);
+            s2cQueue.pop_front();
+        }
+        bot.flushImpairmentQueues(nowUs);
+        bot.tick30Hz(nowUs, 1.0f / 30.0f);
+        drainServerSocket();
+
+        // Once bot joined team/kit/spawn, send a ghost snapshot spawning bot & showing a nearby enemy
+        if (gotSelectSpawn && !sentSpawnGhost)
+        {
+            sentSpawnGhost = true;
+            bf2bot::BitStream pkt(bf2bot::kMaxDataPayloadSize);
+            pkt.writeBool(false); // PlayerActionManager
+            pkt.writeBool(false); // GameEventManager
+            pkt.writeBool(true);  // GhostManager
+            pkt.writeUInt(100u, 32);
+            pkt.writeUInt(1u, 8); // 1 ghost (enemy soldier 710)
+            pkt.writeBool(true);  // hasControlState
+
+            // ControlObjectState for own soldier (netId=700, pos=(10,2,10), hp=255)
+            bf2bot::BitStream ctrl(256u);
+            ctrl.writeSignedMag(0, 32);
+            ctrl.writeFloat(10.0f);
+            ctrl.writeFloat(2.0f);
+            ctrl.writeFloat(10.0f);
+            ctrl.setCompressionVector(bf2bot::Vec3(10.0f, 2.0f, 10.0f));
+            ctrl.writeUInt(700u, 16);
+            ctrl.writeBool(false); // hasParachute
+            ctrl.writeBool(true);  // isSoldier
+            ctrl.writeBool(false); // hasKit
+            ctrl.writeBool(false); // isDelta
+            ctrl.writeUInt(0u, 3); // baseline slot
+            writeSoldierPayload(ctrl, true, 255u, 0u,
+                                bf2bot::Vec3(10.0f, 2.0f, 10.0f),
+                                bf2bot::Vec3(10.0f, 2.0f, 10.0f),
+                                0.0f, 0.0f, true);
+
+            pkt.writeUInt(ctrl.getBitSize(), 12);
+            pkt.writeBits(ctrl.data(), ctrl.getBitSize());
+
+            // Enemy soldier 710 at (10, 2, 25) -> 15m away
+            bf2bot::BitStream enemy(256u);
+            enemy.setCompressionVector(bf2bot::Vec3(10.0f, 2.0f, 10.0f));
+            writeSoldierPayload(enemy, false, 255u, 0u,
+                                bf2bot::Vec3(10.0f, 2.0f, 25.0f),
+                                bf2bot::Vec3(10.0f, 2.0f, 10.0f),
+                                180.0f, 0.0f, true);
+
+            pkt.writeUInt(1u, 2);
+            pkt.writeUInt(710u, 16);
+            pkt.writeBool(true);
+            pkt.writeUInt(enemy.getBitSize(), 11);
+            pkt.writeBits(enemy.data(), enemy.getBitSize());
+
+            sendSrvDataPayload(pkt.data(), pkt.getByteSize());
+        }
+        else if (sentSpawnGhost && gotPlayerAction && !sentRagdollGhost)
+        {
+            // Send ragdoll update for enemy 710 with ONLY mask 0x8000 (no pose bit 0x20!)
+            sentRagdollGhost = true;
+            bf2bot::BitStream pkt(bf2bot::kMaxDataPayloadSize);
+            pkt.writeBool(false); // PlayerActionManager
+            pkt.writeBool(false); // GameEventManager
+            pkt.writeBool(true);  // GhostManager
+            pkt.writeUInt(101u, 32);
+            pkt.writeUInt(1u, 8);
+            pkt.writeBool(false);
+
+            bf2bot::BitStream rag(32u);
+            rag.writeUInt(0x8000u, 21); // ragdoll only, no pose bit
+            pkt.writeUInt(1u, 2);
+            pkt.writeUInt(710u, 16);
+            pkt.writeBool(true);
+            pkt.writeUInt(rag.getBitSize(), 11);
+            pkt.writeBits(rag.data(), rag.getBitSize());
+
+            sendSrvDataPayload(pkt.data(), pkt.getByteSize());
+        }
+        else if (sentRagdollGhost && !sentEorAndReset)
+        {
+            sentEorAndReset = true;
+            std::vector<bf2bot::BitStream> evs;
+            bf2bot::BitStream eor(16u);
+            eor.writeUInt(bf2bot::GE_END_OF_ROUND, bf2bot::kGameEventTypeBits);
+            eor.writeUInt(1u, 32);
+            eor.writeUInt(1u, 32);
+            eor.writeUInt(0u, 32);
+            evs.push_back(eor);
+
+            bf2bot::BitStream rst(16u);
+            rst.writeUInt(bf2bot::GE_POST_REMOTE, bf2bot::kGameEventTypeBits);
+            rst.writeUInt(bf2bot::EC_NETWORK, 4);
+            rst.writeUInt(bf2bot::NRE_CONFIRM_RESET, 32);
+            rst.writeFloat(0.0f);
+            rst.writeUInt(0u, 8);
+            evs.push_back(rst);
+            sendSrvEvents(evs);
+        }
+
+        nowUs += 33333ULL;
+    }
+
+    const bool wasInGame = bot.isInGame();
+    const bool wasSpawned = bot.isSpawned();
+    const bool wasAlive = bot.isAlive();
+
+    bot.disconnectGracefully();
+    drainServerSocket();
+
+    // Expected djb2LowerName("LoadBot_01")
+    uint32_t expectedDjb2 = 5381u;
+    const char* lowerName = "loadbot_01";
+    for (const char* p = lowerName; *p != '\0'; ++p)
+    {
+        expectedDjb2 = static_cast<uint32_t>(static_cast<unsigned char>(*p)) ^ (33u * expectedDjb2);
+    }
+
+    checkCond(gotConnectReq && gotConnectAck, "Loopback UDP ConnectRequest -> ConnectAccept -> Ack");
+    checkCond(gotChallengeResp, "Loopback Challenge -> ChallengeResponse");
+    checkCond(clientInfoCount == 1 && clientInfoHash == expectedDjb2,
+              "Loopback ClientInfo sent once with djb2LowerName (ignores ServerInfo reqResp=false)");
+    checkCond(gotMapLoaded && gotClientReady && wasInGame,
+              "Loopback MapInfo -> MapLoaded -> DBComplete -> ClientReady -> InGame");
+    checkCond(gotConnType && gotJoinTeam && gotSelectKit && gotSelectSpawn,
+              "Loopback ClientReadyAck -> ConnectionType/JoinTeam/SelectKit/SelectSpawnPoint");
+    checkCond(wasSpawned && wasAlive && gotPlayerAction,
+              "Loopback ControlObjectState spawn -> 30Hz PlayerAction transmitted");
+    checkCond(gotEndOfRoundAck && gotConfirmReset,
+              "Loopback EndOfRoundAck(20) and ConfirmReset(5) acknowledged");
+    checkCond(gotDisconnect, "Loopback graceful disconnect transmits UDP_DISCONNECT");
+    checkCond(telemetry.getTotalSummary().protocolErrors == 0u,
+              "Loopback session completed with zero protocolErrors");
+    if (!(gotMapLoaded && gotClientReady && wasInGame && gotSelectSpawn && gotEndOfRoundAck))
+    {
+        std::fprintf(stderr, "  [DIAG] mapLoaded=%d clientReady=%d inGame=%d connType=%d joinTeam=%d kit=%d spawn=%d spawned=%d alive=%d act=%d eor=%d rst=%d\n",
+                     gotMapLoaded ? 1 : 0, gotClientReady ? 1 : 0, wasInGame ? 1 : 0,
+                     gotConnType ? 1 : 0, gotJoinTeam ? 1 : 0, gotSelectKit ? 1 : 0, gotSelectSpawn ? 1 : 0,
+                     wasSpawned ? 1 : 0, wasAlive ? 1 : 0, gotPlayerAction ? 1 : 0,
+                     gotEndOfRoundAck ? 1 : 0, gotConfirmReset ? 1 : 0);
+    }
+
+    bot.closeSocket();
+#ifdef _WIN32
+    ::WSACleanup();
+#endif
 }
 
 } // anonymous namespace
@@ -1464,6 +2047,7 @@ int main()
     testRouteLoaderAndAbiParity();
     testNetImpairment();
     testTelemetryAndSlidingDetector();
+    testLoopbackHandshakeAndGameplay();
 
     if (g_failures == 0)
     {

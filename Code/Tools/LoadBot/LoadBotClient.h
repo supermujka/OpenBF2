@@ -12,11 +12,31 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
-#include <netinet/in.h>
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <netinet/in.h>
+#endif
+
 namespace bf2bot {
+
+#ifdef _WIN32
+typedef SOCKET BotSocket;
+static const BotSocket kInvalidBotSocket = INVALID_SOCKET;
+#else
+typedef int BotSocket;
+static const BotSocket kInvalidBotSocket = -1;
+#endif
 
 struct LoadBotConfig {
     uint32_t botIndex;
@@ -69,7 +89,7 @@ public:
 
     bool initSocket();
     void closeSocket();
-    int socketFd() const { return m_sockFd; }
+    BotSocket socketFd() const { return m_sockFd; }
 
     BotConnState state() const { return m_state; }
     bool isConnected() const { return m_state == BOT_HANDSHAKING || m_state == BOT_IN_GAME; }
@@ -82,6 +102,11 @@ public:
 
     // Drains all pending UDP datagrams from the non-blocking socket.
     void onSocketReadable(uint64_t nowUs);
+
+    // Optional in-memory datagram transport hooks for deterministic unit/integration tests.
+    typedef std::function<void(const uint8_t*, size_t)> RawSendCallback;
+    void setRawSendHook(const RawSendCallback& cb) { m_rawSendHook = cb; }
+    void injectRawDatagram(const uint8_t* data, size_t len, uint64_t nowUs);
 
     // Flushes ready uplink/downlink impairment queue packets.
     void flushImpairmentQueues(uint64_t nowUs);
@@ -129,12 +154,13 @@ private:
     void sendDirectSocket(const uint8_t* data, size_t len);
     void processIncomingDatagram(const uint8_t* data, size_t len, uint64_t nowUs);
     uint32_t localTimeMs(uint64_t nowUs) const;
-    static uint32_t fnv1a32(const std::string& s);
+    static uint32_t djb2LowerName(const std::string& s);
     Vec3 dequantizeSpawnGroupPos(uint8_t quantX, uint8_t quantZ) const;
 
     LoadBotConfig m_config;
     sockaddr_in m_serverAddr;
-    int m_sockFd;
+    BotSocket m_sockFd;
+    RawSendCallback m_rawSendHook;
     std::string m_playerName;
     int32_t m_profileId;
 
@@ -147,6 +173,7 @@ private:
     uint64_t m_lastDataPacketRxUs;
     uint32_t m_nextDeliveryId;
     uint32_t m_packetGhostCount;
+    uint32_t m_unackedDataPackets;
 
     bool m_useContentChecking;
     bool m_sentInitialJoin;

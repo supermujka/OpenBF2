@@ -122,10 +122,14 @@ enum NetworkRemoteEventId {
     NRE_MAP_LOADED         = 2,
     NRE_CLIENT_READY_ACK   = 3,
     NRE_CLIENT_READY       = 4,
+    NRE_CONFIRM_RESET      = 5,
     NRE_SELECT_SPAWN_POINT = 6,
     NRE_JOIN_TEAM          = 7,
     NRE_SELECT_KIT         = 8,
-    NRE_SUICIDE            = 12
+    NRE_PLAYER_SPAWNED     = 9,
+    NRE_PLAYER_KILLED      = 10,
+    NRE_SUICIDE            = 12,
+    NRE_END_OF_ROUND_ACK   = 20
 };
 
 enum DataBlockId {
@@ -393,10 +397,12 @@ public:
 
     void queueMapLoaded();
     void queueClientReady();
+    void queueConfirmReset();
     void queueJoinTeam(int32_t team);
     void queueSelectKit(int32_t kit, int32_t unlockLevel = 0);
     void queueSelectSpawnPoint(int32_t spawnGroupId);
     void queueSuicide();
+    void queueEndOfRoundAck();
 
     void queueContentCheck(const uint8_t miscHash[16],
                            const uint8_t archiveHash[16],

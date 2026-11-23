@@ -189,7 +189,8 @@ bool PlayerActionSender::skipIncoming(BitStream& bs) {
         return false;
     }
     if (count > 0) {
-        bs.skipBits(32u + count * 144u);
+        // Each PlayerAction on the BF2 v1.50 wire is 6*16 (axes) + 32 (maskLow) + 9 (maskHigh) + 1 (flag) = 138 bits.
+        bs.skipBits(32u + count * 138u);
     }
     return !bs.hasError();
 }
@@ -412,6 +413,10 @@ void GameEventStream::queueClientReady() {
     queuePostRemoteEvent(EC_NETWORK, NRE_CLIENT_READY, nullptr, 0, 0.0f);
 }
 
+void GameEventStream::queueConfirmReset() {
+    queuePostRemoteEvent(EC_NETWORK, NRE_CONFIRM_RESET, nullptr, 0, 0.0f);
+}
+
 void GameEventStream::queueJoinTeam(int32_t team) {
     queuePostRemoteEvent(EC_NETWORK, NRE_JOIN_TEAM, &team, 4u, 0.0f);
 }
@@ -427,6 +432,10 @@ void GameEventStream::queueSelectSpawnPoint(int32_t spawnGroupId) {
 
 void GameEventStream::queueSuicide() {
     queuePostRemoteEvent(EC_NETWORK, NRE_SUICIDE, nullptr, 0, 0.0f);
+}
+
+void GameEventStream::queueEndOfRoundAck() {
+    queuePostRemoteEvent(EC_NETWORK, NRE_END_OF_ROUND_ACK, nullptr, 0, 0.0f);
 }
 
 void GameEventStream::queueContentCheck(const uint8_t miscHash[16],

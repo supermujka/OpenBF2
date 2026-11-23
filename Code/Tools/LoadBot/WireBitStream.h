@@ -32,6 +32,10 @@ public:
     explicit BitStream(uint32_t sizeBytes = 1500);
     BitStream(uint8_t* buf, uint32_t sizeBytes);
     BitStream(const uint8_t* buf, uint32_t sizeBytes);
+    BitStream(const BitStream& other);
+    BitStream& operator=(const BitStream& other);
+    BitStream(BitStream&& other);
+    BitStream& operator=(BitStream&& other);
 
     // Resets stream for writing into its current writable buffer.
     void clear();

@@ -145,17 +145,25 @@ def get_changed_and_untracked_cpp_files():
     return sorted(files)
 
 
+def resolve_ref_short(ref_name: str):
+    rc, sha, _ = run_git(["rev-parse", "--short", ref_name])
+    if rc == 0 and sha:
+        return rc, sha
+    rc, sha, _ = run_git(["rev-parse", "--short", f"origin/{ref_name}"])
+    return rc, sha
+
+
 def check_git_branch_safety():
     issues = []
     rc, branch, _ = run_git(["rev-parse", "--abbrev-ref", "HEAD"])
     if rc != 0 or branch != "feat/loadbot-64p":
         issues.append(f"Current branch is '{branch}', expected 'feat/loadbot-64p'")
 
-    rc, sha_hitreg, _ = run_git(["rev-parse", "--short", "hitreg-v1"])
+    rc, sha_hitreg = resolve_ref_short("hitreg-v1")
     if rc != 0 or not sha_hitreg.startswith("9cd3527"):
         issues.append(f"hitreg-v1 resolves to '{sha_hitreg}', expected '9cd3527'")
 
-    rc, sha_mt, _ = run_git(["rev-parse", "--short", "feat/net-mt-32v32"])
+    rc, sha_mt = resolve_ref_short("feat/net-mt-32v32")
     if rc != 0 or not sha_mt.startswith("f579a3c"):
         issues.append(f"feat/net-mt-32v32 resolves to '{sha_mt}', expected 'f579a3c'")
 

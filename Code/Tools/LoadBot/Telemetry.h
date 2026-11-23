@@ -71,7 +71,8 @@ public:
     TelemetrySummary getTotalSummary() const;
 
     // Formats a readable console table covering periodic window and cumulative totals.
-    std::string formatReport(const std::string& label, double elapsedSec) const;
+    // windowSec (if > 0) is used for Window Mbps; otherwise falls back to elapsedSec.
+    std::string formatReport(const std::string& label, double elapsedSec, double windowSec = 0.0) const;
 
 private:
     struct Bucket {
