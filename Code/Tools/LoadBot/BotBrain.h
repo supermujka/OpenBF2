@@ -1,0 +1,256 @@
+#ifndef BF2BOT_BOT_BRAIN_H
+#define BF2BOT_BOT_BRAIN_H
+
+#include "Bf2Protocol.h"
+#include "NavMesh.h"
+#include "RouteLoader.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <random>
+#include <string>
+#include <vector>
+
+namespace bf2bot {
+
+struct TrackedPlayer {
+    uint8_t playerId;
+    uint16_t playerNetId;
+    int32_t team;
+    bool isAlive;
+    bool isManDown;
+    uint8_t spawnGroupId;
+    uint8_t kit;
+    uint16_t soldierNetId;
+    std::string name;
+
+    TrackedPlayer()
+        : playerId(0),
+          playerNetId(0),
+          team(0),
+          isAlive(false),
+          isManDown(false),
+          spawnGroupId(0),
+          kit(0),
+          soldierNetId(0),
+          name() {}
+};
+
+struct TrackedSoldier {
+    uint16_t netId;
+    uint8_t ownerPlayerId;
+    int32_t team;
+    Vec3 pos;
+    Vec3 speed;
+    float facingDegrees;
+    float lookUpDownAngle;
+    uint8_t pose;
+    uint8_t hitPointsByte;
+    bool isRagdoll;
+    bool hasPos;
+    uint64_t lastUpdateUs;
+
+    TrackedSoldier()
+        : netId(0),
+          ownerPlayerId(0),
+          team(0),
+          pos(),
+          speed(),
+          facingDegrees(0.0f),
+          lookUpDownAngle(0.0f),
+          pose(0),
+          hitPointsByte(255u),
+          isRagdoll(false),
+          hasPos(false),
+          lastUpdateUs(0) {}
+};
+
+struct TrackedSpawnGroup {
+    uint8_t spawnGroupId;
+    uint16_t netId;
+    uint8_t team;
+    bool active;
+    bool aiOnly;
+    bool hasSpawnPoints;
+    Vec3 pos;
+    bool hasPos;
+
+    TrackedSpawnGroup()
+        : spawnGroupId(0),
+          netId(0),
+          team(0),
+          active(false),
+          aiOnly(false),
+          hasSpawnPoints(false),
+          pos(),
+          hasPos(false) {}
+};
+
+struct TrackedControlPoint {
+    uint16_t netId;
+    int32_t team;
+    bool isNeutral;
+    bool allowCaptureByTeam1;
+    bool allowCaptureByTeam2;
+    Vec3 pos;
+    bool hasPos;
+
+    TrackedControlPoint()
+        : netId(0),
+          team(0),
+          isNeutral(false),
+          allowCaptureByTeam1(true),
+          allowCaptureByTeam2(true),
+          pos(),
+          hasPos(false) {}
+};
+
+struct BotWorldView {
+    uint8_t ownPlayerId;
+    int32_t ownTeam;
+    bool ownAlive;
+    bool ownManDown;
+    uint16_t ownSoldierNetId;
+    bool hasOwnPos;
+    Vec3 ownPos;
+    float ownFacingDegrees;
+    float ownPitchDegrees;
+    uint8_t ownPose;
+    float worldSize;
+
+    const std::map<uint16_t, TrackedSoldier>* soldiers;
+    const std::map<uint8_t, TrackedSpawnGroup>* spawnGroups;
+    const std::map<uint16_t, TrackedControlPoint>* controlPoints;
+
+    BotWorldView()
+        : ownPlayerId(0),
+          ownTeam(0),
+          ownAlive(false),
+          ownManDown(false),
+          ownSoldierNetId(0),
+          hasOwnPos(false),
+          ownPos(),
+          ownFacingDegrees(0.0f),
+          ownPitchDegrees(0.0f),
+          ownPose(0),
+          worldSize(1024.0f),
+          soldiers(nullptr),
+          spawnGroups(nullptr),
+          controlPoints(nullptr) {}
+};
+
+struct BotTickOutput {
+    PlayerActionInput action;
+    bool requestSpawn;
+    int32_t desiredSpawnGroupId;
+    int32_t desiredKit;
+
+    BotTickOutput()
+        : action(),
+          requestSpawn(false),
+          desiredSpawnGroupId(-1),
+          desiredKit(0) {}
+};
+
+class BotBrain {
+public:
+    BotBrain(uint32_t botIndex, uint32_t seed,
+             const NavMesh* navMesh, const RouteLoader* routeLoader);
+
+    void reset();
+    void onSpawned(const Vec3& spawnPos, uint64_t nowUs);
+    void onDied(uint64_t nowUs);
+
+    uint32_t botIndex() const { return m_botIndex; }
+    int32_t assignedTeam() const { return m_team; }
+    int32_t assignedKit() const { return m_kit; }
+
+    int32_t pickSpawnGroup(const std::map<uint8_t, TrackedSpawnGroup>& spawnGroups);
+
+    void tick(uint64_t nowUs, float dtSec, const BotWorldView& world, BotTickOutput& out);
+
+private:
+    enum NavTier {
+        NAV_NAVMESH = 0,
+        NAV_ROUTES  = 1,
+        NAV_FALLBACK = 2
+    };
+
+    float randFloat(float lo, float hi);
+    int32_t randInt(int32_t lo, int32_t hi);
+
+    static float wrapAngleDeg(float deg);
+    static float clampFloat(float v, float lo, float hi);
+    static float distXZ(const Vec3& a, const Vec3& b);
+    static float dist3D(const Vec3& a, const Vec3& b);
+
+    bool pickObjectiveGoal(const BotWorldView& world, Vec3& outGoal);
+    bool pickRandomWalkableNavPoint(Vec3& outGoal);
+    void updateNavigation(uint64_t nowUs, const BotWorldView& world,
+                          bool inCombat, Vec3& outMoveTarget, bool& outHasMoveTarget,
+                          uint32_t& outNavButtons);
+    void steerToward(const Vec3& ownPos, float ownYawDeg, float ownPitchDeg,
+                     const Vec3& targetPos, float dtSec, float& outMouseX, float& outMouseY);
+
+    uint32_t m_botIndex;
+    int32_t m_team;
+    int32_t m_kit;
+    std::mt19937 m_rng;
+
+    const NavMesh* m_navMesh;
+    const RouteLoader* m_routeLoader;
+
+    // Humanized aiming parameters
+    float m_turnRateDegPerSec;
+    float m_aimNoiseYawDeg;
+    float m_aimNoisePitchDeg;
+    uint64_t m_nextAimNoiseUs;
+
+    // Combat state
+    uint16_t m_targetNetId;
+    uint64_t m_targetAcquiredUs;
+    uint64_t m_reactionDelayUs;
+    bool m_strafeRight;
+    uint64_t m_nextStrafeFlipUs;
+    bool m_burstFiring;
+    int32_t m_burstTicksLeft;
+    int32_t m_fireTicksSinceReload;
+    int32_t m_reloadThresholdTicks;
+    uint64_t m_reloadUntilUs;
+    uint64_t m_nextWeaponSwitchUs;
+    uint64_t m_switchBackToPrimaryUs;
+
+    // Respawn cadence
+    uint64_t m_nextSpawnRequestUs;
+    uint32_t m_spawnGroupRotateIdx;
+
+    // Navigation state (Tier 1: NavMesh)
+    std::vector<NavPoint> m_waypoints;
+    size_t m_waypointIdx;
+    uint64_t m_nextPathComputeUs;
+
+    // Navigation state (Tier 2: RouteLoader)
+    bool m_hasRouteTrack;
+    size_t m_routeTrackIdx;
+    size_t m_routeSampleIdx;
+    uint64_t m_lastRouteAdvanceUs;
+
+    // Navigation state (Tier 3: Fallback patrol)
+    Vec3 m_spawnAnchor;
+    bool m_hasSpawnAnchor;
+    Vec3 m_patrolGoal;
+    bool m_hasPatrolGoal;
+    uint64_t m_nextPatrolGoalUs;
+
+    // Stuck detection
+    Vec3 m_stuckAnchorPos;
+    uint64_t m_stuckAnchorUs;
+    bool m_hasStuckAnchor;
+    uint64_t m_stuckRecoverUntilUs;
+    float m_stuckStrafeDir;
+};
+
+} // namespace bf2bot
+
+#endif // BF2BOT_BOT_BRAIN_H

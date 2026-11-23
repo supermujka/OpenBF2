@@ -63,6 +63,7 @@
 #include "../../Physics/LatencyCompensation.h" // [CHOSEN, not recovered] Version 1 queue-delay tracking
 #include "../../Physics/HitregTelemetry.h"     // [CHOSEN, not recovered] Version 1 hitreg telemetry CSV
 #include "ServerTickProfiler.h"                // [CHOSEN, not recovered] 32v32 per-phase server tick profiler
+#include "RouteActionRecorder.h"               // [CHOSEN, not recovered] binary route/action recorder for loadbots
 #include "NetPipeline/WorldNetSnapshot.h"      // [CHOSEN, not recovered] Phase 2A immutable tick world snapshot
 #include "NetPipeline/NetWorkerPool.h"         // [CHOSEN, not recovered] Phase 2B Stage A/B/C MT network pipeline
 #include "NetPipeline/LinuxBatchSender.h"      // [CHOSEN, not recovered] Phase 2A batched sendmmsg sender
@@ -200,6 +201,7 @@ void cdkey_auth_callback(int localId, AuthResult result, void* context)
 // LAN initialization still follows this service setup.
 bool GameServer::init()
 {
+    RouteActionRecorder::initCVars();
     m_numPlayers = 0;
     m_initComplete = false;
     m_initTime = g_system->getWallClockTime();
@@ -1419,6 +1421,7 @@ bool GameServer::load()
 bool GameServer::unload()
 {
     ServerTickProfiler::flushAndReset();
+    RouteActionRecorder::shutdown();
     eventManager->postEvent(ECHud, 3, 0, 0.0f);
 
     const std::list<world::IPlayer*> players(world::playerManager->getPlayers());
@@ -1914,6 +1917,7 @@ GameServer::GameServer()
 
 GameServer::~GameServer()
 {
+    RouteActionRecorder::shutdown();
     netpipeline::NetWorkerPool::instance().shutdown();
     // shutdown() owns the protocol objects. The destructor only tears down these four owned
     // allocations before C++ destroys the containers and the Game base in reverse field order.
@@ -2491,6 +2495,7 @@ bool GameServer::update(int steps, float dt)
         world::responsePhysicsManager->startFrame();            // +0x2C
         simulateFrame(dt);                                      // the parameter, not getDeltaTime()
         world::responsePhysicsManager->stopFrame();             // +0x30
+        RouteActionRecorder::recordStep(static_cast<std::uint32_t>(WorldPref::getTickCount()));
         if (isRecordingDemo())                                  // an extra send per iteration while recording
         {
             updateStateMasks();

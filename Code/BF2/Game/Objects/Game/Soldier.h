@@ -29,6 +29,7 @@ class ServerGameLogic;
 class SoldierSound;          // dedicated no-op sound voice; see Sound/SoldierSound.h
 class ISound;
 class SoldierNetworkable;    // the wire wrapper - a friend below; see Networkables.h
+class RouteActionRecorder;   // [CHOSEN, not recovered] server route/action recorder - a friend below
 namespace geom { class NametagManager; }   // RendDX9's - a friend below
 
 namespace world {
@@ -328,6 +329,8 @@ private:
     friend class ZiplineContainer;
     // [CHOSEN, not recovered] Read-only zero-dt pose snapshots for shadow A/B telemetry.
     friend class HitregTelemetry;
+    // [CHOSEN, not recovered] Read-only facing/pitch capture for server route/action recorder.
+    friend class ::dice::hfe::RouteActionRecorder;
     // [CHOSEN, not recovered] Hitreg V3 Phase 2 (Option C): inspect m_ragDoll during latency ring capture.
     friend class SoldierPhysicsNode;
     /* +0x1F4 */ float  m_smoothedStrafe;            // [CHOSEN] name

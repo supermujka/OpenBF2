@@ -1894,4 +1894,59 @@ if(BUILD_TESTING)
     endif()
     set_property(TARGET bf2_net_pipeline_golden_test PROPERTY FOLDER "Checks")
     add_test(NAME bf2_net_pipeline_golden_test COMMAND bf2_net_pipeline_golden_test)
+
+    add_executable(bf2_loadbot_tests
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tests/bf2_loadbot_tests.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot/WireBitStream.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot/SWTransport.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot/Bf2Protocol.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot/NavMesh.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot/RouteLoader.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot/NetImpairment.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot/Telemetry.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot/BotBrain.cpp"
+    )
+    target_compile_features(bf2_loadbot_tests PRIVATE cxx_std_14)
+    target_include_directories(bf2_loadbot_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/BF2"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot"
+    )
+    if(MSVC)
+        target_compile_options(bf2_loadbot_tests PRIVATE /EHsc /O2 /permissive)
+        bf2_use_static_msvc_runtime(bf2_loadbot_tests)
+    else()
+        find_package(Threads REQUIRED)
+        target_compile_options(bf2_loadbot_tests PRIVATE -fno-strict-aliasing -pthread)
+        target_link_libraries(bf2_loadbot_tests PRIVATE Threads::Threads)
+        target_link_options(bf2_loadbot_tests PRIVATE -pthread)
+    endif()
+    set_property(TARGET bf2_loadbot_tests PROPERTY FOLDER "Checks")
+    add_test(NAME bf2_loadbot_tests COMMAND bf2_loadbot_tests)
+endif()
+
+if(BF2_BUILD_LINUX OR UNIX)
+    find_package(Threads REQUIRED)
+    add_executable(bf2_loadbot
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot/WireBitStream.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot/SWTransport.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot/Bf2Protocol.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot/NavMesh.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot/RouteLoader.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot/NetImpairment.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot/Telemetry.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot/BotBrain.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot/LoadBotClient.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot/main.cpp"
+    )
+    target_compile_features(bf2_loadbot PRIVATE cxx_std_14)
+    target_include_directories(bf2_loadbot PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/Code/Tools/LoadBot"
+    )
+    target_compile_options(bf2_loadbot PRIVATE -fno-strict-aliasing -pthread -Wall -Wextra)
+    target_link_libraries(bf2_loadbot PRIVATE Threads::Threads)
+    target_link_options(bf2_loadbot PRIVATE -pthread)
+    set_target_properties(bf2_loadbot PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${BF2_DEDICATED_DEFAULT_OUTPUT_DIR}"
+        FOLDER "Tools"
+    )
 endif()
