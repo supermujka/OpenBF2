@@ -2034,6 +2034,114 @@ void testLoopbackHandshakeAndGameplay()
 #endif
 }
 
+void testHumanAim()
+{
+    using namespace bf2bot;
+
+    // --- interpolation at (now - interp) ---
+    TrackedSoldier s;
+    Vec3 q;
+    checkCond(!interpolateSoldierPos(s, 1000, q), "aim: no history -> false");
+    for (int i = 0; i < 20; ++i)
+    {
+        // 20 samples, 50 ms apart, x moves 1 m per sample; ring holds only the last 12.
+        s.pushPos(1000000ULL + static_cast<uint64_t>(i) * 50000ULL, Vec3(static_cast<float>(i), 0.0f, 0.0f));
+    }
+    checkCond(s.histCount == TrackedSoldier::kHistSize, "aim: ring buffer capped");
+    Vec3 p;
+    const uint64_t newest = 1000000ULL + 19ULL * 50000ULL;
+    checkCond(interpolateSoldierPos(s, newest, p) && nearFloat(p.x, 19.0f, 1e-4f), "aim: newest at newest time");
+    checkCond(interpolateSoldierPos(s, newest + 500000ULL, p) && nearFloat(p.x, 19.0f, 1e-4f),
+              "aim: no extrapolation past newest");
+    // now - 100ms = exactly two samples back
+    checkCond(interpolateSoldierPos(s, newest - 100000ULL, p) && nearFloat(p.x, 17.0f, 1e-4f),
+              "aim: now-100ms lands two samples back");
+    // between samples: 25 ms after sample 16 -> 16.5
+    checkCond(interpolateSoldierPos(s, 1000000ULL + 16ULL * 50000ULL + 25000ULL, p) && nearFloat(p.x, 16.5f, 1e-3f),
+              "aim: linear interpolation between samples");
+    checkCond(interpolateSoldierPos(s, 0, p) && nearFloat(p.x, 8.0f, 1e-4f), "aim: clamps to oldest retained");
+    s.pushPos(newest + 50000ULL, Vec3(500.0f, 0.0f, 0.0f)); // teleport
+    checkCond(s.histCount == 1u, "aim: teleport clears history");
+
+    // --- aim error convergence ---
+    const float e0 = 4.0f;
+    const uint64_t conv = 450000ULL;
+    float prev = e0;
+    bool monotone = true;
+    for (uint64_t t = 0; t <= 600000ULL; t += 30000ULL)
+    {
+        const float e = aimErrorDecay(e0, t, conv);
+        if (e > prev + 1e-6f) monotone = false;
+        prev = e;
+    }
+    checkCond(monotone, "aim: error decays monotonically");
+    checkCond(nearFloat(aimErrorDecay(e0, 0, conv), e0, 1e-6f), "aim: error at t=0 is initial");
+    checkCond(aimErrorDecay(e0, conv, conv) < e0 * 0.06f, "aim: error <6% at convergence time");
+
+    // --- brain: reaction delay, fire discipline, convergence ---
+    for (int legacy = 0; legacy < 2; ++legacy)
+    {
+        AimConfig cfg;
+        cfg.legacy = (legacy != 0);
+        BotBrain brain(0u, 42u, nullptr, nullptr, cfg);
+        std::map<uint16_t, TrackedSoldier> soldiers;
+        TrackedSoldier en;
+        en.netId = 7;
+        en.team = 2;
+        en.hasPos = true;
+        en.pos = Vec3(0.0f, 0.0f, 30.0f);
+        soldiers[7] = en;
+
+        BotWorldView w;
+        w.ownTeam = brain.assignedTeam();
+        w.ownAlive = true;
+        w.hasOwnPos = true;
+        w.ownSoldierNetId = 1;
+        w.soldiers = &soldiers;
+
+        const uint64_t t0 = 5000000ULL;
+        brain.onSpawned(w.ownPos, t0);
+        uint64_t firstFireUs = 0;
+        bool movedWhileFiring = false;
+        int burstLen = 0;
+        int maxBurstTicks = 0;
+        for (int tick = 0; tick < 150; ++tick)
+        {
+            const uint64_t now = t0 + static_cast<uint64_t>(tick) * 33333ULL;
+            soldiers[7].pushPos(now, soldiers[7].pos);
+            BotTickOutput out;
+            brain.tick(now, 1.0f / 30.0f, w, out);
+            w.ownFacingDegrees += out.action.axes[4] * 5.0f;
+            w.ownPitchDegrees += out.action.axes[5] * 5.0f;
+            const bool fire = (out.action.buttonMaskLow & BTN_FIRE) != 0u;
+            if (fire)
+            {
+                if (firstFireUs == 0) firstFireUs = now - t0;
+                if (!cfg.legacy &&
+                    (out.action.axes[0] != 0.0f || out.action.axes[3] != 0.0f)) movedWhileFiring = true;
+                ++burstLen;
+                if (burstLen > maxBurstTicks) maxBurstTicks = burstLen;
+            }
+            else
+            {
+                burstLen = 0;
+            }
+        }
+        if (!cfg.legacy)
+        {
+            checkCond(firstFireUs >= 100000ULL, "aim: reaction delay before first shot");
+            checkCond(firstFireUs < 1500000ULL, "aim: eventually fires");
+            checkCond(!movedWhileFiring, "aim: no forward/strafe input while firing");
+            checkCond(maxBurstTicks <= 18, "aim: bursts are short (3-5 shots, ~100ms each)");
+            checkCond(std::fabs(w.ownFacingDegrees) < 6.0f, "aim: yaw converged on target");
+        }
+        else
+        {
+            checkCond(firstFireUs != 0, "aim: legacy still fires");
+        }
+    }
+}
+
 } // anonymous namespace
 
 int main()
@@ -2047,6 +2155,7 @@ int main()
     testRouteLoaderAndAbiParity();
     testNetImpairment();
     testTelemetryAndSlidingDetector();
+    testHumanAim();
     testLoopbackHandshakeAndGameplay();
 
     if (g_failures == 0)

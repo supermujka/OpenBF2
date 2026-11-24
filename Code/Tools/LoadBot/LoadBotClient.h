@@ -47,6 +47,7 @@ struct LoadBotConfig {
     uint64_t startAtUs;
     ImpairmentConfig uplinkImpair;
     ImpairmentConfig downlinkImpair;
+    AimConfig aim;
     bool verbose;
 
     LoadBotConfig()

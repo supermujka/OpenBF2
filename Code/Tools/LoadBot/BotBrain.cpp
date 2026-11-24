@@ -18,7 +18,8 @@ static const int32_t kInfantryKits[5] = { 0, 2, 3, 5, 6 };
 } // namespace
 
 BotBrain::BotBrain(uint32_t botIndex, uint32_t seed,
-                   const NavMesh* navMesh, const RouteLoader* routeLoader)
+                   const NavMesh* navMesh, const RouteLoader* routeLoader,
+                   const AimConfig& aim)
     : m_botIndex(botIndex),
       m_team((botIndex % 2u == 0u) ? 1 : 2),
       m_kit(kInfantryKits[botIndex % 5u]),
@@ -41,6 +42,16 @@ BotBrain::BotBrain(uint32_t botIndex, uint32_t seed,
       m_reloadUntilUs(0),
       m_nextWeaponSwitchUs(0),
       m_switchBackToPrimaryUs(0),
+      m_aim(aim),
+      m_aimInitYawDeg(0.0f),
+      m_aimInitPitchDeg(0.0f),
+      m_aimConvergeUs(450000ULL),
+      m_jitterYawDeg(0.0f),
+      m_jitterPitchDeg(0.0f),
+      m_nextJitterUs(0),
+      m_fireState(FIRE_WAIT),
+      m_fireStateEndUs(0),
+      m_burstShots(0),
       m_nextSpawnRequestUs(0),
       m_spawnGroupRotateIdx(botIndex),
       m_waypoints(),
@@ -65,6 +76,7 @@ BotBrain::BotBrain(uint32_t botIndex, uint32_t seed,
 }
 
 void BotBrain::reset() {
+    resetFireState();
     m_aimNoiseYawDeg = 0.0f;
     m_aimNoisePitchDeg = 0.0f;
     m_nextAimNoiseUs = 0;
@@ -102,6 +114,7 @@ void BotBrain::reset() {
 }
 
 void BotBrain::onSpawned(const Vec3& spawnPos, uint64_t nowUs) {
+    resetFireState();
     m_spawnAnchor = spawnPos;
     m_hasSpawnAnchor = true;
 
@@ -129,6 +142,7 @@ void BotBrain::onSpawned(const Vec3& spawnPos, uint64_t nowUs) {
 }
 
 void BotBrain::onDied(uint64_t nowUs) {
+    resetFireState();
     m_targetNetId = 0;
     m_burstFiring = false;
     m_burstTicksLeft = 0;
@@ -457,6 +471,245 @@ void BotBrain::updateNavigation(uint64_t nowUs, const BotWorldView& world,
     }
 }
 
+bool interpolateSoldierPos(const TrackedSoldier& s, uint64_t renderUs, Vec3& out) {
+    if (s.histCount == 0u) {
+        return false;
+    }
+    const PosSample& oldest = s.histAt(0);
+    const PosSample& newest = s.histAt(static_cast<size_t>(s.histCount) - 1u);
+    if (renderUs <= oldest.us) {
+        out = oldest.pos;
+        return true;
+    }
+    if (renderUs >= newest.us) {
+        out = newest.pos;
+        return true;
+    }
+    for (size_t i = 1; i < s.histCount; ++i) {
+        const PosSample& b = s.histAt(i);
+        if (renderUs <= b.us) {
+            const PosSample& a = s.histAt(i - 1u);
+            const uint64_t span = b.us - a.us;
+            if (span == 0u) {
+                out = b.pos;
+                return true;
+            }
+            const float t = static_cast<float>(renderUs - a.us) / static_cast<float>(span);
+            out.x = a.pos.x + (b.pos.x - a.pos.x) * t;
+            out.y = a.pos.y + (b.pos.y - a.pos.y) * t;
+            out.z = a.pos.z + (b.pos.z - a.pos.z) * t;
+            return true;
+        }
+    }
+    out = newest.pos;
+    return true;
+}
+
+float aimErrorDecay(float initialDeg, uint64_t elapsedUs, uint64_t convergeUs) {
+    if (convergeUs == 0u) {
+        return 0.0f;
+    }
+    const float t = static_cast<float>(elapsedUs) / static_cast<float>(convergeUs);
+    return initialDeg * std::exp(-3.0f * t);
+}
+
+bool terrainLineOfSight(const NavMesh* nav, const Vec3& a, const Vec3& b) {
+    if (!nav || !nav->hasAerialHeightMap()) {
+        return true;
+    }
+    const float dx = b.x - a.x;
+    const float dz = b.z - a.z;
+    const float len = std::sqrt(dx * dx + dz * dz);
+    if (len < 8.0f) {
+        return true;
+    }
+    // The aerial map's absolute offset to the ground is unknown, so only the bump above the
+    // chord between both endpoints is considered (an eye is ~1.5 m above the ground).
+    const float ha = nav->sampleAerialHeight(a.x, a.z, 0.0f);
+    const float hb = nav->sampleAerialHeight(b.x, b.z, 0.0f);
+    const int steps = static_cast<int>(len / 4.0f) + 1;
+    for (int i = 1; i < steps; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(steps);
+        const float chord = ha + (hb - ha) * t;
+        const float h = nav->sampleAerialHeight(a.x + dx * t, a.z + dz * t, chord);
+        if (h - chord > 2.0f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void BotBrain::resetFireState() {
+    m_fireState = FIRE_WAIT;
+    m_fireStateEndUs = 0;
+    m_burstShots = 0;
+}
+
+bool BotBrain::selectTarget(uint64_t nowUs, const BotWorldView& world,
+                            const TrackedSoldier*& outTarget, Vec3& outRendered, float& outDist) {
+    outTarget = nullptr;
+    if (!world.soldiers) {
+        return false;
+    }
+    const uint64_t interpUs = static_cast<uint64_t>(m_aim.interpMs > 0 ? m_aim.interpMs : 0) * 1000ULL;
+    const uint64_t renderUs = nowUs > interpUs ? nowUs - interpUs : 0ULL;
+    const Vec3 ownEye(world.ownPos.x, world.ownPos.y + 1.55f, world.ownPos.z);
+
+    float bestDist = 1e9f;
+    for (std::map<uint16_t, TrackedSoldier>::const_iterator it = world.soldiers->begin();
+         it != world.soldiers->end(); ++it) {
+        const TrackedSoldier& s = it->second;
+        if (s.netId == world.ownSoldierNetId || !s.hasPos || s.isRagdoll || s.hitPointsByte == 0u) {
+            continue;
+        }
+        if (s.team == 0 || s.team == world.ownTeam) {
+            continue;
+        }
+        Vec3 r = s.pos;
+        if (!interpolateSoldierPos(s, renderUs, r)) {
+            r = s.pos;
+        }
+        const bool current = (s.netId == m_targetNetId);
+        const float d = dist3D(world.ownPos, r);
+        if (d > (current ? 90.0f : 80.0f)) {
+            continue;
+        }
+        const float bearing = std::atan2(r.x - world.ownPos.x, r.z - world.ownPos.z) * kRadToDeg;
+        const float off = std::fabs(wrapAngleDeg(bearing - world.ownFacingDegrees));
+        // Within 10 m a player hears and notices an enemy in any direction.
+        if (d >= 10.0f && off > (current ? 70.0f : 45.0f)) {
+            continue;
+        }
+        if (!terrainLineOfSight(m_navMesh, ownEye, Vec3(r.x, r.y + 1.4f, r.z))) {
+            continue;
+        }
+        if (current) {
+            // Stickiness: keep the current target as long as it stays valid.
+            outTarget = &s;
+            outRendered = r;
+            outDist = d;
+            return true;
+        }
+        if (d < bestDist) {
+            bestDist = d;
+            outTarget = &s;
+            outRendered = r;
+            outDist = d;
+        }
+    }
+    return outTarget != nullptr;
+}
+
+void BotBrain::tickCombatHuman(uint64_t nowUs, float dtSec, const BotWorldView& world,
+                               const TrackedSoldier& target, const Vec3& rendered, float dist,
+                               PlayerActionInput& act) {
+    const float skill = clampFloat(m_aim.skill, 0.0f, 1.0f);
+    const float reactScale = 1.3f - 0.6f * skill;
+    const float errScale = 2.0f - 1.5f * skill;
+    const float convScale = 1.4f - 0.8f * skill;
+
+    if (target.netId != m_targetNetId) {
+        m_targetNetId = target.netId;
+        m_targetAcquiredUs = nowUs;
+        m_reactionDelayUs = static_cast<uint64_t>(randFloat(150.0f, 350.0f) * reactScale * 1000.0f);
+        // Initial error: a few degrees, growing mildly with distance, random direction.
+        const float mag = randFloat(1.5f, 4.0f) * errScale * (0.6f + dist / 60.0f);
+        m_aimInitYawDeg = randFloat(-1.0f, 1.0f) * mag;
+        m_aimInitPitchDeg = randFloat(-1.0f, 1.0f) * mag * 0.6f;
+        m_aimConvergeUs = static_cast<uint64_t>(randFloat(300.0f, 600.0f) * convScale * 1000.0f);
+        m_nextJitterUs = 0;
+        resetFireState();
+    }
+
+    // Small jitter, refreshed every ~50-90 ms.
+    if (nowUs >= m_nextJitterUs) {
+        const float j = 0.35f * errScale;
+        m_jitterYawDeg = randFloat(-j, j);
+        m_jitterPitchDeg = randFloat(-j, j) * 0.7f;
+        m_nextJitterUs = nowUs + static_cast<uint64_t>(randInt(50, 90)) * 1000ULL;
+    }
+
+    // Aim point: upper chest by pose (feet-relative).
+    float tgtH = 1.4f;
+    if (target.pose == 1u) tgtH = 1.0f;
+    else if (target.pose == 2u) tgtH = 0.35f;
+    else if (target.pose == 3u) tgtH = 0.4f;
+    float eyeH = 1.55f;
+    if (world.ownPose == 1u) eyeH = 1.1f;
+    else if (world.ownPose == 2u) eyeH = 0.45f;
+
+    const float dx = rendered.x - world.ownPos.x;
+    const float dy = (rendered.y + tgtH) - (world.ownPos.y + eyeH);
+    const float dz = rendered.z - world.ownPos.z;
+    const float horiz = std::sqrt(dx * dx + dz * dz);
+
+    const uint64_t tracked = nowUs - m_targetAcquiredUs;
+    const float errYaw = aimErrorDecay(m_aimInitYawDeg, tracked, m_aimConvergeUs) + m_jitterYawDeg;
+    const float errPitch = aimErrorDecay(m_aimInitPitchDeg, tracked, m_aimConvergeUs) + m_jitterPitchDeg;
+
+    const float trueYaw = std::atan2(dx, dz) * kRadToDeg;
+    const float truePitch = clampFloat(-std::atan2(dy, (horiz > 0.05f ? horiz : 0.05f)) * kRadToDeg,
+                                       -75.0f, 75.0f);
+    const float desiredYaw = trueYaw + errYaw;
+    const float desiredPitch = clampFloat(truePitch + errPitch, -75.0f, 75.0f);
+
+    const float yawErr = wrapAngleDeg(desiredYaw - world.ownFacingDegrees);
+    const float pitchErr = desiredPitch - world.ownPitchDegrees;
+    // Humans flick onto a target far faster than the patrol turn rate.
+    const float maxDelta = (400.0f + 200.0f * skill) * dtSec;
+    act.axes[4] = clampFloat(yawErr, -maxDelta, maxDelta) / kLookFactor;
+    act.axes[5] = clampFloat(pitchErr, -maxDelta * 0.8f, maxDelta * 0.8f) / kLookFactor;
+
+    // Actual aim vs. the true (rendered) point decides whether a shot would plausibly hit.
+    const float tyaw = wrapAngleDeg(trueYaw - world.ownFacingDegrees);
+    const float tpit = truePitch - world.ownPitchDegrees;
+    const float offTarget = std::sqrt(tyaw * tyaw + tpit * tpit);
+    const float fireTolerance = 3.0f + 40.0f / (dist > 5.0f ? dist : 5.0f);
+
+    const bool closeRange = dist < 15.0f;
+    const bool reacted = nowUs >= m_targetAcquiredUs + m_reactionDelayUs;
+    const bool reloading = nowUs < m_reloadUntilUs;
+    const bool tapOnly = dist > 40.0f;
+
+    if (m_fireState == FIRE_WAIT) {
+        if (reacted && !reloading && offTarget < fireTolerance) {
+            m_fireState = FIRE_BURST;
+            m_burstShots = tapOnly ? 1 : randInt(3, 5);
+            // ~100 ms per round; a tap lasts a single tick so the trigger is released.
+            m_fireStateEndUs = nowUs + (tapOnly ? static_cast<uint64_t>(dtSec * 1000000.0f)
+                                                : static_cast<uint64_t>(m_burstShots) * 100000ULL);
+            m_fireTicksSinceReload += m_burstShots;
+        }
+    }
+    if (m_fireState == FIRE_BURST) {
+        act.buttonMaskLow |= BTN_FIRE;
+        if (nowUs >= m_fireStateEndUs) {
+            m_fireState = FIRE_PAUSE;
+            const float pauseMs = randFloat(200.0f, 400.0f) * (tapOnly ? 1.2f : 1.0f);
+            m_fireStateEndUs = nowUs + static_cast<uint64_t>(pauseMs * 1000.0f);
+            if (closeRange) {
+                m_strafeRight = !m_strafeRight;
+            }
+        }
+    } else if (m_fireState == FIRE_PAUSE) {
+        // Let fire deviation recover. No strafing: bots mostly meet at close range, and
+        // flipping strafe every pause made them jitter and lose their own aim.
+        if (nowUs >= m_fireStateEndUs) {
+            m_fireState = FIRE_WAIT;
+            if (m_fireTicksSinceReload >= m_reloadThresholdTicks && !reloading) {
+                act.buttonMaskLow |= BTN_RELOAD;
+                m_fireTicksSinceReload = 0;
+                m_reloadThresholdTicks = randInt(25, 35);
+                m_reloadUntilUs = nowUs + 1800000ULL;
+            }
+        }
+    }
+
+    // Stand still and crouch while engaging so speed deviation decays and crouch spread applies.
+    (void)closeRange;
+    act.buttonMaskLow |= BTN_CROUCH;
+}
+
 void BotBrain::tick(uint64_t nowUs, float dtSec, const BotWorldView& world, BotTickOutput& out) {
     out = BotTickOutput();
     if (dtSec <= 0.0f || dtSec > 0.25f) {
@@ -490,8 +743,12 @@ void BotBrain::tick(uint64_t nowUs, float dtSec, const BotWorldView& world, BotT
 
     // 1. Scan for closest alive enemy soldier within combat range (< 50 m).
     const TrackedSoldier* bestTarget = nullptr;
+    Vec3 targetRendered;
+    float targetDist = 0.0f;
     float bestDist = kCombatRangeMeters;
-    if (world.soldiers) {
+    if (!m_aim.legacy) {
+        selectTarget(nowUs, world, bestTarget, targetRendered, targetDist);
+    } else if (world.soldiers) {
         for (std::map<uint16_t, TrackedSoldier>::const_iterator it = world.soldiers->begin();
              it != world.soldiers->end(); ++it) {
             const TrackedSoldier& s = it->second;
@@ -550,7 +807,7 @@ void BotBrain::tick(uint64_t nowUs, float dtSec, const BotWorldView& world, BotT
     }
 
     // 5. Combat AI vs peaceful navigation.
-    if (inCombat) {
+    if (inCombat && m_aim.legacy) {
         if (bestTarget->netId != m_targetNetId) {
             m_targetNetId = bestTarget->netId;
             m_targetAcquiredUs = nowUs;
@@ -640,8 +897,11 @@ void BotBrain::tick(uint64_t nowUs, float dtSec, const BotWorldView& world, BotT
             }
             --m_burstTicksLeft;
         }
+    } else if (inCombat) {
+        tickCombatHuman(nowUs, dtSec, world, *bestTarget, targetRendered, targetDist, act);
     } else {
         // Out of combat: navigate smoothly along waypoints/route/patrol.
+        resetFireState();
         m_targetNetId = 0;
         if (m_switchBackToPrimaryUs != 0 && nowUs >= m_switchBackToPrimaryUs) {
             act.buttonMaskLow |= BTN_WEAPON_3;

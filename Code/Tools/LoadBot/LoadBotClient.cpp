@@ -51,7 +51,7 @@ LoadBotClient::LoadBotClient(const LoadBotConfig& cfg,
       m_codec(),
       m_uplinkImpair(cfg.uplinkImpair),
       m_downlinkImpair(cfg.downlinkImpair),
-      m_brain(cfg.botIndex, cfg.seed, navMesh, routeLoader),
+      m_brain(cfg.botIndex, cfg.seed, navMesh, routeLoader, cfg.aim),
       m_telemetry(telemetry),
       m_hasOwnPlayerId(false),
       m_ownPlayerId(0),
@@ -677,7 +677,9 @@ void LoadBotClient::onCreatePlayer(const CreatePlayerEventData& data) {
     if (!data.isRemote || (!m_hasOwnPlayerId && data.name == m_playerName)) {
         m_hasOwnPlayerId = true;
         m_ownPlayerId = data.playerId;
-        if (data.teamId != 0) {
+        // The server creates every player on team 2 before the client's JoinTeam. Adopting that
+        // default before our own JoinTeam is sent would make every bot request team 2.
+        if (data.teamId != 0 && m_sentInitialJoin) {
             m_ownTeam = static_cast<int32_t>(data.teamId);
             m_brain.setTeam(m_ownTeam);
         }
@@ -896,6 +898,11 @@ void LoadBotClient::onPlayerGhost(const PlayerGhostState& data) {
 
     if (data.hasTeam) {
         p.team = data.team;
+        // After our JoinTeam, follow the team the server actually granted (it may refuse or move us).
+        if (m_hasOwnPlayerId && pid == m_ownPlayerId && m_sentInitialJoin && data.team > 0) {
+            m_ownTeam = static_cast<int32_t>(data.team);
+            m_brain.setTeam(m_ownTeam);
+        }
         // Propagate updated team to this player's soldier if tracked.
         std::map<uint8_t, uint16_t>::const_iterator sit = m_playerToSoldierNetId.find(pid);
         if (sit != m_playerToSoldierNetId.end()) {
@@ -948,6 +955,7 @@ void LoadBotClient::onSoldierGhost(const SoldierGhostState& data) {
 
     if (data.hasPos) {
         s.pos = data.pos;
+        s.pushPos(m_currentNowUs, data.pos);
         s.hasPos = true;
     }
     if (data.hasSpeed) {

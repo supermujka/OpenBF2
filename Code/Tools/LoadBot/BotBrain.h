@@ -37,7 +37,24 @@ struct TrackedPlayer {
           name() {}
 };
 
+// Human-like aiming configuration (CLI: --aim-skill, --interp-ms, --aim-legacy).
+struct AimConfig {
+    bool legacy;       // true: old nearest-target / newest-position behaviour
+    float skill;       // 0..1; scales reaction time, initial error and convergence time
+    int32_t interpMs;  // client render delay used to pick the aimed-at position
+
+    AimConfig() : legacy(false), skill(0.7f), interpMs(100) {}
+};
+
+// One received snapshot position of a remote soldier (receive time in the bot clock).
+struct PosSample {
+    uint64_t us;
+    Vec3 pos;
+    PosSample() : us(0), pos() {}
+};
+
 struct TrackedSoldier {
+    enum { kHistSize = 12 };
     uint16_t netId;
     uint8_t ownerPlayerId;
     int32_t team;
@@ -50,6 +67,30 @@ struct TrackedSoldier {
     bool isRagdoll;
     bool hasPos;
     uint64_t lastUpdateUs;
+    PosSample hist[kHistSize]; // ring buffer of received positions
+    uint8_t histCount;
+    uint8_t histHead;          // next write slot
+
+    void pushPos(uint64_t us, const Vec3& p) {
+        if (histCount > 0u) {
+            // Teleport (respawn): drop history so we never interpolate across it.
+            const Vec3& l = hist[(histHead + kHistSize - 1u) % kHistSize].pos;
+            const float ex = p.x - l.x, ey = p.y - l.y, ez = p.z - l.z;
+            if (ex * ex + ey * ey + ez * ez > 25.0f * 25.0f) {
+                histCount = 0;
+            }
+        }
+        hist[histHead].us = us;
+        hist[histHead].pos = p;
+        histHead = static_cast<uint8_t>((histHead + 1u) % kHistSize);
+        if (histCount < kHistSize) {
+            ++histCount;
+        }
+    }
+    // i = 0 is the oldest retained sample, histCount-1 the newest.
+    const PosSample& histAt(size_t i) const {
+        return hist[(histHead + kHistSize - histCount + i) % kHistSize];
+    }
 
     TrackedSoldier()
         : netId(0),
@@ -63,8 +104,25 @@ struct TrackedSoldier {
           hitPointsByte(255u),
           isRagdoll(false),
           hasPos(false),
-          lastUpdateUs(0) {}
+          lastUpdateUs(0),
+          hist(),
+          histCount(0),
+          histHead(0) {}
 };
+
+// Position a real client would render at renderUs: linear interpolation between the two
+// received snapshots bracketing renderUs. Clamps to the oldest sample before the history
+// and to the newest after it (no extrapolation). Returns false without any history.
+bool interpolateSoldierPos(const TrackedSoldier& s, uint64_t renderUs, Vec3& out);
+
+// Remaining aim offset (degrees) after elapsedUs of tracking: exponential decay that has
+// dropped to ~5% of initialDeg at convergeUs.
+float aimErrorDecay(float initialDeg, uint64_t elapsedUs, uint64_t convergeUs);
+
+// Terrain line-of-sight approximation from the navmesh aerial height map: false when a
+// height-map bump rises above the chord between both end heights. Fails open (true) when
+// no height map is loaded.
+bool terrainLineOfSight(const NavMesh* nav, const Vec3& a, const Vec3& b);
 
 struct TrackedSpawnGroup {
     uint8_t spawnGroupId;
@@ -156,7 +214,8 @@ struct BotTickOutput {
 class BotBrain {
 public:
     BotBrain(uint32_t botIndex, uint32_t seed,
-             const NavMesh* navMesh, const RouteLoader* routeLoader);
+             const NavMesh* navMesh, const RouteLoader* routeLoader,
+             const AimConfig& aim = AimConfig());
 
     void reset();
     void onSpawned(const Vec3& spawnPos, uint64_t nowUs);
@@ -202,6 +261,14 @@ private:
     void steerToward(const Vec3& ownPos, float ownYawDeg, float ownPitchDeg,
                      const Vec3& targetPos, float dtSec, float& outMouseX, float& outMouseY);
 
+    // Human-like combat (non-legacy).
+    bool selectTarget(uint64_t nowUs, const BotWorldView& world, const TrackedSoldier*& outTarget,
+                      Vec3& outRendered, float& outDist);
+    void tickCombatHuman(uint64_t nowUs, float dtSec, const BotWorldView& world,
+                         const TrackedSoldier& target, const Vec3& rendered, float dist,
+                         PlayerActionInput& act);
+    void resetFireState();
+
     uint32_t m_botIndex;
     int32_t m_team;
     int32_t m_kit;
@@ -229,6 +296,19 @@ private:
     uint64_t m_reloadUntilUs;
     uint64_t m_nextWeaponSwitchUs;
     uint64_t m_switchBackToPrimaryUs;
+
+    // Human aim model state
+    AimConfig m_aim;
+    float m_aimInitYawDeg;
+    float m_aimInitPitchDeg;
+    uint64_t m_aimConvergeUs;
+    float m_jitterYawDeg;
+    float m_jitterPitchDeg;
+    uint64_t m_nextJitterUs;
+    enum FireState { FIRE_WAIT = 0, FIRE_BURST = 1, FIRE_PAUSE = 2 };
+    FireState m_fireState;
+    uint64_t m_fireStateEndUs;
+    int32_t m_burstShots;
 
     // Respawn cadence
     uint64_t m_nextSpawnRequestUs;

@@ -11,7 +11,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <algorithm>
 #include <memory>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -60,6 +62,11 @@ struct RunnerOptions {
     double pingMs;
     double jitterMs;
     double lossPct;
+    double pingMinMs;       // < 0: per-bot ping range disabled
+    double pingMaxMs;
+    double highPingPct;     // share of bots drawn from the high-ping range
+    double highPingMinMs;
+    double highPingMaxMs;
     int durationSec;
     std::string navmeshPath;
     std::string routesPath;
@@ -70,6 +77,7 @@ struct RunnerOptions {
     bool worldSizeExplicit;
     uint32_t seed;
     int reportSec;
+    bf2bot::AimConfig aim;
     bool verbose;
 
     RunnerOptions()
@@ -79,6 +87,11 @@ struct RunnerOptions {
           pingMs(35.0),
           jitterMs(8.0),
           lossPct(1.0),
+          pingMinMs(-1.0),
+          pingMaxMs(-1.0),
+          highPingPct(0.0),
+          highPingMinMs(50.0),
+          highPingMaxMs(100.0),
           durationSec(300),
           navmeshPath(),
           routesPath(),
@@ -105,6 +118,11 @@ void printUsage(const char* prog) {
         "  --ping-ms <float>        Simulated round-trip ping in ms, split 50/50 uplink/downlink (default: 35.0)\n"
         "  --jitter-ms <float>      Simulated RTT jitter in ms, split 50/50 per direction (default: 8.0)\n"
         "  --loss-pct <float>       Simulated packet loss %% applied independently per direction (default: 1.0)\n"
+        "  --ping-min-ms <float>    With --ping-max-ms: each bot gets its own RTT drawn uniformly\n"
+        "  --ping-max-ms <float>    from [min,max] (overrides --ping-ms; --jitter-ms still applies)\n"
+        "  --high-ping-pct <float>  Percent of bots drawn from the high-ping range instead (default: 0)\n"
+        "  --high-ping-min-ms <f>   High-ping range minimum RTT (default: 50)\n"
+        "  --high-ping-max-ms <f>   High-ping range maximum RTT (default: 100)\n"
         "  --duration-sec <int>     Run duration in seconds; 0 = run until SIGINT/SIGTERM (default: 300)\n"
         "  --navmesh <dir_or_qtr>   Optional BF2 AIPathFinding v3 .qtr file or directory (Tier 1 nav)\n"
         "  --routes <routes.bin>    Optional OBR1 recorded route file (Tier 2 nav)\n"
@@ -113,7 +131,10 @@ void printUsage(const char* prog) {
         "  --stagger-ms <int>       Delay between consecutive bot joins in ms (default: 150)\n"
         "  --world-size <float>     Map world size in meters (default: 1024.0; auto-set from navmesh if loaded)\n"
         "  --seed <uint32>          Deterministic RNG seed (default: 1337)\n"
-        "  --report-sec <int>       Periodic telemetry report interval in seconds (default: 10)\n"
+        "  --aim-skill <0..1>       Human-like aim skill: scales reaction time, aim error, convergence (default: 0.7)\n"
+        "  --interp-ms <int>        Client interpolation delay: bots aim at the position rendered at now-interp (default: 100)\n"
+        "  --aim-legacy             Use the old aiming (nearest target, newest position, no reaction/error model)\n"
+        "  --report-sec <int>      Periodic telemetry report interval in seconds (default: 10)\n"
         "  --verbose                Enable verbose per-bot handshake/disconnect logging\n"
         "  -h, --help               Show this help message\n",
         prog);
@@ -126,6 +147,10 @@ bool parseArgs(int argc, char** argv, RunnerOptions& opt, bool& showHelp) {
         if (arg == "-h" || arg == "--help") {
             showHelp = true;
             return true;
+        }
+        if (arg == "--aim-legacy") {
+            opt.aim.legacy = true;
+            continue;
         }
         if (arg == "--verbose") {
             opt.verbose = true;
@@ -157,6 +182,22 @@ bool parseArgs(int argc, char** argv, RunnerOptions& opt, bool& showHelp) {
         } else if (arg == "--ping-ms") {
             opt.pingMs = std::strtod(val, nullptr);
             if (opt.pingMs < 0.0) opt.pingMs = 0.0;
+        } else if (arg == "--ping-min-ms") {
+            opt.pingMinMs = std::strtod(val, nullptr);
+            if (opt.pingMinMs < 0.0) opt.pingMinMs = 0.0;
+        } else if (arg == "--ping-max-ms") {
+            opt.pingMaxMs = std::strtod(val, nullptr);
+            if (opt.pingMaxMs < 0.0) opt.pingMaxMs = 0.0;
+        } else if (arg == "--high-ping-pct") {
+            opt.highPingPct = std::strtod(val, nullptr);
+            if (opt.highPingPct < 0.0) opt.highPingPct = 0.0;
+            if (opt.highPingPct > 100.0) opt.highPingPct = 100.0;
+        } else if (arg == "--high-ping-min-ms") {
+            opt.highPingMinMs = std::strtod(val, nullptr);
+            if (opt.highPingMinMs < 0.0) opt.highPingMinMs = 0.0;
+        } else if (arg == "--high-ping-max-ms") {
+            opt.highPingMaxMs = std::strtod(val, nullptr);
+            if (opt.highPingMaxMs < 0.0) opt.highPingMaxMs = 0.0;
         } else if (arg == "--jitter-ms") {
             opt.jitterMs = std::strtod(val, nullptr);
             if (opt.jitterMs < 0.0) opt.jitterMs = 0.0;
@@ -182,6 +223,14 @@ bool parseArgs(int argc, char** argv, RunnerOptions& opt, bool& showHelp) {
             opt.worldSize = static_cast<float>(std::strtod(val, nullptr));
             if (opt.worldSize < 64.0f) opt.worldSize = 64.0f;
             opt.worldSizeExplicit = true;
+        } else if (arg == "--aim-skill") {
+            opt.aim.skill = static_cast<float>(std::strtod(val, nullptr));
+            if (opt.aim.skill < 0.0f) opt.aim.skill = 0.0f;
+            if (opt.aim.skill > 1.0f) opt.aim.skill = 1.0f;
+        } else if (arg == "--interp-ms") {
+            opt.aim.interpMs = static_cast<int32_t>(std::strtol(val, nullptr, 10));
+            if (opt.aim.interpMs < 0) opt.aim.interpMs = 0;
+            if (opt.aim.interpMs > 1000) opt.aim.interpMs = 1000;
         } else if (arg == "--seed") {
             opt.seed = static_cast<uint32_t>(std::strtoul(val, nullptr, 10));
         } else if (arg == "--report-sec") {
@@ -313,11 +362,46 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (opt.aim.legacy) {
+        std::printf("[LoadBot] Aim: legacy (nearest target, newest position)\n");
+    } else {
+        std::printf("[LoadBot] Aim: human model skill=%.2f interp=%dms (LOS=%s)\n",
+                    static_cast<double>(opt.aim.skill), static_cast<int>(opt.aim.interpMs),
+                    navMesh.hasAerialHeightMap() ? "aerial-heightmap-bump" : "off(no AHM)");
+    }
+
     bf2bot::Telemetry telemetry;
     const uint64_t startUs = steadyNowUs();
 
     std::vector<std::unique_ptr<bf2bot::LoadBotClient> > bots;
     bots.reserve(opt.bots);
+
+    // Per-bot RTT is a seeded, deterministic draw so one process can model a mixed-ping lobby;
+    // several processes would reuse the same bot names and profile ids and kick each other.
+    std::vector<double> botPingMs(opt.bots, opt.pingMs);
+    std::vector<bool> botHighPing(opt.bots, false);
+    const bool perBotPing = opt.pingMinMs >= 0.0 && opt.pingMaxMs >= 0.0;
+    if (perBotPing || opt.highPingPct > 0.0) {
+        std::mt19937 pingRng(opt.seed ^ 0x5EEDF00Du);
+        const double lo = perBotPing ? std::min(opt.pingMinMs, opt.pingMaxMs) : opt.pingMs;
+        const double hi = perBotPing ? std::max(opt.pingMinMs, opt.pingMaxMs) : opt.pingMs;
+        std::uniform_real_distribution<double> lowDist(lo, hi);
+        std::uniform_real_distribution<double> highDist(std::min(opt.highPingMinMs, opt.highPingMaxMs),
+                                                        std::max(opt.highPingMinMs, opt.highPingMaxMs));
+        std::vector<uint32_t> order(opt.bots);
+        for (uint32_t i = 0; i < opt.bots; ++i) order[i] = i;
+        std::shuffle(order.begin(), order.end(), pingRng);
+        const uint32_t highCount = static_cast<uint32_t>(opt.bots * opt.highPingPct / 100.0 + 0.5);
+        for (uint32_t k = 0; k < opt.bots; ++k) {
+            const uint32_t b = order[k];
+            botHighPing[b] = k < highCount;
+            botPingMs[b] = botHighPing[b] ? highDist(pingRng) : lowDist(pingRng);
+        }
+        std::printf("[LoadBot] Per-bot RTT ms (%u high-ping, marked *):", highCount);
+        for (uint32_t b = 0; b < opt.bots; ++b)
+            std::printf(" %02u=%.0f%s", b + 1u, botPingMs[b], botHighPing[b] ? "*" : "");
+        std::printf("\n");
+    }
 
     for (uint32_t i = 0; i < opt.bots; ++i) {
         bf2bot::LoadBotConfig cfg;
@@ -328,14 +412,15 @@ int main(int argc, char** argv) {
         cfg.seed = opt.seed;
         cfg.startAtUs = startUs + static_cast<uint64_t>(i) * static_cast<uint64_t>(opt.staggerMs) * 1000ULL;
         cfg.verbose = opt.verbose;
+        cfg.aim = opt.aim;
 
         // Split ping and jitter 50/50 across uplink and downlink so RTT matches --ping-ms / --jitter-ms.
-        cfg.uplinkImpair.oneWayDelayMs = opt.pingMs * 0.5;
+        cfg.uplinkImpair.oneWayDelayMs = botPingMs[i] * 0.5;
         cfg.uplinkImpair.jitterMs = opt.jitterMs * 0.5;
         cfg.uplinkImpair.lossPct = opt.lossPct;
         cfg.uplinkImpair.seed = opt.seed ^ (i * 2u + 1u);
 
-        cfg.downlinkImpair.oneWayDelayMs = opt.pingMs * 0.5;
+        cfg.downlinkImpair.oneWayDelayMs = botPingMs[i] * 0.5;
         cfg.downlinkImpair.jitterMs = opt.jitterMs * 0.5;
         cfg.downlinkImpair.lossPct = opt.lossPct;
         cfg.downlinkImpair.seed = opt.seed ^ (i * 2u + 2u);
