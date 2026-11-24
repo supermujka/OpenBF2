@@ -15,6 +15,7 @@
 #include "../../IPlayer.h"
 #include "../../ObjectLayoutAccess.h"
 #include "../../../../Physics/IPhysicsNode.h"
+#include "../../../../Physics/SoldierResponse.h"
 #include "../../../../Core/Debug.h"
 #include "../../../../Core/Ids.h"
 #include "../../../../IO/Input/PlayerInput.h"
@@ -174,11 +175,13 @@ void SoldierDeviationComp::updateDeviation(io::PlayerInput input,
         SoldierPose pose = static_cast<Soldier*>(soldierObject)->getPose();
         if (!soldierObject->getParent())
         {
-            // Retail has no null guard here.  A Soldier is expected to carry response physics;
-            // preserve the raw +0xFA ground-contact read instead of inventing a fallback.
-            unsigned char* const response = static_cast<unsigned char*>(
+            // Retail has no null guard here.  A Soldier is expected to carry response physics.
+            // Retail reads the raw x86 +0xFA ground-contact byte; the named field keeps that read
+            // correct on native x64, where a raw 0xFA offset lands on a different member and
+            // forced every non-parented soldier to the standing modifier.
+            const SoldierResponsePhysics* const response = static_cast<const SoldierResponsePhysics*>(
                 object_detail::LayoutAccess::responsePhysics(soldierObject));
-            if (!response[0xFA])
+            if (!response->m_byteFA)
                 pose = SoldierPose_Stand;
         }
 
