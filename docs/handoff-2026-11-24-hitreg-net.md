@@ -33,6 +33,12 @@ Sažetak jedne duge sesije. Novi agent: pročitaj ovo, pa `AGENTS.md`.
    van-only). Zaključak: lokalni test bez jittera nije reprezentativan; `queueDelay 1` ostaviti dok
    gather CSV ne pokaže suprotno. Tamo je i `OVERRIDE_WALL` 7.7% isporuka (lokalno ~2%), kandidat
    za "pogodak bez štete".
+   **`maxClientInterpMs` na pravom serveru** (default u kodu 133, retail samo 512 tehnički):
+   133 → live vs vanilla +1.5/100; 250 → ~0; **50 → −0.7 (lošije, rewind premali)**; 450 → +1.3.
+   133 i 450/350 su statistički isti. Vlasnik i drugi igrač subjektivno osjećaju 350 kao
+   "ogromno bolje" (u istom periodu: restart mape, friendly fire 0, manje rafala), pa je
+   **350 upisan trajno** u `karkand_inf64.con`, uz `queueDrainMaxTarget 4` i friendly fire 0.
+   Promjene na serveru se bilježe u `/home/bf2/server/live_changes.log`.
 6. **`queueDrainMaxTarget`**: kod stabilne veze red je uvijek 1, delay 0 → postavka nema efekta.
    Vlasnik subjektivno preferira 1; za igrače s jitterom 2 je kompromis.
 7. **Kapacitet 64 igrača (Karkand, loadbotovi)**: tik p50 ~5.7 ms / p99 ~7.5 ms od 33.3 ms, glavna nit
