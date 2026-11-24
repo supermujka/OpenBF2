@@ -22,13 +22,33 @@ static const uint64_t kPingIntervalUs   = 2000000ULL;  // 2.0 s
 static const uint64_t kReconnectDelayUs = 2000000ULL;  // 2.0 s
 static const uint64_t kIdleTimeoutUs    = 20000000ULL; // 20.0 s
 
+float wrapDeg(float deg) {
+    while (deg > 180.0f) deg -= 360.0f;
+    while (deg < -180.0f) deg += 360.0f;
+    return deg;
+}
+
+float clampRange(float v, float lo, float hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+float quantizeAxisFloat(float v) {
+    float scaled = v * 100.0f;
+    if (scaled > 32767.0f) scaled = 32767.0f;
+    else if (scaled < -32767.0f) scaled = -32767.0f;
+    return static_cast<float>(static_cast<int16_t>(static_cast<int32_t>(scaled))) / 100.0f;
+}
+
 } // namespace
 
 LoadBotClient::LoadBotClient(const LoadBotConfig& cfg,
                              const sockaddr_in& serverAddr,
                              const NavMesh* navMesh,
                              const RouteLoader* routeLoader,
-                             Telemetry* telemetry)
+                             Telemetry* telemetry,
+                             TeamTactics* teamTactics)
     : m_config(cfg),
       m_serverAddr(serverAddr),
       m_sockFd(kInvalidBotSocket),
@@ -51,7 +71,7 @@ LoadBotClient::LoadBotClient(const LoadBotConfig& cfg,
       m_codec(),
       m_uplinkImpair(cfg.uplinkImpair),
       m_downlinkImpair(cfg.downlinkImpair),
-      m_brain(cfg.botIndex, cfg.seed, navMesh, routeLoader, cfg.aim),
+      m_brain(cfg.botIndex, cfg.seed, navMesh, routeLoader, cfg.aim, teamTactics),
       m_telemetry(telemetry),
       m_hasOwnPlayerId(false),
       m_ownPlayerId(0),
@@ -61,9 +81,24 @@ LoadBotClient::LoadBotClient(const LoadBotConfig& cfg,
       m_ownSoldierNetId(0),
       m_hasOwnPos(false),
       m_ownPos(),
+      m_ownSpeed(),
       m_ownFacingDegrees(0.0f),
+      m_ownLookLeftRightAngle(0.0f),
+      m_ownPendingTurn(0.0f),
       m_ownPitchDegrees(0.0f),
       m_ownPose(0),
+      m_ownHitPointsByte(255u),
+      m_ownWeaponZoom(0u),
+      m_ownWeaponState(0u),
+      m_ownWeaponStowed(false),
+      m_ownSprintStamina(1.0f),
+      m_ownIsSprinting(false),
+      m_ownIsGrounded(true),
+      m_ownKit(m_brain.assignedKit()),
+      m_estimatedZoomMod(0.55f),
+      m_lastAckedInputIndex(0),
+      m_ctrlBaselines(),
+      m_pendingAim(),
       m_players(),
       m_playerNetIdToPlayerId(),
       m_soldiers(),
@@ -178,6 +213,24 @@ Vec3 LoadBotClient::dequantizeSpawnGroupPos(uint8_t quantX, uint8_t quantZ) cons
     return Vec3(x, 0.0f, z);
 }
 
+void LoadBotClient::clearOwnSoldierPrediction() {
+    m_ownLookLeftRightAngle = 0.0f;
+    m_ownPendingTurn = 0.0f;
+    m_ownSpeed = Vec3();
+    m_ownHitPointsByte = 255u;
+    m_ownWeaponZoom = 0u;
+    m_ownWeaponState = 0u;
+    m_ownWeaponStowed = false;
+    m_ownSprintStamina = 1.0f;
+    m_ownIsSprinting = false;
+    m_ownIsGrounded = true;
+    m_estimatedZoomMod = 0.55f;
+    m_pendingAim.clear();
+    for (int i = 0; i < 8; ++i) {
+        m_ctrlBaselines[i] = OwnSoldierBaseline();
+    }
+}
+
 void LoadBotClient::resetSession(uint64_t reconnectAtUs) {
     m_state = BOT_DISCONNECTED;
     m_nextConnectTryUs = reconnectAtUs;
@@ -209,6 +262,9 @@ void LoadBotClient::resetSession(uint64_t reconnectAtUs) {
     m_ownFacingDegrees = 0.0f;
     m_ownPitchDegrees = 0.0f;
     m_ownPose = 0;
+    m_ownKit = m_brain.assignedKit();
+    m_lastAckedInputIndex = 0;
+    clearOwnSoldierPrediction();
 
     m_players.clear();
     m_playerNetIdToPlayerId.clear();
@@ -541,6 +597,18 @@ void LoadBotClient::tick30Hz(uint64_t nowUs, float dtSec) {
 
     // Run Combat & Navigation AI once InGame and initial JoinTeam/Kit/Spawn handshake is queued
     if (m_state == BOT_IN_GAME && m_sentInitialJoin) {
+        // Compute client-predicted aim yaw/pitch from server-reconciled (facing + lookLR, pitch)
+        // plus any unacknowledged in-flight mouse deltas so high-ping bots never oscillate.
+        float predYaw = m_ownFacingDegrees + m_ownLookLeftRightAngle;
+        float predPitch = m_ownPitchDegrees;
+        for (size_t i = 0; i < m_pendingAim.size(); ++i) {
+            predYaw += m_pendingAim[i].predictedYawDeg;
+            predPitch += m_pendingAim[i].predictedPitchDeg;
+        }
+        predYaw = wrapDeg(predYaw);
+        predPitch = clampRange(predPitch, -85.0f, 85.0f);
+        const float activeMouseMod = (m_ownWeaponZoom > 0u) ? m_estimatedZoomMod : 1.0f;
+
         BotWorldView view;
         view.ownPlayerId = m_ownPlayerId;
         view.ownTeam = m_ownTeam;
@@ -550,10 +618,27 @@ void LoadBotClient::tick30Hz(uint64_t nowUs, float dtSec) {
         view.hasOwnPos = m_hasOwnPos;
         view.ownPos = m_ownPos;
         view.ownFacingDegrees = m_ownFacingDegrees;
+        view.ownLookLeftRightAngle = m_ownLookLeftRightAngle;
+        view.ownPendingTurn = m_ownPendingTurn;
         view.ownPitchDegrees = m_ownPitchDegrees;
+        view.hasPredictedAim = true;
+        view.ownAimYawDegrees = predYaw;
+        view.ownAimPitchDegrees = predPitch;
+        view.ownMouseSpeedMod = activeMouseMod;
         view.ownPose = m_ownPose;
+        view.ownHitPointsByte = m_ownHitPointsByte;
+        view.ownWeaponZoom = m_ownWeaponZoom;
+        view.ownWeaponState = m_ownWeaponState;
+        view.ownWeaponStowed = m_ownWeaponStowed;
+        view.ownSprintStamina = m_ownSprintStamina;
+        view.ownIsSprinting = m_ownIsSprinting;
+        view.ownIsGrounded = m_ownIsGrounded;
+        view.ownSpeed = m_ownSpeed;
+        view.ownKit = m_ownKit;
+        view.rttMs = m_conn.smoothedRttMs();
         view.worldSize = m_config.worldSize;
         view.soldiers = &m_soldiers;
+        view.players = &m_players;
         view.spawnGroups = &m_spawnGroups;
         view.controlPoints = &m_controlPoints;
 
@@ -566,7 +651,20 @@ void LoadBotClient::tick30Hz(uint64_t nowUs, float dtSec) {
         }
 
         if (m_ownAlive || m_codec.actions().isEnabled()) {
-            m_codec.actions().pushAction(out.action);
+            const int32_t pushedIdx = m_codec.actions().pushAction(out.action);
+            if (m_ownAlive && !m_ownManDown) {
+                PendingAimInput pi;
+                pi.inputIndex = pushedIdx;
+                pi.rawMouseX = quantizeAxisFloat(out.action.axes[4]);
+                pi.rawMouseY = quantizeAxisFloat(out.action.axes[5]);
+                pi.predictedYawDeg = pi.rawMouseX * 5.0f * activeMouseMod;
+                pi.predictedPitchDeg = pi.rawMouseY * 5.0f * activeMouseMod;
+                pi.zoomed = (m_ownWeaponZoom > 0u);
+                if (m_pendingAim.size() >= 48u) {
+                    m_pendingAim.pop_front();
+                }
+                m_pendingAim.push_back(pi);
+            }
         }
     }
 
@@ -790,7 +888,7 @@ void LoadBotClient::onPostRemoteEvent(const PostRemoteEventData& data) {
             m_codec.events().queueConnectionType(5u);
             m_codec.events().queueJoinTeam(m_brain.assignedTeam());
             m_codec.events().queueSelectKit(m_brain.assignedKit(), 0);
-            const int32_t sg = m_brain.pickSpawnGroup(m_spawnGroups);
+            const int32_t sg = m_brain.pickSpawnGroup(m_spawnGroups, &m_controlPoints, &m_soldiers);
             if (sg >= 0) {
                 m_codec.events().queueSelectSpawnPoint(sg);
             }
@@ -809,8 +907,11 @@ void LoadBotClient::onPostRemoteEvent(const PostRemoteEventData& data) {
             const bool wasAlive = m_ownAlive && !m_ownManDown;
             m_ownAlive = true;
             m_ownManDown = false;
-            if (!wasAlive && m_hasOwnPos) {
-                m_brain.onSpawned(m_ownPos, m_currentNowUs);
+            if (!wasAlive) {
+                clearOwnSoldierPrediction();
+                if (m_hasOwnPos) {
+                    m_brain.onSpawned(m_ownPos, m_currentNowUs);
+                }
             }
         }
     } else if (data.eventId == NRE_PLAYER_KILLED && data.payload.size() >= 4u) {
@@ -819,6 +920,7 @@ void LoadBotClient::onPostRemoteEvent(const PostRemoteEventData& data) {
         if (m_hasOwnPlayerId && pid == static_cast<int32_t>(m_ownPlayerId)) {
             if (m_ownAlive) {
                 m_ownAlive = false;
+                clearOwnSoldierPrediction();
                 m_brain.onDied(m_currentNowUs);
             }
         }
@@ -829,6 +931,7 @@ void LoadBotClient::onKilledBy(const KilledByEventData& data) {
     if (m_hasOwnPlayerId && data.victimId == m_ownPlayerId) {
         if (m_ownAlive) {
             m_ownAlive = false;
+            clearOwnSoldierPrediction();
             m_brain.onDied(m_currentNowUs);
         }
     }
@@ -850,27 +953,90 @@ void LoadBotClient::onControlObjectState(const ControlObjectStateData& data) {
     ++m_packetGhostCount;
 
     const bool wasAlive = m_ownAlive;
+    const bool hadPosBefore = m_hasOwnPos;
     if (data.isSoldier) {
+        if (m_ownSoldierNetId != 0u && m_ownSoldierNetId != data.controlNetId) {
+            // New soldier entity (respawn): discard stale baseline & in-flight aim deltas.
+            clearOwnSoldierPrediction();
+        }
         m_ownSoldierNetId = data.controlNetId;
+
+        const float prevSrvAimYaw = wrapDeg(m_ownFacingDegrees + m_ownLookLeftRightAngle);
+        const bool hadValidPrevYaw = m_hasOwnPos && wasAlive;
+
         if (data.hasSoldierState) {
             const SoldierGhostState& ss = data.soldierState;
-            if (ss.hasPos) {
-                m_ownPos = ss.pos;
-                m_hasOwnPos = true;
+            const uint8_t slot = static_cast<uint8_t>(data.baselineSlot & 7u);
+
+            OwnSoldierBaseline cur;
+            if (!data.isDelta) {
+                // Full snapshot establishing baseline slot `slot`.
+                cur.valid = true;
+                cur.pos = ss.hasPos ? ss.pos : data.compressionVec;
+                cur.speed = ss.hasSpeed ? ss.speed : Vec3();
+                cur.facingDegrees = ss.hasFacing ? ss.facingDegrees : 0.0f;
+                cur.lookLeftRightAngle = ss.hasLookLR ? ss.lookLeftRightAngle : 0.0f;
+                cur.pendingTurn = ss.hasPendingTurn ? ss.pendingTurn : 0.0f;
+                cur.pitchDegrees = ss.hasLookUD ? ss.lookUpDownAngle : 0.0f;
+                cur.pose = ss.hasPose ? ss.pose : 0u;
+                cur.hitPointsByte = ss.hasHitPoints ? ss.hitPointsByte : m_ownHitPointsByte;
+                cur.sprintStamina = ss.hasSprint ? ss.sprintStamina : m_ownSprintStamina;
+                cur.isSprinting = ss.hasSprint ? ss.isSprinting : false;
+                cur.isRagdoll = ss.isRagdoll;
+                m_ctrlBaselines[slot] = cur;
             } else {
-                m_ownPos = data.compressionVec;
-                m_hasOwnPos = true;
+                // Delta compressed against acknowledged baseline slot `slot`.
+                if (m_ctrlBaselines[slot].valid) {
+                    cur = m_ctrlBaselines[slot];
+                } else {
+                    cur.pos = m_hasOwnPos ? m_ownPos : data.compressionVec;
+                    cur.speed = m_ownSpeed;
+                    cur.facingDegrees = m_ownFacingDegrees;
+                    cur.lookLeftRightAngle = m_ownLookLeftRightAngle;
+                    cur.pendingTurn = m_ownPendingTurn;
+                    cur.pitchDegrees = m_ownPitchDegrees;
+                    cur.pose = m_ownPose;
+                    cur.hitPointsByte = m_ownHitPointsByte;
+                    cur.sprintStamina = m_ownSprintStamina;
+                    cur.isSprinting = m_ownIsSprinting;
+                    cur.isRagdoll = false;
+                }
+                if (ss.hasPos) cur.pos = ss.pos;
+                if (ss.hasSpeed) cur.speed = ss.speed;
+                if (ss.hasFacing) cur.facingDegrees = ss.facingDegrees;
+                if (ss.hasLookLR) cur.lookLeftRightAngle = ss.lookLeftRightAngle;
+                if (ss.hasPendingTurn) cur.pendingTurn = ss.pendingTurn;
+                if (ss.hasLookUD) cur.pitchDegrees = ss.lookUpDownAngle;
+                if (ss.hasPose) cur.pose = ss.pose;
+                if (ss.hasHitPoints) cur.hitPointsByte = ss.hitPointsByte;
+                if (ss.hasSprint) {
+                    cur.sprintStamina = ss.sprintStamina;
+                    cur.isSprinting = ss.isSprinting;
+                }
+                cur.isRagdoll = ss.isRagdoll;
             }
-            if (ss.hasFacing) {
-                m_ownFacingDegrees = ss.facingDegrees;
+
+            m_ownPos = cur.pos;
+            m_hasOwnPos = true;
+            m_ownSpeed = cur.speed;
+            m_ownFacingDegrees = cur.facingDegrees;
+            m_ownLookLeftRightAngle = cur.lookLeftRightAngle;
+            m_ownPendingTurn = cur.pendingTurn;
+            m_ownPitchDegrees = cur.pitchDegrees;
+            m_ownPose = cur.pose;
+            m_ownHitPointsByte = cur.hitPointsByte;
+            m_ownSprintStamina = cur.sprintStamina;
+            m_ownIsSprinting = cur.isSprinting;
+
+            // Unconditional fields present on every non-ragdoll Soldier update.
+            if (!ss.isRagdoll) {
+                m_ownWeaponZoom = ss.weaponZoom;
+                m_ownWeaponState = ss.weaponState;
+                m_ownWeaponStowed = ss.weaponStowed;
+                m_ownIsGrounded = ss.isGrounded;
             }
-            if (ss.hasLookUD) {
-                m_ownPitchDegrees = ss.lookUpDownAngle;
-            }
-            if (ss.hasPose) {
-                m_ownPose = ss.pose;
-            }
-            if (ss.hasHitPoints && ss.hitPointsByte > 0u && !ss.isRagdoll) {
+
+            if (cur.hitPointsByte > 0u && !cur.isRagdoll) {
                 m_ownAlive = true;
                 m_ownManDown = false;
             }
@@ -879,7 +1045,44 @@ void LoadBotClient::onControlObjectState(const ControlObjectStateData& data) {
             m_hasOwnPos = true;
         }
 
-        if (!wasAlive && m_ownAlive && m_hasOwnPos) {
+        // Reconcile in-flight aim queue against server-processed inputIndex (actionBufferEntries)
+        // and self-calibrate zoomed mouseSpeedMod from observed yaw response.
+        const int32_t ackedIdx = data.actionBufferEntries;
+        if (ackedIdx > 0 && ackedIdx >= m_lastAckedInputIndex) {
+            float sumZoomedMouseX = 0.0f;
+            bool allZoomed = true;
+            int32_t ackedCount = 0;
+
+            while (!m_pendingAim.empty() && m_pendingAim.front().inputIndex <= ackedIdx) {
+                const PendingAimInput& pi = m_pendingAim.front();
+                if (!pi.zoomed) {
+                    allZoomed = false;
+                } else {
+                    sumZoomedMouseX += pi.rawMouseX;
+                }
+                ++ackedCount;
+                m_pendingAim.pop_front();
+            }
+
+            if (hadValidPrevYaw && allZoomed && ackedCount > 0 && m_ownWeaponZoom > 0u &&
+                std::fabs(sumZoomedMouseX) > 0.35f) {
+                const float newSrvAimYaw = wrapDeg(m_ownFacingDegrees + m_ownLookLeftRightAngle);
+                const float obsDelta = wrapDeg(newSrvAimYaw - prevSrvAimYaw);
+                if (std::fabs(obsDelta) < 60.0f) {
+                    const float obsMod = obsDelta / (sumZoomedMouseX * 5.0f);
+                    if (obsMod >= 0.15f && obsMod <= 1.25f) {
+                        m_estimatedZoomMod = m_estimatedZoomMod * 0.7f + obsMod * 0.3f;
+                    }
+                }
+            }
+            m_lastAckedInputIndex = ackedIdx;
+        } else if (m_pendingAim.size() > 16u) {
+            // Guard against unbounded drift if a mock/server sends ackedIdx=0.
+            m_pendingAim.clear();
+        }
+
+        if ((!wasAlive || !hadPosBefore) && m_ownAlive && m_hasOwnPos) {
+            m_pendingAim.clear();
             m_brain.onSpawned(m_ownPos, m_currentNowUs);
         }
     }
@@ -928,6 +1131,28 @@ void LoadBotClient::onPlayerGhost(const PlayerGhostState& data) {
     }
     if (data.hasKit) {
         p.kit = data.kit;
+        if (m_hasOwnPlayerId && pid == m_ownPlayerId) {
+            m_ownKit = static_cast<int32_t>(data.kit);
+        }
+    }
+    if (data.hasCallForMedic) {
+        p.callForMedic = data.callForMedic;
+    }
+    if (data.hasFiring) {
+        p.isFiring = data.isFiring;
+        if (data.isFiring) {
+            p.lastFiredUs = m_currentNowUs;
+        }
+        std::map<uint8_t, uint16_t>::const_iterator sit = m_playerToSoldierNetId.find(pid);
+        if (sit != m_playerToSoldierNetId.end()) {
+            std::map<uint16_t, TrackedSoldier>::iterator sIt = m_soldiers.find(sit->second);
+            if (sIt != m_soldiers.end()) {
+                sIt->second.isFiring = data.isFiring;
+                if (data.isFiring) {
+                    sIt->second.lastFiredUs = m_currentNowUs;
+                }
+            }
+        }
     }
 
     if (m_hasOwnPlayerId && pid == m_ownPlayerId) {
@@ -944,9 +1169,13 @@ void LoadBotClient::onPlayerGhost(const PlayerGhostState& data) {
         }
         const bool nowAlive = m_ownAlive && !m_ownManDown;
         if (prevAlive && !nowAlive) {
+            clearOwnSoldierPrediction();
             m_brain.onDied(m_currentNowUs);
-        } else if (!prevAlive && nowAlive && m_hasOwnPos) {
-            m_brain.onSpawned(m_ownPos, m_currentNowUs);
+        } else if (!prevAlive && nowAlive) {
+            clearOwnSoldierPrediction();
+            if (m_hasOwnPos) {
+                m_brain.onSpawned(m_ownPos, m_currentNowUs);
+            }
         }
     }
 }
@@ -988,6 +1217,10 @@ void LoadBotClient::onSoldierGhost(const SoldierGhostState& data) {
             std::map<uint8_t, TrackedPlayer>::const_iterator plIt = m_players.find(pIt->second);
             if (plIt != m_players.end()) {
                 s.team = plIt->second.team;
+                if (s.lastFiredUs == 0) {
+                    s.isFiring = plIt->second.isFiring;
+                    s.lastFiredUs = plIt->second.lastFiredUs;
+                }
             }
         }
     }
@@ -1048,6 +1281,16 @@ void LoadBotClient::onControlPointGhost(const ControlPointGhostState& data) {
     }
     if (data.hasAllowTeam2) {
         cp.allowCaptureByTeam2 = data.allowCaptureByTeam2;
+    }
+    if (data.hasTakeOver) {
+        cp.takeOverCounter = data.takeOverCounter;
+        cp.takeOverChangePerSecond = data.takeOverChangePerSecond;
+    }
+    if (data.hasFlagTeam) {
+        cp.flagTeam = data.flagTeam;
+    }
+    if (data.hasCapturingState) {
+        cp.capturingState = data.capturingState;
     }
     if (!cp.hasPos) {
         std::map<uint16_t, Vec3>::const_iterator posIt = m_objectPositions.find(data.netId);

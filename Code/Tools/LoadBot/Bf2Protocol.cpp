@@ -1196,7 +1196,10 @@ void GhostReceiver::decodePlayerGhost(BitStream& bs, uint16_t netId, PlayerGhost
         bs.readRanged(2047u); // score5 (12b)
     }
     if (mask & 0x200000u) bs.readBool(); // flagHolder
-    if (mask & 0x10u) bs.readBool();     // callForMedic
+    if (mask & 0x10u) {
+        out.hasCallForMedic = true;
+        out.callForMedic = bs.readBool();
+    }
 
     // Weapon section (StatePrecisionGhost)
     static const uint32_t kFiringBits[3] = { 0x40u, 0x80u, 0x20000u };
@@ -1208,6 +1211,10 @@ void GhostReceiver::decodePlayerGhost(BitStream& bs, uint16_t netId, PlayerGhost
             continue;
         }
         const bool firing = bs.readBool();
+        out.hasFiring = true;
+        if (firing) {
+            out.isFiring = true;
+        }
         if (!firing && (mask & 0x10000u) == 0) {
             continue;
         }
@@ -1380,8 +1387,8 @@ bool GhostReceiver::readControlObjectState(BitStream& bs, uint32_t tick, IGhostS
     }
 
     if (!bs.hasError() && data.isSoldier && bs.getBitOffset() + 4u <= endPos) {
-        bs.readBool();   // isDelta
-        bs.readUInt(3);  // baseline slot 0..7
+        data.isDelta = bs.readBool();
+        data.baselineSlot = static_cast<uint8_t>(bs.readUInt(3));
         if (!bs.hasError() && bs.getBitOffset() < endPos) {
             decodeSoldierUpToSprint(bs, data.controlNetId, true, data.soldierState);
             if (!bs.hasError() && bs.getBitOffset() <= endPos) {

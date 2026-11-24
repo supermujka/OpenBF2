@@ -52,6 +52,37 @@ public:
                   std::vector<NavPoint>& outWaypoints,
                   uint32_t maxExpanded = 4096) const;
 
+    // Funnel-smoothed (string-pulled) A* path with corner clearance inset and optional
+    // per-bot route diversity seed (0 = shortest path).
+    bool findSmoothedPath(float startX, float startY, float startZ,
+                          float goalX, float goalY, float goalZ,
+                          std::vector<NavPoint>& outWaypoints,
+                          uint32_t diversitySeed = 0u,
+                          uint32_t maxExpanded = 4096) const;
+
+    // Fast exact walkability test via QuadTree descent.
+    bool isPointWalkable(float x, float y, float z) const;
+
+    // Checks whether the XZ segment stays mostly on walkable navmesh (fails closed when a
+    // wide off-mesh void such as a building footprint exceeds maxGapMeters). Fails open
+    // when no navmesh is loaded.
+    bool hasNavLineOfSight(float ax, float ay, float az,
+                           float bx, float by, float bz,
+                           float maxGapMeters = 4.5f) const;
+
+    // Finds a nearby walkable cover/evasion step perpendicular or away from a threat,
+    // preferring positions shielded by navmesh voids/walls or terrain bumps.
+    bool findCoverStep(float ownX, float ownY, float ownZ,
+                       float threatX, float threatZ,
+                       float searchRadius,
+                       NavPoint& outCover) const;
+
+    // Finds a walkable flanking waypoint offset laterally from the direct start->goal line.
+    bool findFlankWaypoint(float startX, float startY, float startZ,
+                           float goalX, float goalY, float goalZ,
+                           float sideSign, float offsetDist,
+                           NavPoint& outFlank) const;
+
     bool isWalkablePolygon(uint32_t polyIdx) const;
     float getPolygonCost(uint32_t polyIdx) const;
     NavPoint getPolygonCentroid(uint32_t polyIdx) const;
@@ -59,6 +90,22 @@ public:
     float sampleAerialHeight(float x, float z, float fallbackY = 0.0f) const;
 
 private:
+    struct PortalEdge {
+        NavPoint left;
+        NavPoint right;
+    };
+
+    struct CorridorStep {
+        uint32_t poly;
+        uint16_t edge;
+        uint32_t nextPoly;
+    };
+
+    bool findCorridor(float startX, float startY, float startZ,
+                      float goalX, float goalY, float goalZ,
+                      uint32_t diversitySeed, uint32_t maxExpanded,
+                      uint32_t& outStartPoly, uint32_t& outGoalPoly,
+                      std::vector<CorridorStep>& outSteps) const;
     struct QuadNode {
         uint32_t children[4];
         uint8_t isLeaf;

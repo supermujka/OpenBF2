@@ -35,6 +35,7 @@ static const uint32_t BTN_WEAPON_2           = 0x00000080u; // b7  PIWeaponSelec
 static const uint32_t BTN_WEAPON_3           = 0x00000100u; // b8  PIWeaponSelect3=16
 static const uint32_t BTN_WEAPON_4           = 0x00000200u; // b9  PIWeaponSelect4=17
 static const uint32_t BTN_WEAPON_5           = 0x00000400u; // b10 PIWeaponSelect5=18
+static const uint32_t BTN_WEAPON_6           = 0x00000800u; // b11 PIWeaponSelect6=19
 static const uint32_t BTN_ALT_FIRE           = 0x00800000u; // b23 PIAltFire=31
 static const uint32_t BTN_RELOAD             = 0x01000000u; // b24 PIReload=32
 static const uint32_t BTN_PRONE              = 0x20000000u; // b29 PILie=37
@@ -543,13 +544,15 @@ struct ControlObjectStateData {
     bool isSoldier;
     bool hasKit;
     uint16_t kitNetId;
+    bool isDelta;
+    uint8_t baselineSlot;
     bool hasSoldierState;
     SoldierGhostState soldierState;
 
     ControlObjectStateData()
         : tick(0), actionBufferEntries(0), controlNetId(0), hasParachute(false),
           parachuteNetId(0), isSoldier(false), hasKit(false), kitNetId(0),
-          hasSoldierState(false) {}
+          isDelta(false), baselineSlot(0), hasSoldierState(false) {}
 };
 
 struct PlayerGhostState {
@@ -560,6 +563,10 @@ struct PlayerGhostState {
     bool isAlive;
     bool hasSpawnGroup;
     uint32_t spawnGroup;
+    bool hasCallForMedic;
+    bool callForMedic;
+    bool hasFiring;
+    bool isFiring;
     bool hasPing;
     uint32_t ping;
     bool hasSpawnAtTick;
@@ -577,7 +584,10 @@ struct PlayerGhostState {
 
     PlayerGhostState()
         : netId(0), playerId(0), mask(0), hasIsAlive(false), isAlive(false),
-          hasSpawnGroup(false), spawnGroup(0), hasPing(false), ping(0),
+          hasSpawnGroup(false), spawnGroup(0),
+          hasCallForMedic(false), callForMedic(false),
+          hasFiring(false), isFiring(false),
+          hasPing(false), ping(0),
           hasSpawnAtTick(false), spawnAtTick(0), isManDown(false),
           hasTeam(false), team(0), hasKit(false), kit(0), unlockLevel(0),
           hasSquadId(false), squadId(0), isSquadLeader(false), isConnected(false) {}

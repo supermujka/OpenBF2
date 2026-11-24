@@ -7,10 +7,12 @@
 #include "NetImpairment.h"
 #include "RouteLoader.h"
 #include "SWTransport.h"
+#include "TeamTactics.h"
 #include "Telemetry.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <string>
 #include <vector>
@@ -87,7 +89,8 @@ public:
                   const sockaddr_in& serverAddr,
                   const NavMesh* navMesh,
                   const RouteLoader* routeLoader,
-                  Telemetry* telemetry);
+                  Telemetry* telemetry,
+                  TeamTactics* teamTactics = nullptr);
     ~LoadBotClient();
 
     bool initSocket();
@@ -153,6 +156,7 @@ private:
     LoadBotClient& operator=(const LoadBotClient&);
 
     void resetSession(uint64_t reconnectAtUs);
+    void clearOwnSoldierPrediction();
     void sendRawDatagram(const uint8_t* data, size_t len, uint64_t nowUs);
     void sendDirectSocket(const uint8_t* data, size_t len);
     void processIncomingDatagram(const uint8_t* data, size_t len, uint64_t nowUs);
@@ -189,6 +193,36 @@ private:
     Telemetry* m_telemetry;
 
     // World state tables
+    struct OwnSoldierBaseline {
+        bool valid;
+        Vec3 pos;
+        Vec3 speed;
+        float facingDegrees;
+        float lookLeftRightAngle;
+        float pendingTurn;
+        float pitchDegrees;
+        uint8_t pose;
+        uint8_t hitPointsByte;
+        float sprintStamina;
+        bool isSprinting;
+        bool isRagdoll;
+
+        OwnSoldierBaseline()
+            : valid(false), pos(), speed(), facingDegrees(0.0f),
+              lookLeftRightAngle(0.0f), pendingTurn(0.0f), pitchDegrees(0.0f),
+              pose(0), hitPointsByte(255u), sprintStamina(1.0f),
+              isSprinting(false), isRagdoll(false) {}
+    };
+
+    struct PendingAimInput {
+        int32_t inputIndex;
+        float rawMouseX;
+        float rawMouseY;
+        float predictedYawDeg;
+        float predictedPitchDeg;
+        bool zoomed;
+    };
+
     bool m_hasOwnPlayerId;
     uint8_t m_ownPlayerId;
     int32_t m_ownTeam;
@@ -197,9 +231,24 @@ private:
     uint16_t m_ownSoldierNetId;
     bool m_hasOwnPos;
     Vec3 m_ownPos;
+    Vec3 m_ownSpeed;
     float m_ownFacingDegrees;
+    float m_ownLookLeftRightAngle;
+    float m_ownPendingTurn;
     float m_ownPitchDegrees;
     uint8_t m_ownPose;
+    uint8_t m_ownHitPointsByte;
+    uint8_t m_ownWeaponZoom;
+    uint8_t m_ownWeaponState;
+    bool m_ownWeaponStowed;
+    float m_ownSprintStamina;
+    bool m_ownIsSprinting;
+    bool m_ownIsGrounded;
+    int32_t m_ownKit;
+    float m_estimatedZoomMod;
+    int32_t m_lastAckedInputIndex;
+    OwnSoldierBaseline m_ctrlBaselines[8];
+    std::deque<PendingAimInput> m_pendingAim;
 
     std::map<uint8_t, TrackedPlayer> m_players;
     std::map<uint16_t, uint8_t> m_playerNetIdToPlayerId;

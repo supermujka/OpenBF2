@@ -2142,6 +2142,793 @@ void testHumanAim()
     }
 }
 
+void testSmartTacticalBots()
+{
+    using namespace bf2bot;
+
+    // 1. Stationary lookLeftRightAngle + 90ms RTT + ControlObjectState baseline delta simulation!
+    // Models real BF2 Soldier.cpp yaw pipeline: standing still modifies m_lookLeftRightAngle
+    // inside +/-40 deg without moving m_facingDegrees, plus PIAltFire zoom toggle & mouseSpeedMod=0.5.
+    {
+        sockaddr_in srvAddr;
+        std::memset(&srvAddr, 0, sizeof(srvAddr));
+        srvAddr.sin_family = AF_INET;
+        srvAddr.sin_port = htons(16567u);
+        ::inet_pton(AF_INET, "127.0.0.1", &srvAddr.sin_addr);
+
+        LoadBotConfig cfg;
+        cfg.botIndex = 0u;
+        cfg.seed = 777u;
+        cfg.worldSize = 1024.0f;
+        cfg.aim.skill = 0.9f;
+        cfg.aim.interpMs = 100;
+        cfg.uplinkImpair.oneWayDelayMs = 45.0;   // 90 ms RTT!
+        cfg.downlinkImpair.oneWayDelayMs = 45.0;
+
+        Telemetry tel;
+        TeamTactics tactics;
+        LoadBotClient bot(cfg, srvAddr, nullptr, nullptr, &tel, &tactics);
+
+        // Simulated server soldier state matching Soldier.cpp:3820-3915
+        float srvFacing = 0.0f;
+        float srvLookLR = 0.0f;
+        float srvPendingTurn = 0.0f;
+        float srvPitch = 0.0f;
+        uint8_t srvZoom = 0u;
+        uint8_t srvPose = 0u;
+        int32_t srvLastInputIdx = 0;
+        int32_t srvBaseSlot = 0;
+        float baseFacing = 0.0f;
+        float baseLookLR = 0.0f;
+        float basePitch = 0.0f;
+        bool hasBaseline = false;
+
+        // Enemy at 25m bearing +25 deg right (strictly inside +/-40 deg stationary lookLimit!)
+        const float kRad = 3.14159265358979323846f / 180.0f;
+        const Vec3 enemyPos(25.0f * std::sin(25.0f * kRad), 0.0f, 25.0f * std::cos(25.0f * kRad));
+
+        // Complete minimal handshake directly via sink callbacks? Better: test full wire through
+        // injectRawDatagram/rawSendHook or direct sink+tick! Let's drive real wire packets via hook!
+        std::deque<std::vector<uint8_t> > c2sQ;
+        std::deque<std::vector<uint8_t> > s2cQ;
+        bot.setRawSendHook([&](const uint8_t* d, size_t l) {
+            c2sQ.push_back(std::vector<uint8_t>(d, d + l));
+        });
+
+        SWConnectionState srvConn;
+        srvConn.setAssignedConnId(9u);
+        uint32_t srvEvBlock = 0u;
+        uint32_t srvDeliv = 1u;
+
+        auto sendSrvRaw = [&](const uint8_t* d, size_t l) {
+            s2cQ.push_back(std::vector<uint8_t>(d, d + l));
+        };
+        auto sendSrvPayload = [&](const uint8_t* pl, size_t plLen) {
+            uint8_t w[kMaxDatagramSize];
+            size_t wl = 0;
+            if (srvConn.wrapDataPacket(pl, static_cast<uint16_t>(plLen), srvDeliv++, w, sizeof(w), wl))
+                sendSrvRaw(w, wl);
+        };
+        auto sendSrvEv = [&](const std::vector<BitStream>& evs) {
+            BitStream pkt(kMaxDataPayloadSize);
+            pkt.writeBool(false);
+            pkt.writeBool(true);
+            pkt.writeUInt(static_cast<uint32_t>(evs.size()), 8);
+            pkt.writeUInt(srvEvBlock++ & 31u, 5);
+            pkt.writeBool(false);
+            for (size_t i = 0; i < evs.size(); ++i)
+                pkt.writeBits(evs[i].data(), evs[i].getBitSize());
+            pkt.writeBool(false);
+            sendSrvPayload(pkt.data(), pkt.getByteSize());
+        };
+
+        auto writeFullCtrlSnapshot = [&](BitStream& pkt, uint32_t tickNum, bool sendDelta) {
+            pkt.writeBool(false); // PlayerActionManager
+            pkt.writeBool(false); // GameEventManager
+            pkt.writeBool(true);  // GhostManager
+            pkt.writeUInt(tickNum, 32);
+            pkt.writeUInt(1u, 8); // 1 remote enemy ghost
+            pkt.writeBool(true);  // hasControlState
+
+            BitStream ctrl(256u);
+            ctrl.writeSignedMag(srvLastInputIdx, 32);
+            ctrl.writeFloat(0.0f); ctrl.writeFloat(0.0f); ctrl.writeFloat(0.0f);
+            ctrl.setCompressionVector(Vec3(0.0f, 0.0f, 0.0f));
+            ctrl.writeUInt(700u, 16);
+            ctrl.writeBool(false); // hasParachute
+            ctrl.writeBool(true);  // isSoldier
+            ctrl.writeBool(false); // hasKit
+
+            if (!sendDelta || !hasBaseline)
+            {
+                hasBaseline = true;
+                baseFacing = srvFacing;
+                baseLookLR = srvLookLR;
+                basePitch = srvPitch;
+                ctrl.writeBool(false);
+                ctrl.writeUInt(static_cast<uint32_t>(srvBaseSlot & 7), 3);
+
+                uint32_t mask = 0x40u | 0x20u | 0x01u | 0x02u | 0x04u | 0x08u | 0x10u;
+                ctrl.writeUInt(mask, 21);
+                ctrl.writeUInt(255u, 8); ctrl.writeUInt(0u, 1);
+                ctrl.writeUInt(srvPose, 3); ctrl.writeUInt(srvPose, 3);
+                ctrl.writeCompressedVector(Vec3(0.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 0.0f), 0.001f);
+                ctrl.writeFloat(srvFacing);
+                ctrl.writeFloat(srvLookLR);
+                ctrl.writeFloat(srvPendingTurn);
+                ctrl.writeFloat(srvPitch);
+                ctrl.writeUInt(srvZoom, 3);
+                ctrl.writeUInt(0u, 2);
+                ctrl.writeBool(false); ctrl.writeBool(false); ctrl.writeBool(false);
+                ctrl.writeBool(true); // grounded
+            }
+            else
+            {
+                ctrl.writeBool(true);
+                ctrl.writeUInt(static_cast<uint32_t>(srvBaseSlot & 7), 3);
+                uint32_t mask = 0u;
+                if (std::fabs(srvFacing - baseFacing) > 1e-4f) mask |= 0x02u;
+                if (std::fabs(srvLookLR - baseLookLR) > 1e-4f) mask |= 0x04u;
+                if (std::fabs(srvPitch - basePitch) > 1e-4f)   mask |= 0x10u;
+                ctrl.writeUInt(mask, 21);
+                if (mask & 0x02u) ctrl.writeFloat(srvFacing);
+                if (mask & 0x04u) ctrl.writeFloat(srvLookLR);
+                if (mask & 0x10u) ctrl.writeFloat(srvPitch);
+                ctrl.writeUInt(srvZoom, 3);
+                ctrl.writeUInt(0u, 2);
+                ctrl.writeBool(false); ctrl.writeBool(false); ctrl.writeBool(false);
+                ctrl.writeBool(true);
+            }
+
+            pkt.writeUInt(ctrl.getBitSize(), 12);
+            pkt.writeBits(ctrl.data(), ctrl.getBitSize());
+
+            // Enemy soldier 710 at enemyPos
+            BitStream en(256u);
+            en.setCompressionVector(Vec3(0.0f, 0.0f, 0.0f));
+            writeSoldierPayload(en, false, 255u, 0u, enemyPos, Vec3(0.0f, 0.0f, 0.0f), 205.0f, 0.0f, true);
+            pkt.writeUInt(1u, 2);
+            pkt.writeUInt(710u, 16);
+            pkt.writeBool(true);
+            pkt.writeUInt(en.getBitSize(), 11);
+            pkt.writeBits(en.data(), en.getBitSize());
+        };
+
+        bool inGameSent = false;
+        int onTargetFireTicks = 0;
+        int totalFireTicks = 0;
+        bool sawZoomToggle = false;
+        float maxOvershootAfterLock = 0.0f;
+        bool lockedOnce = false;
+        uint64_t nowUs = 1000000ULL;
+
+        for (int tick = 0; tick < 180; ++tick)
+        {
+            while (!s2cQ.empty())
+            {
+                const std::vector<uint8_t>& p = s2cQ.front();
+                bot.injectRawDatagram(&p[0], p.size(), nowUs);
+                s2cQ.pop_front();
+            }
+            bot.flushImpairmentQueues(nowUs);
+            bot.tick30Hz(nowUs, 1.0f / 30.0f);
+
+            while (!c2sQ.empty())
+            {
+                const std::vector<uint8_t> pkt = c2sQ.front();
+                c2sQ.pop_front();
+                ParsedDatagram dg;
+                if (!parseIncomingDatagram(&pkt[0], pkt.size(), dg)) continue;
+                if (dg.type == UDP_CONNECT_REQUEST)
+                {
+                    uint8_t acc[16]; std::memset(acc, 0, sizeof(acc));
+                    BitStream bs(acc, sizeof(acc));
+                    bs.writeUInt(UDP_CONNECT_ACCEPT, 4);
+                    bs.writeUInt(0u, 8); bs.writeUInt(9u, 8); bs.writeUInt(1000u, 32); bs.writeBool(false);
+                    sendSrvRaw(acc, bs.getByteSize());
+                }
+                else if (dg.type == UDP_CONNECT_ACCEPT_ACK && !inGameSent)
+                {
+                    inGameSent = true;
+                    std::vector<BitStream> evs;
+                    // Create own player (id=1, team=1), enemy player (id=2, team=2), EnterVehicle, DBComplete, ReadyAck
+                    BitStream cp1(64u);
+                    cp1.writeUInt(GE_CREATE_PLAYER, kGameEventTypeBits);
+                    cp1.writeUInt(1u, 3); cp1.writeUInt(0u, 4); cp1.writeBool(false);
+                    cp1.writeUInt(1u, 8); cp1.writeUInt(2u, 16); cp1.writeUInt(0u, 16); cp1.writeBool(false);
+                    char n1[32]; std::memset(n1, 0, 32); std::memcpy(n1, "LoadBot_01", 10);
+                    cp1.writeFixedBytes(n1, 32u);
+                    evs.push_back(cp1);
+
+                    BitStream cp2(64u);
+                    cp2.writeUInt(GE_CREATE_PLAYER, kGameEventTypeBits);
+                    cp2.writeUInt(2u, 3); cp2.writeUInt(0u, 4); cp2.writeBool(true);
+                    cp2.writeUInt(2u, 8); cp2.writeUInt(3u, 16); cp2.writeUInt(0u, 16); cp2.writeBool(false);
+                    char n2[32]; std::memset(n2, 0, 32); std::memcpy(n2, "Enemy_01", 8);
+                    cp2.writeFixedBytes(n2, 32u);
+                    evs.push_back(cp2);
+
+                    BitStream ev1(16u);
+                    ev1.writeUInt(GE_ENTER_VEHICLE, kGameEventTypeBits);
+                    ev1.writeUInt(1u, 8); ev1.writeUInt(700u, 16); ev1.writeBool(true);
+                    evs.push_back(ev1);
+
+                    BitStream ev2(16u);
+                    ev2.writeUInt(GE_ENTER_VEHICLE, kGameEventTypeBits);
+                    ev2.writeUInt(2u, 8); ev2.writeUInt(710u, 16); ev2.writeBool(true);
+                    evs.push_back(ev2);
+
+                    BitStream rdy(16u);
+                    rdy.writeUInt(GE_POST_REMOTE, kGameEventTypeBits);
+                    rdy.writeUInt(EC_NETWORK, 4); rdy.writeUInt(NRE_CLIENT_READY, 32);
+                    rdy.writeFloat(0.0f); rdy.writeUInt(0u, 8);
+                    evs.push_back(rdy);
+
+                    BitStream ack(16u);
+                    ack.writeUInt(GE_POST_REMOTE, kGameEventTypeBits);
+                    ack.writeUInt(EC_NETWORK, 4); ack.writeUInt(NRE_CLIENT_READY_ACK, 32);
+                    ack.writeFloat(0.0f); ack.writeUInt(0u, 8);
+                    evs.push_back(ack);
+
+                    sendSrvEv(evs);
+                }
+                else if (dg.type == UDP_DATA_PACKET)
+                {
+                    if (!srvConn.acceptIncomingDataSeq(dg.seq)) continue;
+                    srvConn.handleRemoteAck(dg.ack, dg.ackMask, PacketStatusCallback());
+
+                    BitStream bs(dg.payload, dg.payloadLen);
+                    const bool hasAct = bs.readBool();
+                    if (hasAct && !bs.hasError())
+                    {
+                        const uint32_t cnt = bs.readUInt(4);
+                        bs.readUInt(9);
+                        if (cnt > 0u)
+                        {
+                            const int32_t baseIdx = bs.readSignedMag(32);
+                            for (uint32_t i = 0; i < cnt; ++i)
+                            {
+                                float ax[6];
+                                for (int a = 0; a < 6; ++a)
+                                    ax[a] = static_cast<float>(bs.readSignedMag(16)) / 100.0f;
+                                const uint32_t btnLow = bs.readUInt(32);
+                                bs.readUInt(9);
+                                bs.readBool();
+
+                                const int32_t idx = baseIdx + static_cast<int32_t>(i);
+                                if (idx <= srvLastInputIdx) continue;
+                                srvLastInputIdx = idx;
+
+                                // Real BF2 Soldier.cpp yaw/pitch/zoom pipeline!
+                                if ((btnLow & BTN_ALT_FIRE) != 0u)
+                                {
+                                    srvZoom = (srvZoom == 0u) ? 1u : 0u;
+                                    sawZoomToggle = true;
+                                }
+                                srvPose = ((btnLow & BTN_CROUCH) != 0u) ? 1u : 0u;
+                                const float mod = (srvZoom > 0u) ? 0.5f : 1.0f;
+                                const float yawDelta = ax[4] * 5.0f * mod;
+                                const float pitchDelta = ax[5] * 5.0f * mod;
+                                srvPitch += pitchDelta;
+                                if (srvPitch > 85.0f) srvPitch = 85.0f;
+                                if (srvPitch < -85.0f) srvPitch = -85.0f;
+
+                                float appliedYaw = yawDelta;
+                                if (std::fabs(ax[3]) > 0.01f)
+                                {
+                                    if (srvLookLR != 0.0f) srvPendingTurn = srvLookLR;
+                                }
+                                else
+                                {
+                                    srvLookLR += yawDelta;
+                                    if (srvLookLR >= 40.0f || srvLookLR <= -40.0f)
+                                        srvPendingTurn = srvLookLR;
+                                    else
+                                        appliedYaw = 0.0f;
+                                }
+                                if (std::fabs(srvPendingTurn) > 0.0f)
+                                {
+                                    const float sgn = (srvPendingTurn > 0.0f) ? 1.0f : -1.0f;
+                                    const float step = (sgn > 0.0f)
+                                        ? (4.0f < srvPendingTurn ? 4.0f : srvPendingTurn)
+                                        : (-4.0f > srvPendingTurn ? -4.0f : srvPendingTurn);
+                                    srvPendingTurn -= step;
+                                    srvLookLR -= step;
+                                    appliedYaw += step;
+                                }
+                                srvFacing += appliedYaw;
+
+                                const float totalYaw = srvFacing + srvLookLR;
+                                const float yawErr = std::fabs(totalYaw - 25.0f);
+                                if (yawErr < 3.5f) lockedOnce = true;
+                                if (lockedOnce && yawErr > maxOvershootAfterLock)
+                                    maxOvershootAfterLock = yawErr;
+                                if ((btnLow & BTN_FIRE) != 0u)
+                                {
+                                    ++totalFireTicks;
+                                    if (yawErr < 4.5f) ++onTargetFireTicks;
+                                    // Simulate BF2 upward rifle recoil kick (-1.0 deg pitch per fire tick)
+                                    srvPitch -= 1.0f;
+                                    if (srvPitch < -85.0f) srvPitch = -85.0f;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (inGameSent && tick >= 12)
+            {
+                BitStream snap(kMaxDataPayloadSize);
+                // Alternate baseline & delta packets (baseline every 12 ticks, deltas in between)
+                const bool sendDelta = ((tick - 12) % 12 != 0);
+                writeFullCtrlSnapshot(snap, static_cast<uint32_t>(100 + tick), sendDelta);
+                sendSrvPayload(snap.data(), snap.getByteSize());
+            }
+            nowUs += 33333ULL;
+        }
+
+        const float finalAimYaw = srvFacing + srvLookLR;
+        checkCond(std::fabs(finalAimYaw - 25.0f) < 4.0f,
+                  "smart aim: stationary lookLeftRightAngle + 90ms RTT converges on +25 deg target");
+        checkCond(lockedOnce && maxOvershootAfterLock < 6.0f,
+                  "smart aim: zero ping-induced oscillation after locking on target");
+        checkCond(totalFireTicks >= 15 && onTargetFireTicks >= 12,
+                  "smart aim: fires accurately at 90ms RTT with delta baselines");
+        checkCond(std::fabs(srvPitch) < 6.0f,
+                  "smart aim: actively compensates vertical rifle recoil under 90ms RTT");
+        checkCond(sawZoomToggle, "smart aim: engages ADS zoom toggle at 25m");
+    }
+
+    // 2. Target velocity leading test (enemy sprinting laterally at +6 m/s at 45m).
+    {
+        AimConfig cfg;
+        cfg.skill = 1.0f;
+        cfg.interpMs = 100;
+        BotBrain brain(0u, 101u, nullptr, nullptr, cfg);
+
+        std::map<uint16_t, TrackedSoldier> soldiers;
+        TrackedSoldier& en = soldiers[9];
+        en.netId = 9;
+        en.team = 2;
+        en.hasPos = true;
+
+        BotWorldView w;
+        w.ownTeam = 1;
+        w.ownAlive = true;
+        w.hasOwnPos = true;
+        w.ownSoldierNetId = 1;
+        w.soldiers = &soldiers;
+
+        const uint64_t t0 = 5000000ULL;
+        brain.onSpawned(w.ownPos, t0);
+        for (int tick = 0; tick < 60; ++tick)
+        {
+            const uint64_t now = t0 + static_cast<uint64_t>(tick) * 33333ULL;
+            const float sec = static_cast<float>(tick) * (1.0f / 30.0f);
+            en.pos = Vec3(-6.0f + 6.0f * sec, 0.0f, 45.0f);
+            en.speed = Vec3(6.0f, 0.0f, 0.0f);
+            en.pushPos(now, en.pos);
+
+            BotTickOutput out;
+            brain.tick(now, 1.0f / 30.0f, w, out);
+            w.ownFacingDegrees += out.action.axes[4] * 5.0f;
+            w.ownPitchDegrees += out.action.axes[5] * 5.0f;
+        }
+        Vec3 rendered;
+        const uint64_t lastNow = t0 + 59ULL * 33333ULL;
+        interpolateSoldierPos(en, lastNow - 100000ULL, rendered);
+        const float renderedBearing = std::atan2(rendered.x, rendered.z) * (180.0f / 3.14159265f);
+        checkCond(w.ownFacingDegrees > renderedBearing + 0.10f,
+                  "smart aim: leads laterally sprinting target ahead of rendered position");
+    }
+
+    // 3. 360-degree damage reaction & gunshot perception test.
+    {
+        AimConfig cfg;
+        cfg.skill = 0.9f;
+        BotBrain brain(0u, 202u, nullptr, nullptr, cfg);
+
+        std::map<uint16_t, TrackedSoldier> soldiers;
+        TrackedSoldier& behind = soldiers[12];
+        behind.netId = 12;
+        behind.team = 2;
+        behind.hasPos = true;
+        behind.pos = Vec3(0.0f, 0.0f, -25.0f); // directly behind (+180 deg)
+        behind.facingDegrees = 0.0f;           // aiming right at our back
+
+        BotWorldView w;
+        w.ownTeam = 1;
+        w.ownAlive = true;
+        w.hasOwnPos = true;
+        w.ownSoldierNetId = 1;
+        w.ownFacingDegrees = 0.0f;
+        w.ownHitPointsByte = 255u;
+        w.soldiers = &soldiers;
+
+        const uint64_t t0 = 5000000ULL;
+        brain.onSpawned(w.ownPos, t0);
+        behind.pushPos(t0, behind.pos);
+        BotTickOutput out0;
+        brain.tick(t0, 1.0f / 30.0f, w, out0);
+        checkCond((out0.action.buttonMaskLow & BTN_FIRE) == 0u,
+                  "awareness: silent enemy 25m directly behind is not seen initially");
+
+        // Now bot takes bullet damage!
+        w.ownHitPointsByte = 180u;
+        bool turnedAndFired = false;
+        for (int tick = 1; tick < 80; ++tick)
+        {
+            const uint64_t now = t0 + static_cast<uint64_t>(tick) * 33333ULL;
+            behind.pushPos(now, behind.pos);
+            BotTickOutput out;
+            brain.tick(now, 1.0f / 30.0f, w, out);
+            w.ownFacingDegrees += out.action.axes[4] * 5.0f;
+            while (w.ownFacingDegrees > 180.0f) w.ownFacingDegrees -= 360.0f;
+            while (w.ownFacingDegrees < -180.0f) w.ownFacingDegrees += 360.0f;
+            if ((out.action.buttonMaskLow & BTN_FIRE) != 0u && std::fabs(w.ownFacingDegrees) > 165.0f)
+            {
+                turnedAndFired = true;
+                break;
+            }
+        }
+        checkCond(turnedAndFired, "awareness: taking damage triggers 360-deg spin and return fire");
+
+        // Gunshot hearing test: separate bot hears actively firing enemy 30m behind!
+        BotBrain brain2(2u, 203u, nullptr, nullptr, cfg);
+        behind.pos = Vec3(0.0f, 0.0f, -30.0f);
+        behind.isFiring = true;
+        behind.lastFiredUs = t0;
+        w.ownFacingDegrees = 0.0f;
+        w.ownHitPointsByte = 255u;
+        brain2.onSpawned(w.ownPos, t0);
+        bool heardAndEngaged = false;
+        for (int tick = 0; tick < 80; ++tick)
+        {
+            const uint64_t now = t0 + static_cast<uint64_t>(tick) * 33333ULL;
+            behind.lastFiredUs = now;
+            behind.pushPos(now, behind.pos);
+            BotTickOutput out;
+            brain2.tick(now, 1.0f / 30.0f, w, out);
+            w.ownFacingDegrees += out.action.axes[4] * 5.0f;
+            while (w.ownFacingDegrees > 180.0f) w.ownFacingDegrees -= 360.0f;
+            while (w.ownFacingDegrees < -180.0f) w.ownFacingDegrees += 360.0f;
+            if ((out.action.buttonMaskLow & BTN_FIRE) != 0u && std::fabs(w.ownFacingDegrees) > 165.0f)
+            {
+                heardAndEngaged = true;
+                break;
+            }
+        }
+        checkCond(heardAndEngaged, "awareness: actively firing enemy 30m behind is heard and engaged");
+    }
+
+    // 4. Threat prioritization: active shooter facing us beats closer unaware enemy.
+    {
+        AimConfig cfg;
+        cfg.skill = 0.9f;
+        BotBrain brain(0u, 303u, nullptr, nullptr, cfg);
+
+        std::map<uint16_t, TrackedSoldier> soldiers;
+        // Enemy A: 24m left-ish (-20 deg), facing AWAY, not firing, full HP
+        TrackedSoldier& a = soldiers[20];
+        a.netId = 20; a.team = 2; a.hasPos = true; a.hitPointsByte = 255u;
+        a.pos = Vec3(-8.0f, 0.0f, 22.6f); a.facingDegrees = -20.0f;
+        // Enemy B: 27m right-ish (+22 deg), facing RIGHT AT US, firing, low HP
+        TrackedSoldier& b = soldiers[21];
+        b.netId = 21; b.team = 2; b.hasPos = true; b.hitPointsByte = 90u;
+        b.pos = Vec3(10.0f, 0.0f, 25.0f); b.facingDegrees = -158.0f;
+        b.isFiring = true;
+
+        BotWorldView w;
+        w.ownTeam = 1; w.ownAlive = true; w.hasOwnPos = true; w.ownSoldierNetId = 1;
+        w.soldiers = &soldiers;
+        const uint64_t t0 = 5000000ULL;
+        brain.onSpawned(w.ownPos, t0);
+        for (int tick = 0; tick < 25; ++tick)
+        {
+            const uint64_t now = t0 + static_cast<uint64_t>(tick) * 33333ULL;
+            b.lastFiredUs = now;
+            a.pushPos(now, a.pos);
+            b.pushPos(now, b.pos);
+            BotTickOutput out;
+            brain.tick(now, 1.0f / 30.0f, w, out);
+            w.ownFacingDegrees += out.action.axes[4] * 5.0f;
+        }
+        checkCond(w.ownFacingDegrees > 12.0f,
+                  "tactics: prioritizes active firing threat facing us over slightly closer unaware enemy");
+    }
+
+    // 5. Medic heal & revive, Support ammo drop, and guaranteed return to Primary (slot 3).
+    {
+        // Medic bot (kit 5): botIndex=3 has kInfantryKits[3]=5
+        BotBrain medic(3u, 404u, nullptr, nullptr);
+        BotWorldView w;
+        w.ownTeam = 2; w.ownAlive = true; w.hasOwnPos = true; w.ownSoldierNetId = 50;
+        w.ownKit = 5;
+        w.ownHitPointsByte = 110u; // wounded!
+
+        const uint64_t t0 = 10000000ULL;
+        medic.onSpawned(w.ownPos, t0);
+        bool selectedMedkit = false;
+        bool droppedMedkit = false;
+        bool restoredPrimary = false;
+        for (int tick = 0; tick < 160; ++tick)
+        {
+            const uint64_t now = t0 + static_cast<uint64_t>(tick) * 33333ULL;
+            BotTickOutput out;
+            medic.tick(now, 1.0f / 30.0f, w, out);
+            if ((out.action.buttonMaskLow & BTN_WEAPON_5) != 0u) selectedMedkit = true;
+            if (selectedMedkit && (out.action.buttonMaskLow & BTN_FIRE) != 0u) droppedMedkit = true;
+            if (droppedMedkit && (out.action.buttonMaskLow & BTN_WEAPON_3) != 0u) restoredPrimary = true;
+        }
+        checkCond(selectedMedkit && droppedMedkit && restoredPrimary,
+                  "class AI: wounded Medic switches to medkit (slot 5), drops it, restores primary (slot 3)");
+
+        // Medic revive test: downed teammate 6m ahead
+        BotBrain medic2(3u, 405u, nullptr, nullptr);
+        std::map<uint8_t, TrackedPlayer> players;
+        std::map<uint16_t, TrackedSoldier> soldiers;
+        TrackedPlayer& downed = players[7];
+        downed.playerId = 7; downed.team = 2; downed.isManDown = true; downed.soldierNetId = 88;
+        TrackedSoldier& body = soldiers[88];
+        body.netId = 88; body.team = 2; body.hasPos = true; body.pos = Vec3(0.0f, 0.0f, 1.5f);
+
+        w.ownHitPointsByte = 255u;
+        w.players = &players;
+        w.soldiers = &soldiers;
+        medic2.onSpawned(w.ownPos, t0);
+        bool selectedDefib = false;
+        bool pulsedDefib = false;
+        bool restoredAfterRevive = false;
+        for (int tick = 0; tick < 180; ++tick)
+        {
+            const uint64_t now = t0 + static_cast<uint64_t>(tick) * 33333ULL;
+            BotTickOutput out;
+            medic2.tick(now, 1.0f / 30.0f, w, out);
+            if ((out.action.buttonMaskLow & BTN_WEAPON_6) != 0u) selectedDefib = true;
+            if (selectedDefib && (out.action.buttonMaskLow & BTN_FIRE) != 0u)
+            {
+                pulsedDefib = true;
+                downed.isManDown = false; // revived!
+            }
+            if (pulsedDefib && (out.action.buttonMaskLow & BTN_WEAPON_3) != 0u) restoredAfterRevive = true;
+        }
+        checkCond(selectedDefib && pulsedDefib && restoredAfterRevive,
+                  "class AI: Medic switches to defib (slot 6), revives man-down ally, restores primary");
+
+        // Support bot (kit 3): drops ammo bag near teammates
+        BotBrain support(2u, 406u, nullptr, nullptr);
+        std::map<uint16_t, TrackedSoldier> allies;
+        allies[61].netId = 61; allies[61].team = 1; allies[61].hasPos = true; allies[61].pos = Vec3(2.0f, 0.0f, 2.0f);
+        allies[62].netId = 62; allies[62].team = 1; allies[62].hasPos = true; allies[62].pos = Vec3(-2.0f, 0.0f, 2.0f);
+        BotWorldView ws;
+        ws.ownTeam = 1; ws.ownAlive = true; ws.hasOwnPos = true; ws.ownSoldierNetId = 60;
+        ws.ownKit = 3; ws.soldiers = &allies;
+        support.onSpawned(ws.ownPos, t0);
+        bool droppedAmmo = false;
+        bool restoredSupportPrimary = false;
+        bool selAmmo = false;
+        for (int tick = 0; tick < 240; ++tick)
+        {
+            const uint64_t now = t0 + static_cast<uint64_t>(tick) * 33333ULL;
+            BotTickOutput out;
+            support.tick(now, 1.0f / 30.0f, ws, out);
+            if ((out.action.buttonMaskLow & BTN_WEAPON_5) != 0u) selAmmo = true;
+            if (selAmmo && (out.action.buttonMaskLow & BTN_FIRE) != 0u) droppedAmmo = true;
+            if (droppedAmmo && (out.action.buttonMaskLow & BTN_WEAPON_3) != 0u) restoredSupportPrimary = true;
+        }
+        checkCond(selAmmo && droppedAmmo && restoredSupportPrimary,
+                  "class AI: Support drops ammo bag near teammates and restores primary");
+    }
+
+    // 6. NavMesh funnel smoothing, walkability, building LOS, and cover/flank queries.
+    {
+        const char* const qtrPath = "bf2_loadbot_test_smart_nav.qtr";
+        std::remove(qtrPath);
+
+        // Build same 3x3 10x10m grid in [0,30]x[0,30] with center poly 4 unwalkable (building).
+        std::vector<uint8_t> qtr;
+        writeI32LE(qtr, 1); writeI32LE(qtr, 3);
+        writeF32LE(qtr, 0.0f); writeF32LE(qtr, 0.0f);
+        writeF32LE(qtr, 30.0f); writeF32LE(qtr, 30.0f); writeF32LE(qtr, 30.0f);
+        writeU32LE(qtr, 1u);
+        writeU32LE(qtr, 0u); writeU32LE(qtr, 0u); writeU32LE(qtr, 0u); writeU32LE(qtr, 0u);
+        writeU8LE(qtr, 1u); writeU8LE(qtr, 9u); writeU8LE(qtr, 0u); writeU8LE(qtr, 0u);
+        writeU32LE(qtr, 0u);
+        writeU32LE(qtr, 9u);
+        for (uint32_t p = 0; p < 9u; ++p)
+        {
+            writeU8LE(qtr, 4u);
+            writeU8LE(qtr, (p == 4u) ? 0u : 1u);
+            writeU16LE(qtr, 0u);
+            writeU32LE(qtr, p * 4u);
+            writeF32LE(qtr, 0.0f); writeF32LE(qtr, 1.0f); writeF32LE(qtr, 0.0f);
+        }
+        writeU32LE(qtr, 9u);
+        for (uint32_t p = 0; p < 9u; ++p) writeU32LE(qtr, p);
+        writeU32LE(qtr, 16u);
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c)
+            {
+                writeF32LE(qtr, static_cast<float>(c * 10));
+                writeF32LE(qtr, 0.0f);
+                writeF32LE(qtr, static_cast<float>(r * 10));
+            }
+        writeU32LE(qtr, 36u);
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c)
+            {
+                writeU32LE(qtr, static_cast<uint32_t>(r * 4 + c));
+                writeU32LE(qtr, static_cast<uint32_t>((r + 1) * 4 + c));
+                writeU32LE(qtr, static_cast<uint32_t>((r + 1) * 4 + (c + 1)));
+                writeU32LE(qtr, static_cast<uint32_t>(r * 4 + (c + 1)));
+            }
+        writeU32LE(qtr, 36u);
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c)
+            {
+                writeU32LE(qtr, (c > 0) ? static_cast<uint32_t>(r * 3 + (c - 1)) : NavMesh::INVALID_POLYGON);
+                writeU32LE(qtr, (r < 2) ? static_cast<uint32_t>((r + 1) * 3 + c) : NavMesh::INVALID_POLYGON);
+                writeU32LE(qtr, (c < 2) ? static_cast<uint32_t>(r * 3 + (c + 1)) : NavMesh::INVALID_POLYGON);
+                writeU32LE(qtr, (r > 0) ? static_cast<uint32_t>((r - 1) * 3 + c) : NavMesh::INVALID_POLYGON);
+            }
+        {
+            std::ofstream ofs(qtrPath, std::ios::binary);
+            ofs.write(reinterpret_cast<const char*>(&qtr[0]), static_cast<std::streamsize>(qtr.size()));
+        }
+
+        NavMesh nav;
+        checkCond(nav.load(qtrPath), "smart nav: loaded synthetic 3x3 obstacle mesh");
+        std::vector<NavPoint> rawPath, smoothPath;
+        const bool okRaw = nav.findPath(5.0f, 0.0f, 15.0f, 25.0f, 0.0f, 15.0f, rawPath);
+        const bool okSmooth = nav.findSmoothedPath(5.0f, 0.0f, 15.0f, 25.0f, 0.0f, 15.0f, smoothPath);
+        checkCond(okRaw && okSmooth && smoothPath.size() <= rawPath.size() && !smoothPath.empty(),
+                  "smart nav: funnel findSmoothedPath simplifies corridor cleanly");
+        bool smoothEnteredObs = false;
+        for (size_t i = 0; i < smoothPath.size(); ++i)
+            if (smoothPath[i].x > 10.05f && smoothPath[i].x < 19.95f &&
+                smoothPath[i].z > 10.05f && smoothPath[i].z < 19.95f)
+                smoothEnteredObs = true;
+        checkCond(!smoothEnteredObs, "smart nav: smoothed path avoids center building obstacle");
+        checkCond(nav.isPointWalkable(5.0f, 0.0f, 15.0f) && !nav.isPointWalkable(15.0f, 0.0f, 15.0f),
+                  "smart nav: isPointWalkable distinguishes open ground vs building void");
+        checkCond(!nav.hasNavLineOfSight(5.0f, 0.0f, 15.0f, 25.0f, 0.0f, 15.0f, 4.5f) &&
+                  nav.hasNavLineOfSight(5.0f, 0.0f, 5.0f, 25.0f, 0.0f, 5.0f, 4.5f),
+                  "smart nav: hasNavLineOfSight detects building occlusion vs clear street");
+        NavPoint cov;
+        const bool gotCov = nav.findCoverStep(7.0f, 0.0f, 15.0f, 25.0f, 15.0f, 5.0f, cov);
+        checkCond(gotCov && nav.isPointWalkable(cov.x, cov.y, cov.z),
+                  "smart nav: findCoverStep locates valid walkable cover offset");
+        std::remove(qtrPath);
+    }
+
+    // 7. Frontline spawning, flag capture hold, and TeamTactics objective distribution + spotting.
+    {
+        std::map<uint8_t, TrackedSpawnGroup> sgs;
+        // Rear friendly spawn at z=0, frontline friendly spawn at z=200, enemy flag at z=250.
+        sgs[1].spawnGroupId = 1; sgs[1].team = 1; sgs[1].active = true; sgs[1].hasSpawnPoints = true;
+        sgs[1].hasPos = true; sgs[1].pos = Vec3(0.0f, 0.0f, 0.0f);
+        sgs[2].spawnGroupId = 2; sgs[2].team = 1; sgs[2].active = true; sgs[2].hasSpawnPoints = true;
+        sgs[2].hasPos = true; sgs[2].pos = Vec3(0.0f, 0.0f, 200.0f);
+        sgs[3].spawnGroupId = 3; sgs[3].team = 2; sgs[3].active = true; sgs[3].hasSpawnPoints = true;
+        sgs[3].hasPos = true; sgs[3].pos = Vec3(0.0f, 0.0f, 250.0f);
+
+        BotBrain frontBot(0u, 505u, nullptr, nullptr);
+        const int32_t chosenSg = frontBot.pickSpawnGroup(sgs, nullptr, nullptr);
+        checkCond(chosenSg == 2, "team tactics: pickSpawnGroup chooses frontline spawn over rear base");
+
+        // Objective distribution: 10 Team-1 bots sharing TeamTactics split across 2 equidistant flags!
+        TeamTactics shared;
+        std::map<uint16_t, TrackedControlPoint> cps;
+        cps[100].netId = 100; cps[100].team = 2; cps[100].hasPos = true; cps[100].pos = Vec3(-80.0f, 0.0f, 100.0f);
+        cps[101].netId = 101; cps[101].team = 2; cps[101].hasPos = true; cps[101].pos = Vec3( 80.0f, 0.0f, 100.0f);
+
+        BotWorldView tw;
+        tw.ownTeam = 1; tw.ownAlive = true; tw.hasOwnPos = true; tw.ownPos = Vec3(0.0f, 0.0f, 0.0f);
+        tw.controlPoints = &cps;
+        const uint64_t tNow = 5000000ULL;
+        for (uint32_t i = 0; i < 10u; ++i)
+        {
+            BotBrain b(i * 2u, 600u + i, nullptr, nullptr, AimConfig(), &shared);
+            b.onSpawned(tw.ownPos, tNow);
+            BotTickOutput out;
+            b.tick(tNow, 1.0f / 30.0f, tw, out);
+        }
+        const uint32_t onFlagA = shared.countClaimants(1, 0x10000u | 100u, 999u, tNow);
+        const uint32_t onFlagB = shared.countClaimants(1, 0x10000u | 101u, 999u, tNow);
+        checkCond(onFlagA >= 3u && onFlagB >= 3u && (onFlagA + onFlagB) == 10u,
+                  "team tactics: 10 bots split across two equidistant enemy flags via TeamTactics");
+
+        // Flag capture hold: bot standing 5m from enemy flag stays crouched/holding inside capture zone!
+        BotBrain capper(0u, 707u, nullptr, nullptr);
+        std::map<uint16_t, TrackedControlPoint> oneFlag;
+        oneFlag[200].netId = 200; oneFlag[200].team = 2; oneFlag[200].hasPos = true;
+        oneFlag[200].pos = Vec3(0.0f, 0.0f, 5.0f);
+        BotWorldView cw;
+        cw.ownTeam = 1; cw.ownAlive = true; cw.hasOwnPos = true; cw.ownPos = Vec3(0.0f, 0.0f, 0.0f);
+        cw.controlPoints = &oneFlag;
+        capper.onSpawned(cw.ownPos, tNow);
+        BotTickOutput capOut1, capOut2;
+        capper.tick(tNow, 1.0f / 30.0f, cw, capOut1);
+        capper.tick(tNow + 2000000ULL, 1.0f / 30.0f, cw, capOut2);
+        checkCond((capOut2.action.buttonMaskLow & BTN_CROUCH) != 0u &&
+                  std::fabs(capOut2.action.axes[3]) < 0.05f,
+                  "objectives: bot holds inside enemy flag capture radius until captured");
+    }
+
+    // 8. Tactical out-of-combat reload & CQB empty-mag pistol fallback.
+    {
+        AimConfig cfg;
+        cfg.skill = 0.9f;
+        BotBrain brain(0u, 808u, nullptr, nullptr, cfg);
+
+        std::map<uint16_t, TrackedSoldier> soldiers;
+        TrackedSoldier& en = soldiers[33];
+        en.netId = 33; en.team = 2; en.hasPos = true; en.pos = Vec3(0.0f, 0.0f, 8.0f); // CQB 8m
+
+        BotWorldView w;
+        w.ownTeam = 1; w.ownAlive = true; w.hasOwnPos = true; w.ownSoldierNetId = 1;
+        w.ownKit = 0;
+        w.soldiers = &soldiers;
+        const uint64_t t0 = 5000000ULL;
+        brain.onSpawned(w.ownPos, t0);
+
+        bool swappedToPistol = false;
+        bool firedPistol = false;
+        bool restoredPrimaryAfterPistol = false;
+        for (int tick = 0; tick < 360; ++tick)
+        {
+            const uint64_t now = t0 + static_cast<uint64_t>(tick) * 33333ULL;
+            en.pushPos(now, en.pos);
+            BotTickOutput out;
+            brain.tick(now, 1.0f / 30.0f, w, out);
+            w.ownFacingDegrees += out.action.axes[4] * 5.0f;
+            w.ownPitchDegrees += out.action.axes[5] * 5.0f;
+            if ((out.action.buttonMaskLow & BTN_WEAPON_2) != 0u) swappedToPistol = true;
+            if (swappedToPistol && (out.action.buttonMaskLow & BTN_FIRE) != 0u) firedPistol = true;
+            if (firedPistol && (out.action.buttonMaskLow & BTN_WEAPON_3) != 0u)
+            {
+                restoredPrimaryAfterPistol = true;
+                break;
+            }
+        }
+        checkCond(swappedToPistol && firedPistol && restoredPrimaryAfterPistol,
+                  "combat AI: empty mag in CQB swaps to pistol, fires, and restores primary");
+
+        // Out-of-combat tactical reload after partial mag spent
+        BotBrain brain2(0u, 809u, nullptr, nullptr, cfg);
+        en.pos = Vec3(0.0f, 0.0f, 25.0f);
+        w.ownFacingDegrees = 0.0f;
+        w.ownPitchDegrees = 0.0f;
+        brain2.onSpawned(w.ownPos, t0);
+        // Engage long enough to spend ~15 rounds (half a mag), then enemy disappears.
+        uint64_t now = t0;
+        for (int tick = 0; tick < 90; ++tick)
+        {
+            now = t0 + static_cast<uint64_t>(tick) * 33333ULL;
+            en.pushPos(now, en.pos);
+            BotTickOutput out;
+            brain2.tick(now, 1.0f / 30.0f, w, out);
+            w.ownFacingDegrees += out.action.axes[4] * 5.0f;
+            w.ownPitchDegrees += out.action.axes[5] * 5.0f;
+        }
+        en.hitPointsByte = 0u; // enemy killed!
+        bool didTacticalReload = false;
+        for (int tick = 0; tick < 90; ++tick)
+        {
+            now += 33333ULL;
+            BotTickOutput out;
+            brain2.tick(now, 1.0f / 30.0f, w, out);
+            if ((out.action.buttonMaskLow & BTN_RELOAD) != 0u)
+            {
+                didTacticalReload = true;
+                break;
+            }
+        }
+        checkCond(didTacticalReload, "combat AI: performs proactive tactical reload out of combat");
+    }
+}
+
 } // anonymous namespace
 
 int main()
@@ -2156,6 +2943,7 @@ int main()
     testNetImpairment();
     testTelemetryAndSlidingDetector();
     testHumanAim();
+    testSmartTacticalBots();
     testLoopbackHandshakeAndGameplay();
 
     if (g_failures == 0)

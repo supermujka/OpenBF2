@@ -1,6 +1,7 @@
 #include "LoadBotClient.h"
 #include "NavMesh.h"
 #include "RouteLoader.h"
+#include "TeamTactics.h"
 #include "Telemetry.h"
 
 #include <cerrno>
@@ -79,6 +80,7 @@ struct RunnerOptions {
     int reportSec;
     bf2bot::AimConfig aim;
     int32_t forceTeam;  // 0 = alternate teams by bot index
+    bool teamTactics;
     bool verbose;
 
     RunnerOptions()
@@ -104,6 +106,7 @@ struct RunnerOptions {
           seed(1337u),
           reportSec(10),
           forceTeam(0),
+          teamTactics(true),
           verbose(false) {}
 };
 
@@ -140,6 +143,7 @@ void printUsage(const char* prog) {
         "  --goal <x,y,z>           Every bot moves on this world position instead of choosing flags\n"
         "  --spawn-near <x,y,z>     Spawn at the friendly spawn group closest to this position\n"
         "  --keep-running           Never stand still; alternate sprint and slow walk every 2-4 s\n"
+        "  --no-team-tactics        Disable shared team objective balancing and spotted enemy callouts\n"
         "  --report-sec <int>      Periodic telemetry report interval in seconds (default: 10)\n"
         "  --verbose                Enable verbose per-bot handshake/disconnect logging\n"
         "  -h, --help               Show this help message\n",
@@ -177,6 +181,10 @@ bool parseArgs(int argc, char** argv, RunnerOptions& opt, bool& showHelp) {
         }
         if (arg == "--keep-running") {
             opt.aim.keepRunning = true;
+            continue;
+        }
+        if (arg == "--no-team-tactics") {
+            opt.teamTactics = false;
             continue;
         }
         if (arg == "--spawn-near" && i + 1 < argc) {
@@ -400,12 +408,14 @@ int main(int argc, char** argv) {
     if (opt.aim.legacy) {
         std::printf("[LoadBot] Aim: legacy (nearest target, newest position)\n");
     } else {
-        std::printf("[LoadBot] Aim: human model skill=%.2f interp=%dms (LOS=%s)\n",
+        std::printf("[LoadBot] Aim: tactical human model skill=%.2f interp=%dms (LOS=%s, teamTactics=%s)\n",
                     static_cast<double>(opt.aim.skill), static_cast<int>(opt.aim.interpMs),
-                    navMesh.hasAerialHeightMap() ? "aerial-heightmap-bump" : "off(no AHM)");
+                    navMesh.hasAerialHeightMap() ? "aerial-heightmap-bilinear" : "off(no AHM)",
+                    opt.teamTactics ? "on" : "off");
     }
 
     bf2bot::Telemetry telemetry;
+    bf2bot::TeamTactics teamTactics;
     const uint64_t startUs = steadyNowUs();
 
     std::vector<std::unique_ptr<bf2bot::LoadBotClient> > bots;
@@ -465,7 +475,8 @@ int main(int argc, char** argv) {
             cfg, serverAddr,
             navMesh.isLoaded() ? &navMesh : nullptr,
             routeLoader.isLoaded() ? &routeLoader : nullptr,
-            &telemetry));
+            &telemetry,
+            opt.teamTactics ? &teamTactics : nullptr));
 
         if (!bot->initSocket()) {
 #ifdef _WIN32

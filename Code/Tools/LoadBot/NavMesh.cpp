@@ -106,6 +106,32 @@ float dist3D(const NavPoint& a, const NavPoint& b) {
     return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
+inline float triArea2XZ(const NavPoint& a, const NavPoint& b, const NavPoint& c) {
+    const float ax = b.x - a.x;
+    const float az = b.z - a.z;
+    const float bx = c.x - a.x;
+    const float bz = c.z - a.z;
+    return bx * az - ax * bz;
+}
+
+inline bool pointsNearXZ(const NavPoint& a, const NavPoint& b) {
+    const float dx = a.x - b.x;
+    const float dz = a.z - b.z;
+    return (dx * dx + dz * dz) < 1e-6f;
+}
+
+inline float diversityMultiplier(uint32_t polyIdx, uint32_t seed) {
+    if (seed == 0u) {
+        return 1.0f;
+    }
+    uint32_t h = (polyIdx * 2654435761u) ^ (seed * 2246822519u);
+    h ^= (h >> 16);
+    h *= 0x85EBCA6Bu;
+    h ^= (h >> 13);
+    const float unit = static_cast<float>(h & 0xFFFFu) / 65535.0f;
+    return 1.0f + 0.18f * unit;
+}
+
 float computeMaterialCost(uint8_t material) {
     // Matches BF2 MaterialManager.cpp: 0 = Invalid (-1.0), 5/7 = Avoid (1000.0), others = 1.0.
     if (material == 0u) {
@@ -613,11 +639,14 @@ uint32_t NavMesh::findPolygon(float x, float y, float z) const {
     return findNearestPolygon(x, y, z, 64.0f);
 }
 
-bool NavMesh::findPath(float startX, float startY, float startZ,
-                       float goalX, float goalY, float goalZ,
-                       std::vector<NavPoint>& outWaypoints,
-                       uint32_t maxExpanded) const {
-    outWaypoints.clear();
+bool NavMesh::findCorridor(float startX, float startY, float startZ,
+                           float goalX, float goalY, float goalZ,
+                           uint32_t diversitySeed, uint32_t maxExpanded,
+                           uint32_t& outStartPoly, uint32_t& outGoalPoly,
+                           std::vector<CorridorStep>& outSteps) const {
+    outSteps.clear();
+    outStartPoly = INVALID_POLYGON;
+    outGoalPoly = INVALID_POLYGON;
     if (!m_loaded) {
         return false;
     }
@@ -627,10 +656,10 @@ bool NavMesh::findPath(float startX, float startY, float startZ,
     if (startPoly == INVALID_POLYGON || goalPoly == INVALID_POLYGON) {
         return false;
     }
+    outStartPoly = startPoly;
+    outGoalPoly = goalPoly;
 
-    const NavPoint goalPoint = {goalX, goalY, goalZ};
     if (startPoly == goalPoly) {
-        outWaypoints.push_back(goalPoint);
         return true;
     }
 
@@ -707,7 +736,8 @@ bool NavMesh::findPath(float startX, float startY, float startZ,
 
             const float stepDist = dist3D(curPoly.centroid, edgeMid) +
                                    dist3D(edgeMid, nbrPoly.centroid);
-            const float tentativeG = curG + stepDist * nbrPoly.cost;
+            const float divMult = diversityMultiplier(nbrPolyIdx, diversitySeed);
+            const float tentativeG = curG + stepDist * nbrPoly.cost * divMult;
 
             if (existingIt == stateIndexByPoly.end()) {
                 AStarNodeState nextState;
@@ -743,25 +773,41 @@ bool NavMesh::findPath(float startX, float startY, float startZ,
         return false;
     }
 
-    // Reconstruct traversed (parentPoly, edge) transitions in reverse, then reverse them.
-    struct StepEdge {
-        uint32_t poly;
-        uint16_t edge;
-    };
-    std::vector<StepEdge> steps;
     uint32_t tracePoly = goalPoly;
     while (tracePoly != startPoly) {
         const AStarNodeState& st = states[stateIndexByPoly[tracePoly]];
         if (st.parent == INVALID_POLYGON) {
             return false;
         }
-        StepEdge se;
+        CorridorStep se;
         se.poly = st.parent;
         se.edge = st.parentEdge;
-        steps.push_back(se);
+        se.nextPoly = tracePoly;
+        outSteps.push_back(se);
         tracePoly = st.parent;
     }
-    std::reverse(steps.begin(), steps.end());
+    std::reverse(outSteps.begin(), outSteps.end());
+    return true;
+}
+
+bool NavMesh::findPath(float startX, float startY, float startZ,
+                       float goalX, float goalY, float goalZ,
+                       std::vector<NavPoint>& outWaypoints,
+                       uint32_t maxExpanded) const {
+    outWaypoints.clear();
+    uint32_t startPoly = INVALID_POLYGON;
+    uint32_t goalPoly = INVALID_POLYGON;
+    std::vector<CorridorStep> steps;
+    if (!findCorridor(startX, startY, startZ, goalX, goalY, goalZ,
+                      0u, maxExpanded, startPoly, goalPoly, steps)) {
+        return false;
+    }
+
+    const NavPoint goalPoint = {goalX, goalY, goalZ};
+    if (startPoly == goalPoly) {
+        outWaypoints.push_back(goalPoint);
+        return true;
+    }
 
     outWaypoints.reserve(steps.size() + 1u);
     for (size_t i = 0; i < steps.size(); ++i) {
@@ -784,6 +830,313 @@ bool NavMesh::findPath(float startX, float startY, float startZ,
         outWaypoints.push_back(goalPoint);
     }
     return true;
+}
+
+bool NavMesh::findSmoothedPath(float startX, float startY, float startZ,
+                               float goalX, float goalY, float goalZ,
+                               std::vector<NavPoint>& outWaypoints,
+                               uint32_t diversitySeed,
+                               uint32_t maxExpanded) const {
+    outWaypoints.clear();
+    uint32_t startPoly = INVALID_POLYGON;
+    uint32_t goalPoly = INVALID_POLYGON;
+    std::vector<CorridorStep> steps;
+    if (!findCorridor(startX, startY, startZ, goalX, goalY, goalZ,
+                      diversitySeed, maxExpanded, startPoly, goalPoly, steps)) {
+        return false;
+    }
+
+    const float startH = getPolygonHeight(startPoly, startX, startZ);
+    const float goalH = getPolygonHeight(goalPoly, goalX, goalZ);
+    const NavPoint startPt = {startX, startH, startZ};
+    const NavPoint goalPt = {goalX, goalH, goalZ};
+
+    if (startPoly == goalPoly || steps.empty()) {
+        outWaypoints.push_back(goalPt);
+        return true;
+    }
+
+    // Build ordered portal list (left, right) with slight corner inset (~0.45m soldier clearance)
+    // so bots cut clean lines across open squares without clipping building edges.
+    std::vector<PortalEdge> portals;
+    portals.reserve(steps.size() + 2u);
+
+    PortalEdge startPortal;
+    startPortal.left = startPt;
+    startPortal.right = startPt;
+    portals.push_back(startPortal);
+
+    for (size_t i = 0; i < steps.size(); ++i) {
+        const NavPolygon& fromPoly = m_polygons[steps[i].poly];
+        const NavPolygon& toPoly = m_polygons[steps[i].nextPoly];
+        const uint8_t e = static_cast<uint8_t>(steps[i].edge);
+        const uint8_t eNext = static_cast<uint8_t>((e + 1u) % fromPoly.numVertices);
+        NavPoint vA = m_vertices[m_vertexIndices[fromPoly.firstIndex + e]];
+        NavPoint vB = m_vertices[m_vertexIndices[fromPoly.firstIndex + eNext]];
+
+        // Inset portal slightly inward along the shared edge to maintain wall clearance.
+        const float edx = vB.x - vA.x;
+        const float edy = vB.y - vA.y;
+        const float edz = vB.z - vA.z;
+        const float eLen = std::sqrt(edx * edx + edz * edz);
+        if (eLen > 0.25f) {
+            const float inset = (eLen * 0.22f < 0.45f) ? (eLen * 0.22f) : 0.45f;
+            const float t = inset / eLen;
+            const NavPoint aIn = { vA.x + edx * t, vA.y + edy * t, vA.z + edz * t };
+            const NavPoint bIn = { vB.x - edx * t, vB.y - edy * t, vB.z - edz * t };
+            vA = aIn;
+            vB = bIn;
+        }
+
+        PortalEdge pe;
+        // Winding-independent left/right determination relative to travel direction (from -> to).
+        if (triArea2XZ(fromPoly.centroid, toPoly.centroid, vA) >
+            triArea2XZ(fromPoly.centroid, toPoly.centroid, vB)) {
+            pe.right = vA;
+            pe.left = vB;
+        } else {
+            pe.left = vA;
+            pe.right = vB;
+        }
+        portals.push_back(pe);
+    }
+
+    PortalEdge endPortal;
+    endPortal.left = goalPt;
+    endPortal.right = goalPt;
+    portals.push_back(endPortal);
+
+    // Simple Stupid Funnel Algorithm (2D XZ string-pulling).
+    NavPoint portalApex = portals[0].left;
+    NavPoint portalLeft = portals[0].left;
+    NavPoint portalRight = portals[0].right;
+    size_t apexIndex = 0u;
+    size_t leftIndex = 0u;
+    size_t rightIndex = 0u;
+
+    const size_t maxIters = portals.size() * 4u + 64u;
+    size_t iters = 0u;
+
+    for (size_t i = 1u; i < portals.size() && iters < maxIters; ++i, ++iters) {
+        const NavPoint& left = portals[i].left;
+        const NavPoint& right = portals[i].right;
+
+        // Update right boundary.
+        if (triArea2XZ(portalApex, portalRight, right) <= 0.0f) {
+            if (pointsNearXZ(portalApex, portalRight) ||
+                triArea2XZ(portalApex, portalLeft, right) > 0.0f) {
+                portalRight = right;
+                rightIndex = i;
+            } else {
+                // Right crossed over left -> commit portalLeft corner.
+                if (outWaypoints.empty() || dist3D(outWaypoints.back(), portalLeft) > 0.25f) {
+                    outWaypoints.push_back(portalLeft);
+                }
+                portalApex = portalLeft;
+                apexIndex = leftIndex;
+                portalLeft = portalApex;
+                portalRight = portalApex;
+                leftIndex = apexIndex;
+                rightIndex = apexIndex;
+                i = apexIndex;
+                continue;
+            }
+        }
+
+        // Update left boundary.
+        if (triArea2XZ(portalApex, portalLeft, left) >= 0.0f) {
+            if (pointsNearXZ(portalApex, portalLeft) ||
+                triArea2XZ(portalApex, portalRight, left) < 0.0f) {
+                portalLeft = left;
+                leftIndex = i;
+            } else {
+                // Left crossed over right -> commit portalRight corner.
+                if (outWaypoints.empty() || dist3D(outWaypoints.back(), portalRight) > 0.25f) {
+                    outWaypoints.push_back(portalRight);
+                }
+                portalApex = portalRight;
+                apexIndex = rightIndex;
+                portalLeft = portalApex;
+                portalRight = portalApex;
+                leftIndex = apexIndex;
+                rightIndex = apexIndex;
+                i = apexIndex;
+                continue;
+            }
+        }
+    }
+
+    if (outWaypoints.empty() || dist3D(outWaypoints.back(), goalPt) > 0.25f) {
+        outWaypoints.push_back(goalPt);
+    }
+    return true;
+}
+
+bool NavMesh::isPointWalkable(float x, float y, float z) const {
+    if (!m_loaded) {
+        return true;
+    }
+    return findPolygonExact(x, y, z) != INVALID_POLYGON;
+}
+
+bool NavMesh::hasNavLineOfSight(float ax, float ay, float az,
+                                float bx, float by, float bz,
+                                float maxGapMeters) const {
+    if (!m_loaded) {
+        return true;
+    }
+    const float dx = bx - ax;
+    const float dy = by - ay;
+    const float dz = bz - az;
+    const float len = std::sqrt(dx * dx + dz * dz);
+    if (len < 2.0f) {
+        return true;
+    }
+
+    const float stepSize = 2.0f;
+    const int steps = static_cast<int>(len / stepSize);
+    float currentGap = 0.0f;
+    for (int i = 1; i < steps; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(steps);
+        const float sx = ax + dx * t;
+        const float sy = ay + dy * t;
+        const float sz = az + dz * t;
+        if (findPolygonExact(sx, sy, sz) == INVALID_POLYGON) {
+            currentGap += stepSize;
+            if (currentGap >= maxGapMeters) {
+                return false;
+            }
+        } else {
+            currentGap = 0.0f;
+        }
+    }
+    return true;
+}
+
+bool NavMesh::findCoverStep(float ownX, float ownY, float ownZ,
+                            float threatX, float threatZ,
+                            float searchRadius,
+                            NavPoint& outCover) const {
+    if (!m_loaded) {
+        return false;
+    }
+    const float tx = threatX - ownX;
+    const float tz = threatZ - ownZ;
+    const float tLen = std::sqrt(tx * tx + tz * tz);
+    if (tLen < 0.5f) {
+        return false;
+    }
+    const float dirX = tx / tLen;
+    const float dirZ = tz / tLen;
+    const float rightX = -dirZ;
+    const float rightZ = dirX;
+
+    // Candidate angles relative to threat direction: lateral flanks, rear-diagonals, retreat.
+    static const float kDirs[10][2] = {
+        {  1.00f,  0.00f }, // pure right
+        { -1.00f,  0.00f }, // pure left
+        {  0.86f, -0.50f }, // back-right
+        { -0.86f, -0.50f }, // back-left
+        {  0.50f, -0.86f }, // rear-right
+        { -0.50f, -0.86f }, // rear-left
+        {  0.00f, -1.00f }, // straight back
+        {  0.86f,  0.50f }, // forward-right (corner peek)
+        { -0.86f,  0.50f }, // forward-left (corner peek)
+        {  0.35f, -0.93f }  // angled retreat
+    };
+    const float radii[2] = { searchRadius, searchRadius * 0.55f };
+
+    float bestScore = -1e9f;
+    bool found = false;
+    NavPoint bestPt = {ownX, ownY, ownZ};
+
+    for (int r = 0; r < 2; ++r) {
+        const float rad = radii[r];
+        if (rad < 1.5f) continue;
+        for (int i = 0; i < 10; ++i) {
+            const float cx = ownX + (rightX * kDirs[i][0] + dirX * kDirs[i][1]) * rad;
+            const float cz = ownZ + (rightZ * kDirs[i][0] + dirZ * kDirs[i][1]) * rad;
+            const uint32_t poly = findPolygonExact(cx, ownY, cz);
+            if (poly == INVALID_POLYGON) {
+                continue;
+            }
+            const float cy = getPolygonHeight(poly, cx, cz);
+            // Make sure we can walk straight there without a wall between us and the cover spot.
+            if (!hasNavLineOfSight(ownX, ownY, ownZ, cx, cy, cz, 2.5f)) {
+                continue;
+            }
+
+            float score = 0.0f;
+            // Big bonus if a building/wall blocks direct line from threat to candidate!
+            if (!hasNavLineOfSight(cx, cy, cz, threatX, ownY, threatZ, 3.0f)) {
+                score += 12.0f;
+            }
+            // Bonus if candidate sits near a wall/boundary on the threat-facing side (hugging cover).
+            const float probeX = cx + dirX * 2.2f;
+            const float probeZ = cz + dirZ * 2.2f;
+            if (findPolygonExact(probeX, cy, probeZ) == INVALID_POLYGON) {
+                score += 6.0f;
+            }
+            // Prefer lateral/retreat movement over running directly toward threat.
+            score -= kDirs[i][1] * 2.0f;
+            // Slight preference for full searchRadius when equally good.
+            score += (r == 0) ? 1.0f : 0.0f;
+
+            if (score > bestScore) {
+                bestScore = score;
+                bestPt.x = cx;
+                bestPt.y = cy;
+                bestPt.z = cz;
+                found = true;
+            }
+        }
+    }
+
+    if (found) {
+        outCover = bestPt;
+    }
+    return found;
+}
+
+bool NavMesh::findFlankWaypoint(float startX, float startY, float startZ,
+                                float goalX, float goalY, float goalZ,
+                                float sideSign, float offsetDist,
+                                NavPoint& outFlank) const {
+    if (!m_loaded) {
+        return false;
+    }
+    const float dx = goalX - startX;
+    const float dz = goalZ - startZ;
+    const float dist = std::sqrt(dx * dx + dz * dz);
+    if (dist < 22.0f) {
+        return false;
+    }
+    const float perpX = (-dz / dist) * (sideSign >= 0.0f ? 1.0f : -1.0f);
+    const float perpZ = ( dx / dist) * (sideSign >= 0.0f ? 1.0f : -1.0f);
+
+    const float midX = startX + dx * 0.55f;
+    const float midY = startY + (goalY - startY) * 0.55f;
+    const float midZ = startZ + dz * 0.55f;
+
+    const float scales[3] = { 1.0f, 0.65f, 0.35f };
+    for (int i = 0; i < 3; ++i) {
+        const float off = offsetDist * scales[i];
+        const float fx = midX + perpX * off;
+        const float fz = midZ + perpZ * off;
+        const uint32_t poly = findPolygonExact(fx, midY, fz);
+        if (poly != INVALID_POLYGON) {
+            outFlank.x = fx;
+            outFlank.y = getPolygonHeight(poly, fx, fz);
+            outFlank.z = fz;
+            return true;
+        }
+        const uint32_t nearPoly = findNearestPolygon(fx, midY, fz, 18.0f);
+        if (nearPoly != INVALID_POLYGON) {
+            outFlank = getPolygonCentroid(nearPoly);
+            return true;
+        }
+    }
+    return false;
 }
 
 bool NavMesh::isWalkablePolygon(uint32_t polyIdx) const {
@@ -825,14 +1178,27 @@ float NavMesh::sampleAerialHeight(float x, float z, float fallbackY) const {
     if (!m_ahmLoaded || m_ahmWidth <= 0 || m_ahmHeight <= 0) {
         return fallbackY;
     }
-    const int32_t col = static_cast<int32_t>((x - m_ahmOriginX) / m_ahmCellSize);
-    const int32_t row = static_cast<int32_t>((z - m_ahmOriginZ) / m_ahmCellSize);
-    if (col < 0 || col >= m_ahmWidth || row < 0 || row >= m_ahmHeight) {
+    const float fx = (x - m_ahmOriginX) / m_ahmCellSize;
+    const float fz = (z - m_ahmOriginZ) / m_ahmCellSize;
+    if (fx < 0.0f || fz < 0.0f ||
+        fx >= static_cast<float>(m_ahmWidth) || fz >= static_cast<float>(m_ahmHeight)) {
         return fallbackY;
     }
-    const size_t idx = static_cast<size_t>(col) +
-                       static_cast<size_t>(m_ahmWidth) * static_cast<size_t>(row);
-    return static_cast<float>(m_ahmHeights[idx]);
+    const int32_t c0 = static_cast<int32_t>(fx);
+    const int32_t r0 = static_cast<int32_t>(fz);
+    const int32_t c1 = (c0 + 1 < m_ahmWidth) ? (c0 + 1) : c0;
+    const int32_t r1 = (r0 + 1 < m_ahmHeight) ? (r0 + 1) : r0;
+    const float tx = fx - static_cast<float>(c0);
+    const float tz = fz - static_cast<float>(r0);
+
+    const float h00 = static_cast<float>(m_ahmHeights[static_cast<size_t>(c0) + static_cast<size_t>(m_ahmWidth) * static_cast<size_t>(r0)]);
+    const float h10 = static_cast<float>(m_ahmHeights[static_cast<size_t>(c1) + static_cast<size_t>(m_ahmWidth) * static_cast<size_t>(r0)]);
+    const float h01 = static_cast<float>(m_ahmHeights[static_cast<size_t>(c0) + static_cast<size_t>(m_ahmWidth) * static_cast<size_t>(r1)]);
+    const float h11 = static_cast<float>(m_ahmHeights[static_cast<size_t>(c1) + static_cast<size_t>(m_ahmWidth) * static_cast<size_t>(r1)]);
+
+    const float h0 = h00 + (h10 - h00) * tx;
+    const float h1 = h01 + (h11 - h01) * tx;
+    return h0 + (h1 - h0) * tz;
 }
 
 } // namespace bf2bot

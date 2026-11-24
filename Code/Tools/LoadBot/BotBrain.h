@@ -4,6 +4,7 @@
 #include "Bf2Protocol.h"
 #include "NavMesh.h"
 #include "RouteLoader.h"
+#include "TeamTactics.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -20,6 +21,9 @@ struct TrackedPlayer {
     int32_t team;
     bool isAlive;
     bool isManDown;
+    bool isFiring;
+    bool callForMedic;
+    uint64_t lastFiredUs;
     uint8_t spawnGroupId;
     uint8_t kit;
     uint16_t soldierNetId;
@@ -31,6 +35,9 @@ struct TrackedPlayer {
           team(0),
           isAlive(false),
           isManDown(false),
+          isFiring(false),
+          callForMedic(false),
+          lastFiredUs(0),
           spawnGroupId(0),
           kit(0),
           soldierNetId(0),
@@ -40,7 +47,7 @@ struct TrackedPlayer {
 // Human-like aiming configuration (CLI: --aim-skill, --interp-ms, --aim-legacy).
 struct AimConfig {
     bool legacy;       // true: old nearest-target / newest-position behaviour
-    float skill;       // 0..1; scales reaction time, initial error and convergence time
+    float skill;       // 0..1; scales reaction time, initial error, lead and convergence
     int32_t interpMs;  // client render delay used to pick the aimed-at position
     bool hasGoal;      // --goal: every bot moves on this world position instead of the flags
     float goalX, goalY, goalZ;
@@ -72,6 +79,8 @@ struct TrackedSoldier {
     uint8_t pose;
     uint8_t hitPointsByte;
     bool isRagdoll;
+    bool isFiring;
+    uint64_t lastFiredUs;
     bool hasPos;
     uint64_t lastUpdateUs;
     PosSample hist[kHistSize]; // ring buffer of received positions
@@ -110,6 +119,8 @@ struct TrackedSoldier {
           pose(0),
           hitPointsByte(255u),
           isRagdoll(false),
+          isFiring(false),
+          lastFiredUs(0),
           hasPos(false),
           lastUpdateUs(0),
           hist(),
@@ -121,6 +132,10 @@ struct TrackedSoldier {
 // received snapshots bracketing renderUs. Clamps to the oldest sample before the history
 // and to the newest after it (no extrapolation). Returns false without any history.
 bool interpolateSoldierPos(const TrackedSoldier& s, uint64_t renderUs, Vec3& out);
+
+// Estimates a soldier's smoothed world velocity (m/s) from recent snapshot history,
+// falling back to s.speed when fewer than 2 samples are available.
+bool estimateSoldierVelocity(const TrackedSoldier& s, Vec3& outVel);
 
 // Remaining aim offset (degrees) after elapsedUs of tracking: exponential decay that has
 // dropped to ~5% of initialDeg at convergeUs.
@@ -158,6 +173,10 @@ struct TrackedControlPoint {
     bool isNeutral;
     bool allowCaptureByTeam1;
     bool allowCaptureByTeam2;
+    float takeOverCounter;
+    float takeOverChangePerSecond;
+    int32_t flagTeam;
+    int32_t capturingState;
     Vec3 pos;
     bool hasPos;
 
@@ -167,6 +186,10 @@ struct TrackedControlPoint {
           isNeutral(false),
           allowCaptureByTeam1(true),
           allowCaptureByTeam2(true),
+          takeOverCounter(1.0f),
+          takeOverChangePerSecond(0.0f),
+          flagTeam(0),
+          capturingState(0),
           pos(),
           hasPos(false) {}
 };
@@ -180,11 +203,28 @@ struct BotWorldView {
     bool hasOwnPos;
     Vec3 ownPos;
     float ownFacingDegrees;
+    float ownLookLeftRightAngle;
+    float ownPendingTurn;
     float ownPitchDegrees;
+    bool hasPredictedAim;
+    float ownAimYawDegrees;
+    float ownAimPitchDegrees;
+    float ownMouseSpeedMod;
     uint8_t ownPose;
+    uint8_t ownHitPointsByte;
+    uint8_t ownWeaponZoom;
+    uint8_t ownWeaponState;
+    bool ownWeaponStowed;
+    float ownSprintStamina;
+    bool ownIsSprinting;
+    bool ownIsGrounded;
+    Vec3 ownSpeed;
+    int32_t ownKit;
+    float rttMs;
     float worldSize;
 
     const std::map<uint16_t, TrackedSoldier>* soldiers;
+    const std::map<uint8_t, TrackedPlayer>* players;
     const std::map<uint8_t, TrackedSpawnGroup>* spawnGroups;
     const std::map<uint16_t, TrackedControlPoint>* controlPoints;
 
@@ -197,10 +237,27 @@ struct BotWorldView {
           hasOwnPos(false),
           ownPos(),
           ownFacingDegrees(0.0f),
+          ownLookLeftRightAngle(0.0f),
+          ownPendingTurn(0.0f),
           ownPitchDegrees(0.0f),
+          hasPredictedAim(false),
+          ownAimYawDegrees(0.0f),
+          ownAimPitchDegrees(0.0f),
+          ownMouseSpeedMod(1.0f),
           ownPose(0),
+          ownHitPointsByte(255u),
+          ownWeaponZoom(0u),
+          ownWeaponState(0u),
+          ownWeaponStowed(false),
+          ownSprintStamina(1.0f),
+          ownIsSprinting(false),
+          ownIsGrounded(true),
+          ownSpeed(),
+          ownKit(-1),
+          rttMs(0.0f),
           worldSize(1024.0f),
           soldiers(nullptr),
+          players(nullptr),
           spawnGroups(nullptr),
           controlPoints(nullptr) {}
 };
@@ -222,7 +279,8 @@ class BotBrain {
 public:
     BotBrain(uint32_t botIndex, uint32_t seed,
              const NavMesh* navMesh, const RouteLoader* routeLoader,
-             const AimConfig& aim = AimConfig());
+             const AimConfig& aim = AimConfig(),
+             TeamTactics* teamTactics = nullptr);
 
     void reset();
     void onSpawned(const Vec3& spawnPos, uint64_t nowUs);
@@ -232,9 +290,13 @@ public:
     int32_t assignedTeam() const { return m_team; }
     void setTeam(int32_t team) {
         if (team > 0 && team != m_team) {
+            if (m_teamTactics) {
+                m_teamTactics->clearClaim(m_team, m_botIndex);
+            }
             m_team = team;
             m_hasRouteTrack = false;
             m_hasPatrolGoal = false;
+            m_hasActiveObjective = false;
             m_waypoints.clear();
             m_waypointIdx = 0;
         }
@@ -242,6 +304,9 @@ public:
     int32_t assignedKit() const { return m_kit; }
 
     int32_t pickSpawnGroup(const std::map<uint8_t, TrackedSpawnGroup>& spawnGroups);
+    int32_t pickSpawnGroup(const std::map<uint8_t, TrackedSpawnGroup>& spawnGroups,
+                           const std::map<uint16_t, TrackedControlPoint>* controlPoints,
+                           const std::map<uint16_t, TrackedSoldier>* soldiers);
 
     void tick(uint64_t nowUs, float dtSec, const BotWorldView& world, BotTickOutput& out);
 
@@ -252,6 +317,27 @@ private:
         NAV_FALLBACK = 2
     };
 
+    enum FireState {
+        FIRE_WAIT  = 0,
+        FIRE_BURST = 1,
+        FIRE_PAUSE = 2
+    };
+
+    enum UtilityAction {
+        UTIL_NONE    = 0,
+        UTIL_MEDKIT  = 1,
+        UTIL_AMMOBAG = 2,
+        UTIL_REVIVE  = 3,
+        UTIL_GRENADE = 4,
+        UTIL_PISTOL  = 5
+    };
+
+    enum UtilityPhase {
+        UPHASE_SWITCH  = 0,
+        UPHASE_ACT     = 1,
+        UPHASE_RESTORE = 2
+    };
+
     float randFloat(float lo, float hi);
     int32_t randInt(int32_t lo, int32_t hi);
 
@@ -260,29 +346,61 @@ private:
     static float distXZ(const Vec3& a, const Vec3& b);
     static float dist3D(const Vec3& a, const Vec3& b);
 
-    bool pickObjectiveGoal(const BotWorldView& world, Vec3& outGoal);
+    float currentAimYaw(const BotWorldView& world) const;
+    float currentAimPitch(const BotWorldView& world) const;
+    float effectiveMouseScale(const BotWorldView& world) const;
+    int32_t activeKit(const BotWorldView& world) const;
+    int32_t rollReloadThreshold(int32_t kit);
+
+    void steerAngles(float curYawDeg, float curPitchDeg,
+                     float desiredYawDeg, float desiredPitchDeg,
+                     float maxTurnDegPerSec, float mouseScale,
+                     float dtSec, float& outMouseX, float& outMouseY) const;
+    void steerToward(const Vec3& ownPos, float ownYawDeg, float ownPitchDeg,
+                     const Vec3& targetPos, float mouseScale, float dtSec,
+                     float& outMouseX, float& outMouseY);
+    static void computeRelativeMove(float aimYawDeg, float moveYawDeg, float speedScale,
+                                    float& outStrafe, float& outForward);
+
+    bool isObjectiveStillActive(const BotWorldView& world, uint32_t objKey,
+                                bool& outStillFriendly) const;
+    bool pickObjectiveGoal(uint64_t nowUs, const BotWorldView& world, Vec3& outGoal);
     bool pickRandomWalkableNavPoint(Vec3& outGoal);
+    void computeFriendlySeparation(const BotWorldView& world, float& outSepX, float& outSepZ) const;
     void updateNavigation(uint64_t nowUs, const BotWorldView& world,
                           bool inCombat, Vec3& outMoveTarget, bool& outHasMoveTarget,
                           uint32_t& outNavButtons);
-    void steerToward(const Vec3& ownPos, float ownYawDeg, float ownPitchDeg,
-                     const Vec3& targetPos, float dtSec, float& outMouseX, float& outMouseY);
 
     // Human-like combat (non-legacy).
     bool selectTarget(uint64_t nowUs, const BotWorldView& world, const TrackedSoldier*& outTarget,
-                      Vec3& outRendered, float& outDist);
+                      Vec3& outRendered, float& outDist, int32_t& outVisibleEnemyCount);
+    void updateDamageAndMemory(uint64_t nowUs, const BotWorldView& world,
+                               const TrackedSoldier* bestTarget, const Vec3& rendered);
+    bool tryStartUtilityAction(uint64_t nowUs, const BotWorldView& world,
+                               const TrackedSoldier* bestTarget, const Vec3& targetRendered,
+                               float targetDist);
+    bool tickUtilityAction(uint64_t nowUs, float dtSec, const BotWorldView& world,
+                           const TrackedSoldier* bestTarget, const Vec3& targetRendered,
+                           float targetDist, PlayerActionInput& act);
     void tickCombatHuman(uint64_t nowUs, float dtSec, const BotWorldView& world,
                          const TrackedSoldier& target, const Vec3& rendered, float dist,
+                         int32_t visibleEnemies, PlayerActionInput& act);
+    void tickOutOfCombat(uint64_t nowUs, float dtSec, const BotWorldView& world,
+                         bool hasMoveTarget, const Vec3& moveTarget, uint32_t navButtons,
                          PlayerActionInput& act);
     void resetFireState();
+    void startUtility(UtilityAction action, uint64_t nowUs, const Vec3& aimPos, uint16_t targetNetId);
+    void requestPrimaryRestore(uint64_t nowUs);
 
     uint32_t m_botIndex;
     int32_t m_team;
     int32_t m_kit;
+    BotTacticalRole m_role;
     std::mt19937 m_rng;
 
     const NavMesh* m_navMesh;
     const RouteLoader* m_routeLoader;
+    TeamTactics* m_teamTactics;
 
     // Humanized aiming parameters
     float m_turnRateDegPerSec;
@@ -302,9 +420,14 @@ private:
     int32_t m_burstTicksLeft;
     int32_t m_fireTicksSinceReload;
     int32_t m_reloadThresholdTicks;
+    int32_t m_totalReloads;
     uint64_t m_reloadUntilUs;
     uint64_t m_nextWeaponSwitchUs;
     uint64_t m_switchBackToPrimaryUs;
+    uint64_t m_lastCombatUs;
+    uint64_t m_lastJumpUs;
+    uint64_t m_lastProneToggleUs;
+    uint64_t m_zoomToggleCooldownUs;
 
     // Human aim model state
     AimConfig m_aim;
@@ -314,14 +437,52 @@ private:
     float m_jitterYawDeg;
     float m_jitterPitchDeg;
     uint64_t m_nextJitterUs;
-    enum FireState { FIRE_WAIT = 0, FIRE_BURST = 1, FIRE_PAUSE = 2 };
     FireState m_fireState;
     uint64_t m_fireStateEndUs;
     int32_t m_burstShots;
 
+    // Damage, threat memory, cover & scanning state
+    bool m_hasLastHp;
+    uint8_t m_lastOwnHp;
+    uint64_t m_underFireUntilUs;
+    uint64_t m_lastDamageUs;
+    bool m_hasLastKnownEnemy;
+    uint16_t m_lastKnownEnemyNetId;
+    Vec3 m_lastKnownEnemyPos;
+    Vec3 m_lastKnownEnemyVel;
+    uint64_t m_lastKnownEnemyUs;
+    bool m_hasCoverStep;
+    Vec3 m_coverStepPos;
+    uint64_t m_coverStepUntilUs;
+    float m_scanOffsetDeg;
+    uint64_t m_nextScanFlipUs;
+    bool m_sprintActive;
+
+    // Tactical utility / class action state machine
+    UtilityAction m_utilAction;
+    UtilityPhase m_utilPhase;
+    uint64_t m_utilPhaseStartUs;
+    uint64_t m_utilDeadlineUs;
+    Vec3 m_utilTargetPos;
+    uint16_t m_utilTargetNetId;
+    uint64_t m_nextMedkitUs;
+    uint64_t m_nextAmmoBagUs;
+    uint64_t m_nextReviveUs;
+    uint64_t m_nextGrenadeUs;
+    bool m_usedPistolThisTarget;
+
     // Respawn cadence
     uint64_t m_nextSpawnRequestUs;
     uint32_t m_spawnGroupRotateIdx;
+
+    // Active objective & flag capture hold
+    bool m_hasActiveObjective;
+    uint32_t m_activeObjectiveKey;
+    Vec3 m_activeObjectivePos;
+    bool m_activeObjectiveFriendly;
+    uint64_t m_objectiveHoldStartUs;
+    Vec3 m_lastOwnPosForDeath;
+    bool m_hasLastOwnPosForDeath;
 
     // Navigation state (Tier 1: NavMesh)
     std::vector<NavPoint> m_waypoints;
@@ -341,12 +502,15 @@ private:
     bool m_hasPatrolGoal;
     uint64_t m_nextPatrolGoalUs;
 
-    // Stuck detection
+    // Multi-stage stuck detection
     Vec3 m_stuckAnchorPos;
     uint64_t m_stuckAnchorUs;
     bool m_hasStuckAnchor;
     uint64_t m_stuckRecoverUntilUs;
     float m_stuckStrafeDir;
+    int32_t m_stuckStage;
+    uint32_t m_blacklistedObjKey;
+    uint64_t m_blacklistUntilUs;
 };
 
 } // namespace bf2bot
