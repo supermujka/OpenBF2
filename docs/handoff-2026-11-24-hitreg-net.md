@@ -39,6 +39,19 @@ Sažetak jedne duge sesije. Novi agent: pročitaj ovo, pa `AGENTS.md`.
    "ogromno bolje" (u istom periodu: restart mape, friendly fire 0, manje rafala), pa je
    **350 upisan trajno** u `karkand_inf64.con`, uz `queueDrainMaxTarget 4` i friendly fire 0.
    Promjene na serveru se bilježe u `/home/bf2/server/live_changes.log`.
+   **Vanilla vs sve optimizacije (2+2 min, isti igrači)**: vanilla nema drain → red inputa 5,
+   klijent diže interp na ~240 ms, snapshot ~18 Hz; optimizovano red 1–3, interp 115–185 ms,
+   30 Hz. Na ~8.000 proba s optimizacijama (450) live je na istim hicima bolji od vanilla
+   rewinda: Mujka 145/121, SYNKRONIZED 79/63. Procenat pogodaka najviše prati oružje/rasipanje.
+   - `improved 0` gasi i `maxClientInterpMs` granicu (vanilla koristi pun interp do 512).
+   - `maxClientInterpMs 0` = bez granice (ne "interp 0"); `useClientWindow 0` = bez interp
+     rewinda (ping + `phy-latencyComp-default` 50 ms).
+   - Klijent šalje interp u svakom paketu akcija (9 bita, `PlayerActionManager.cpp`); počinje na
+     200 (tier tabela) / `GSInterpolationTime` 100 i retail ga auto-podešava po redu inputa.
+     Ne može se forsirati na klijentu bez manipulacije (to bi bio cheat).
+   - `ObjectTemplate.ammo.magSize` / `nrOfMags` sa servera ne mijenja municiju kod klijenta
+     (klijent ima svoje tweak fajlove) → "bez reloada" nije izvodljivo serverom.
+   - `getQueueDrainMaxTarget()` je klampan na 1..4 u kodu; 5 traži izmjenu koda.
 6. **`queueDrainMaxTarget`**: kod stabilne veze red je uvijek 1, delay 0 → postavka nema efekta.
    Vlasnik subjektivno preferira 1; za igrače s jitterom 2 je kompromis.
 7. **Kapacitet 64 igrača (Karkand, loadbotovi)**: tik p50 ~5.7 ms / p99 ~7.5 ms od 33.3 ms, glavna nit
@@ -84,7 +97,13 @@ Sažetak jedne duge sesije. Novi agent: pročitaj ovo, pa `AGENTS.md`.
   - **Kapacitet Oracle Micro**: 62 bota = bf2 ~94% CPU + ~31% steal, tik p99 do 190 ms,
     snapshot p95 5.7 Hz (teleportovanje). 30 botova = ~28% CPU, snapshot p95 ~27 Hz, uz povremene
     skokove. Za 32v32 treba jača mašina. `feat/hitreg` build nema `[SV-PERF]`/`[SV-CPU]`.
-  - Loadbotovi prema serveru idu iz lokalnog WSL-a (`~/bf2_loadbot`, svi USMC, `--password`).
+  - Loadbotovi prema serveru idu iz lokalnog WSL-a; `feat/loadbot-aim-teams` @ `6cf7728` ima
+    `--team`, `--goal`, `--spawn-near`, `--keep-running` (vidi `scripts/live-test/README.md`).
+    Zadnja postavka: 10 MEC botova, Square, stalno trče, `--aim-legacy`.
+  - Live stanje servera na kraju sesije (config može biti drugačiji!): interp 450 uživo
+    (config 350), `queueDrainMaxTarget 4`, `queueDelay 1`, 30 Hz, FF 0, spawn/manDown 1 s,
+    lozinka servera iz `serversettings.con`; privremeni `ammo.magSize 999` / M16 `nrOfMags 50`
+    žive do restarta servera. `game.sayAll` radi preko `live_cvars.txt`.
 
 ## Otvoreno
 

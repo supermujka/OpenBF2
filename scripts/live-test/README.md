@@ -46,6 +46,37 @@ agent-run tests must not use the owner's port 16567.
 | `misses.py <server dir>` | newest CSV | distance, bone, pose and burst breakdown of those misses |
 | `devcomp.py <server dir> [name]` | newest CSV (102 columns) | deviation terms (min, speed, turn, misc, fire, pose, zoom) by outcome |
 
+### 143-column telemetry (`feat/hitreg` builds)
+
+| Script | Output |
+|---|---|
+| `state143.py <csv>` | per shooter: live (`v1_*`) vs vanilla, aim-on-target conversion, interp, queue, kills; tick p99 per minute |
+| `player143.py <csv> <name> [name]` | one player's network, queue, drain drops, spread, miss buckets, delivery blockers |
+| `rewind_cmp.py <label> <csv> [...]` | live vs vanilla vs the unclamped-interp shadow (`uncl10_*`) per player and dataset |
+| `ab_compare.py <phase csv> ...` / `overall.py <label> <csv> ...` | phase and dataset comparisons per human player |
+| `cp_square.py <level server.zip>` | `gpm_cq/64` control point positions (for loadbot `--goal` / `--spawn-near`) |
+
+## Remote server helpers (`remote/`)
+
+Piped to the server with `plink -batch -load <session> -l ubuntu "tr -d '\r' | bash -s <args>"`.
+They need `livecvar.py` active on the server and passwordless `sudo` for the `ubuntu` user.
+
+| Script | Purpose |
+|---|---|
+| `remote_say.sh "<text>" [console line ...]` | `game.sayAll "[Claude] <text>"` plus optional console commands in one live write |
+| `remote_setcvar.sh "<console line>"` | one live command, appended to `live_changes.log` with CSV file and line |
+| `remote_restartmap.sh` | `admin.restartMap` and wait for the new telemetry CSV |
+| `remote_ab.sh` | map restart, two minutes `improved 0` + vanilla send rate, two minutes all optimizations |
+| `ab_extract.sh` / `extract_since.sh <csv> <line>` | cut telemetry by `ab_phases.log` marks or from a line onward |
+
+Example loadbot run against a remote test server (all bots MEC, holding Square, always moving):
+
+```bash
+bf2_loadbot --team 1 --aim-legacy --keep-running --goal -220.1,155.8,98.1 \
+  --spawn-near -220.1,155.8,98.1 --host <server> --port 16567 --password <pw> --bots 10 \
+  --navmesh <nav_karkand dir> --report-sec 30
+```
+
 Phase experiments write lines `label|wall time|csv file|line count at switch` to
 `exp_phases.log` (or `label|time|console lines|bot log lines` to `net_phases.log`) each time they
 change a setting, so the scripts can split the telemetry by the setting that was live.
