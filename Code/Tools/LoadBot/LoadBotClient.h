@@ -48,10 +48,12 @@ struct LoadBotConfig {
     ImpairmentConfig uplinkImpair;
     ImpairmentConfig downlinkImpair;
     AimConfig aim;
+    int32_t forceTeam;   // 0 = alternate by bot index, otherwise every bot requests this team
     bool verbose;
 
     LoadBotConfig()
         : botIndex(0),
+          forceTeam(0),
           modName("mods/bf2"),
           password(),
           worldSize(1024.0f),

@@ -239,11 +239,39 @@ int32_t BotBrain::pickSpawnGroup(const std::map<uint8_t, TrackedSpawnGroup>& spa
         return -1;
     }
 
+    if (m_aim.hasSpawnNear) {
+        // --spawn-near: always the friendly spawn group closest to the requested point.
+        int32_t best = -1;
+        float bestD = 1e30f;
+        for (size_t i = 0; i < chosen->size(); ++i) {
+            std::map<uint8_t, TrackedSpawnGroup>::const_iterator it = spawnGroups.find((*chosen)[i]);
+            if (it == spawnGroups.end() || !it->second.hasPos) {
+                continue;
+            }
+            const float dx = it->second.pos.x - m_aim.spawnX;
+            const float dz = it->second.pos.z - m_aim.spawnZ;
+            const float d = dx * dx + dz * dz;
+            if (d < bestD) {
+                bestD = d;
+                best = static_cast<int32_t>((*chosen)[i]);
+            }
+        }
+        if (best >= 0) {
+            return best;
+        }
+    }
+
     const size_t idx = (m_spawnGroupRotateIdx++) % chosen->size();
     return static_cast<int32_t>((*chosen)[idx]);
 }
 
 bool BotBrain::pickObjectiveGoal(const BotWorldView& world, Vec3& outGoal) {
+    if (m_aim.hasGoal) {
+        // Spread the bots over ~16 m around the commanded point so they do not stack.
+        outGoal = Vec3(m_aim.goalX + randFloat(-8.0f, 8.0f), m_aim.goalY,
+                       m_aim.goalZ + randFloat(-8.0f, 8.0f));
+        return true;
+    }
     std::vector<Vec3> candidates;
 
     if (world.controlPoints) {
@@ -918,6 +946,22 @@ void BotBrain::tick(uint64_t nowUs, float dtSec, const BotWorldView& world, BotT
             act.axes[5] = mouseY;
             act.axes[3] = 1.0f;
             act.buttonMaskLow |= navButtons;
+        }
+    }
+
+    if (m_aim.keepRunning && world.ownAlive && !world.ownManDown) {
+        // --keep-running: never stand still; alternate sprint and a slow walk every 2-4 s.
+        if (nowUs >= m_nextRunFlipUs) {
+            m_runSprint = !m_runSprint;
+            m_nextRunFlipUs = nowUs + static_cast<uint64_t>(randInt(2000, 4000)) * 1000ULL;
+        }
+        act.buttonMaskLow &= ~(BTN_CROUCH | BTN_PRONE);
+        if (m_runSprint) {
+            act.axes[3] = 1.0f;
+            act.buttonMaskLow |= BTN_SPRINT;
+        } else {
+            act.axes[3] = 0.4f;
+            act.buttonMaskLow &= ~BTN_SPRINT;
         }
     }
 

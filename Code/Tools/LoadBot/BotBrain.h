@@ -42,8 +42,15 @@ struct AimConfig {
     bool legacy;       // true: old nearest-target / newest-position behaviour
     float skill;       // 0..1; scales reaction time, initial error and convergence time
     int32_t interpMs;  // client render delay used to pick the aimed-at position
+    bool hasGoal;      // --goal: every bot moves on this world position instead of the flags
+    float goalX, goalY, goalZ;
+    bool keepRunning = false; // --keep-running: always move, alternating sprint and slow walk
+    bool hasSpawnNear; // --spawn-near: spawn at the friendly spawn group closest to this point
+    float spawnX, spawnY, spawnZ;
 
-    AimConfig() : legacy(false), skill(0.7f), interpMs(100) {}
+    AimConfig() : legacy(false), skill(0.7f), interpMs(100), hasGoal(false),
+                  goalX(0.0f), goalY(0.0f), goalZ(0.0f), hasSpawnNear(false),
+                  spawnX(0.0f), spawnY(0.0f), spawnZ(0.0f) {}
 };
 
 // One received snapshot position of a remote soldier (receive time in the bot clock).
@@ -289,6 +296,8 @@ private:
     uint64_t m_reactionDelayUs;
     bool m_strafeRight;
     uint64_t m_nextStrafeFlipUs;
+    bool m_runSprint = false;        // --keep-running phase: sprint or slow walk
+    uint64_t m_nextRunFlipUs = 0;
     bool m_burstFiring;
     int32_t m_burstTicksLeft;
     int32_t m_fireTicksSinceReload;

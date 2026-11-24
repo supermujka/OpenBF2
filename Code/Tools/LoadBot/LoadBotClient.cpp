@@ -80,6 +80,11 @@ LoadBotClient::LoadBotClient(const LoadBotConfig& cfg,
 
     const int worldInt = static_cast<int>(cfg.worldSize > 64.0f ? cfg.worldSize : 1024.0f);
     m_codec.ghosts().setWorldSize(worldInt, worldInt);
+
+    if (cfg.forceTeam == 1 || cfg.forceTeam == 2) {
+        m_brain.setTeam(cfg.forceTeam);
+        m_ownTeam = cfg.forceTeam;
+    }
 }
 
 LoadBotClient::~LoadBotClient() {

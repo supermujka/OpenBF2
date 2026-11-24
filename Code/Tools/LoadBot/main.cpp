@@ -78,6 +78,7 @@ struct RunnerOptions {
     uint32_t seed;
     int reportSec;
     bf2bot::AimConfig aim;
+    int32_t forceTeam;  // 0 = alternate teams by bot index
     bool verbose;
 
     RunnerOptions()
@@ -102,6 +103,7 @@ struct RunnerOptions {
           worldSizeExplicit(false),
           seed(1337u),
           reportSec(10),
+          forceTeam(0),
           verbose(false) {}
 };
 
@@ -134,6 +136,10 @@ void printUsage(const char* prog) {
         "  --aim-skill <0..1>       Human-like aim skill: scales reaction time, aim error, convergence (default: 0.7)\n"
         "  --interp-ms <int>        Client interpolation delay: bots aim at the position rendered at now-interp (default: 100)\n"
         "  --aim-legacy             Use the old aiming (nearest target, newest position, no reaction/error model)\n"
+        "  --team <1|2>             Every bot requests this team (Karkand: 1 = MEC, 2 = USMC; default alternates)\n"
+        "  --goal <x,y,z>           Every bot moves on this world position instead of choosing flags\n"
+        "  --spawn-near <x,y,z>     Spawn at the friendly spawn group closest to this position\n"
+        "  --keep-running           Never stand still; alternate sprint and slow walk every 2-4 s\n"
         "  --report-sec <int>      Periodic telemetry report interval in seconds (default: 10)\n"
         "  --verbose                Enable verbose per-bot handshake/disconnect logging\n"
         "  -h, --help               Show this help message\n",
@@ -150,6 +156,35 @@ bool parseArgs(int argc, char** argv, RunnerOptions& opt, bool& showHelp) {
         }
         if (arg == "--aim-legacy") {
             opt.aim.legacy = true;
+            continue;
+        }
+        if (arg == "--team" && i + 1 < argc) {
+            opt.forceTeam = static_cast<int32_t>(std::strtol(argv[++i], nullptr, 10));
+            if (opt.forceTeam != 1 && opt.forceTeam != 2) {
+                std::fprintf(stderr, "Invalid --team (1 = team 1/MEC on Karkand, 2 = team 2/USMC)\n");
+                return false;
+            }
+            continue;
+        }
+        if (arg == "--goal" && i + 1 < argc) {
+            // x,y,z world position every bot walks to instead of choosing flags.
+            if (std::sscanf(argv[++i], "%f,%f,%f", &opt.aim.goalX, &opt.aim.goalY, &opt.aim.goalZ) != 3) {
+                std::fprintf(stderr, "Invalid --goal (expected x,y,z)\n");
+                return false;
+            }
+            opt.aim.hasGoal = true;
+            continue;
+        }
+        if (arg == "--keep-running") {
+            opt.aim.keepRunning = true;
+            continue;
+        }
+        if (arg == "--spawn-near" && i + 1 < argc) {
+            if (std::sscanf(argv[++i], "%f,%f,%f", &opt.aim.spawnX, &opt.aim.spawnY, &opt.aim.spawnZ) != 3) {
+                std::fprintf(stderr, "Invalid --spawn-near (expected x,y,z)\n");
+                return false;
+            }
+            opt.aim.hasSpawnNear = true;
             continue;
         }
         if (arg == "--verbose") {
@@ -413,6 +448,7 @@ int main(int argc, char** argv) {
         cfg.startAtUs = startUs + static_cast<uint64_t>(i) * static_cast<uint64_t>(opt.staggerMs) * 1000ULL;
         cfg.verbose = opt.verbose;
         cfg.aim = opt.aim;
+        cfg.forceTeam = opt.forceTeam;
 
         // Split ping and jitter 50/50 across uplink and downlink so RTT matches --ping-ms / --jitter-ms.
         cfg.uplinkImpair.oneWayDelayMs = botPingMs[i] * 0.5;
