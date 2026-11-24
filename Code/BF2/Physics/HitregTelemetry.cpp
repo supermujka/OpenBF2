@@ -70,6 +70,11 @@ struct PlayerNetState
     int           lastSnapGapTicks;
     int           lastDrainDropTick;
 
+    // [CHOSEN, not recovered] Input index of the client action the server executed this tick.
+    // actSrc: 0 = none/AI, 1 = fresh queued action, 2 = replayed m_current (no client index).
+    int           actInputIdx;
+    int           actSrc;
+
     PlayerNetState()
         : lossMask(0)
         , lossCount(0)
@@ -86,6 +91,8 @@ struct PlayerNetState
         , lastSnapTick(-1)
         , lastSnapGapTicks(-1)
         , lastDrainDropTick(-1)
+        , actInputIdx(-1)
+        , actSrc(0)
     {
         std::memset(pingRing, 0, sizeof(pingRing));
     }
@@ -133,6 +140,31 @@ struct ShotRecord
     std::uint64_t shEarlyNpCum;
     int           sndGapTicks;
     int           qDropAgeT;
+
+    // [CHOSEN, not recovered] Deviation-sample forensics (server vs client input index).
+    bool          hasDevInfo;
+    int           fireInputIdx;
+    int           actInputIdx;
+    int           actSrc;
+    int           devTblIdx;      // -1 when no table sample was drawn
+    float         devMag;
+    float         devX;
+    float         devY;
+    int           projIdx;
+    bool          dummyProj;
+    // Deviation terms at fire time (see SoldierDeviationComp::getTelemetrySnapshot).
+    bool          hasDevComp;
+    float         devMin;
+    float         devSpeed;
+    float         devTurn;
+    float         devMisc;
+    float         devFire;
+    float         devPoseMod;
+    float         devZoomMod;
+    int           shPose;
+    bool          shZoomed;
+    float         shSpeedMs;
+    float         shTurnRate;
 
     // Pending soldier contact arbitration on current tick.
     int           pendingTick;
@@ -195,6 +227,28 @@ struct ShotRecord
         , shEarlyNpCum(0)
         , sndGapTicks(-1)
         , qDropAgeT(-1)
+        , hasDevInfo(false)
+        , fireInputIdx(0)
+        , actInputIdx(-1)
+        , actSrc(0)
+        , devTblIdx(-1)
+        , devMag(0.0f)
+        , devX(0.0f)
+        , devY(0.0f)
+        , projIdx(0)
+        , dummyProj(false)
+        , hasDevComp(false)
+        , devMin(0.0f)
+        , devSpeed(0.0f)
+        , devTurn(0.0f)
+        , devMisc(0.0f)
+        , devFire(0.0f)
+        , devPoseMod(0.0f)
+        , devZoomMod(0.0f)
+        , shPose(-1)
+        , shZoomed(false)
+        , shSpeedMs(0.0f)
+        , shTurnRate(0.0f)
         , pendingTick(-1)
         , pendingTarget(0)
         , pendingTargetId(-1)
@@ -289,7 +343,10 @@ const char* kCsvHeader =
     "snd_gap_ticks,q_drop_age_t,"
     "aim_hit,aim_miss_m,miss_dy_m,miss_lat_m,tgt_back_dot,ring_uf,"
     "outcome,blocker,blocker_mat,override_margin_m,t_wall_m,t_soldier_m,obj_class,eye_clear,"
-    "mat_a,mat_b,base_dmg,mat_mod,angle_mod,final_dmg,hp_before,hp_after,killed,hitmarker\n";
+    "mat_a,mat_b,base_dmg,mat_mod,angle_mod,final_dmg,hp_before,hp_after,killed,hitmarker,"
+    "fire_input_idx,act_input_idx,act_src,dev_tbl_idx,dev_mag,dev_x,dev_y,proj_idx,dummy,"
+    "dev_min,dev_speed,dev_turn,dev_misc,dev_fire,dev_pose_mod,dev_zoom_mod,"
+    "sh_pose,sh_zoomed,sh_speed_ms,sh_turn_rate\n";
 
 void flushBufferToDisk(bool forceFlush)
 {
@@ -681,7 +738,7 @@ void ensureTelemetryOpenAndConfigLogged()
             ",,,,,,,,,,,,,,,,,,,,"
             ",,,,,,,,,,,,,,,,,,,,"
             ",,%s"
-            ",,,,,,,,,,,,,,,,,\n",
+            ",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,\n",
             WorldPref::getTickCount(), WorldPref::getWorldTime(), sig);
         appendCheckedLine(line, written, sizeof(line));
         flushBufferToDisk(true);
@@ -757,6 +814,43 @@ void emitFireRow(ShotRecord& shot)
     if (shot.hasMuzzleOff)
         std::snprintf(muzzleOffBuf, sizeof(muzzleOffBuf), "%.3f", shot.muzzleOffM);
 
+    char fireIdxBuf[16] = "";
+    char actIdxBuf[16] = "";
+    char actSrcBuf[8] = "";
+    char tblBuf[16] = "";
+    char magBuf[24] = "";
+    char xBuf[24] = "";
+    char yBuf[24] = "";
+    char projBuf[16] = "";
+    char dummyBuf[8] = "";
+    if (shot.hasDevInfo)
+    {
+        std::snprintf(fireIdxBuf, sizeof(fireIdxBuf), "%d", shot.fireInputIdx);
+        if (shot.actSrc == 1)
+            std::snprintf(actIdxBuf, sizeof(actIdxBuf), "%d", shot.actInputIdx);
+        std::snprintf(actSrcBuf, sizeof(actSrcBuf), "%d", shot.actSrc);
+        std::snprintf(magBuf, sizeof(magBuf), "%.4f", shot.devMag);
+        if (shot.devTblIdx >= 0)
+        {
+            std::snprintf(tblBuf, sizeof(tblBuf), "%d", shot.devTblIdx);
+            std::snprintf(xBuf, sizeof(xBuf), "%.4f", shot.devX);
+            std::snprintf(yBuf, sizeof(yBuf), "%.4f", shot.devY);
+        }
+        std::snprintf(projBuf, sizeof(projBuf), "%d", shot.projIdx);
+        std::snprintf(dummyBuf, sizeof(dummyBuf), "%d", shot.dummyProj ? 1 : 0);
+    }
+
+    // 11 component columns (dev_min .. sh_turn_rate); all empty unless the soldier component ran.
+    char compBuf[192] = ",,,,,,,,,,";
+    if (shot.hasDevComp)
+    {
+        std::snprintf(compBuf, sizeof(compBuf),
+                      "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%d,%.3f,%.4f",
+                      shot.devMin, shot.devSpeed, shot.devTurn, shot.devMisc, shot.devFire,
+                      shot.devPoseMod, shot.devZoomMod, shot.shPose, shot.shZoomed ? 1 : 0,
+                      shot.shSpeedMs, shot.shTurnRate);
+    }
+
     char line[1024];
     const int written = std::snprintf(
         line, sizeof(line),
@@ -766,7 +860,8 @@ void emitFireRow(ShotRecord& shot)
         "%.2f,%.2f"
         ",,,,,,,,,,,,,,,,,,,,,,,,"
         ",%s,%s,%s,%llu,%llu,%llu,%llu,%d,%d"
-        ",,,,,,,,,,,,,,,,,,,,,,,,\n",
+        ",,,,,,,,,,,,,,,,,,,,,,,,"
+        ",%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
         shot.fireTick, shot.fireTimeSec,
         static_cast<unsigned long long>(shot.shotId),
         shot.weaponName.c_str(), shot.shooterId, shot.shooterName.c_str(),
@@ -779,7 +874,8 @@ void emitFireRow(ShotRecord& shot)
         static_cast<unsigned long long>(shot.shShotsCum),
         static_cast<unsigned long long>(shot.shFdropCum),
         static_cast<unsigned long long>(shot.shEarlyNpCum),
-        shot.sndGapTicks, shot.qDropAgeT);
+        shot.sndGapTicks, shot.qDropAgeT,
+        fireIdxBuf, actIdxBuf, actSrcBuf, tblBuf, magBuf, xBuf, yBuf, projBuf, dummyBuf, compBuf);
     appendCheckedLine(line, written, sizeof(line));
 }
 
@@ -847,6 +943,16 @@ void HitregTelemetry::notePlayerInputConsumed(const IPlayer* player, bool fireHe
         return;
 
     ++playerNetStates()[player].fireHeldCum;
+}
+
+void HitregTelemetry::notePlayerActionExecuted(const IPlayer* player, int clientInputIdx, bool replayed)
+{
+    if (!player || *g_telemetryLevel <= 0)
+        return;
+
+    PlayerNetState& ns = playerNetStates()[player];
+    ns.actInputIdx = clientInputIdx;
+    ns.actSrc = replayed ? 2 : 1;
 }
 
 void HitregTelemetry::notePlayerInputDropped(const IPlayer* player, bool fireHeld, bool isDrainDrop)
@@ -928,7 +1034,8 @@ void HitregTelemetry::noteShotFired(const IObject* projectile, IPlayer* owner,
 }
 
 void HitregTelemetry::noteShotDeviation(const IObject* projectile, const Vec3& deviatedVel,
-                                        float deviationPct)
+                                        float deviationPct,
+                                        const ShotDeviationInfo& info)
 {
     if (!projectile || *g_telemetryLevel <= 0)
         return;
@@ -939,6 +1046,35 @@ void HitregTelemetry::noteShotDeviation(const IObject* projectile, const Vec3& d
         return;
 
     ShotRecord& shot = it->second;
+    shot.hasDevInfo = true;
+    shot.fireInputIdx = info.fireInputIdx;
+    shot.devTblIdx = info.tableIdx;
+    shot.devMag = deviationPct;
+    shot.devX = info.sampleX;
+    shot.devY = info.sampleY;
+    shot.projIdx = info.projectileIndex;
+    shot.dummyProj = info.dummy;
+    shot.hasDevComp = info.hasComponents;
+    shot.devMin = info.devMin;
+    shot.devSpeed = info.devSpeed;
+    shot.devTurn = info.devTurn;
+    shot.devMisc = info.devMisc;
+    shot.devFire = info.devFire;
+    shot.devPoseMod = info.devPoseMod;
+    shot.devZoomMod = info.devZoomMod;
+    shot.shPose = info.shPose;
+    shot.shZoomed = info.shZoomed;
+    shot.shSpeedMs = info.shSpeedMs;
+    shot.shTurnRate = info.shTurnRate;
+    {
+        std::unordered_map<const IPlayer*, PlayerNetState>::const_iterator nit =
+            playerNetStates().find(shot.ownerPtr);
+        if (nit != playerNetStates().end())
+        {
+            shot.actInputIdx = nit->second.actInputIdx;
+            shot.actSrc = nit->second.actSrc;
+        }
+    }
     Vec3 bDir;
     if (normalizeVec3(deviatedVel, bDir))
     {
@@ -1281,7 +1417,7 @@ void HitregTelemetry::recordSoldierProbe(IObject* projectileObject, IPlayer* own
         "%s"
         ",,,,,,,,,"
         ",%s,%s,%s,%s,%s,%d"
-        ",,,,,,,,,,,,,,,,,,\n",
+        ",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,\n",
         currentTick, WorldPref::getWorldTime(),
         static_cast<unsigned long long>(shot.shotId),
         shot.weaponName.c_str(), shot.shooterId, shot.shooterName.c_str(),
@@ -1408,7 +1544,7 @@ void HitregTelemetry::noteProjectileContactDelivered(const IObject* projectileOb
         ",,,,,,,,,,,,,,,,,,,,"
         ",,,,,,,,,,,,,,,"
         "%s,%s,%d,%.4f,%.4f,%.4f,%s,%d"
-        ",,,,,,,,,,\n",
+        ",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,\n",
         currentTick, WorldPref::getWorldTime(),
         static_cast<unsigned long long>(shot.shotId),
         shot.weaponName.c_str(), shot.shooterId, shot.shooterName.c_str(),
@@ -1544,7 +1680,7 @@ void HitregTelemetry::finishProjectileCollisionDamage(const IObject* projectileO
         ",,,,,,,,,,,,,,,,,,,,"
         ",,,,,,,,,,,,,,,,,,,,"
         ",,,%s,%s,%s,%s"
-        ",,,,,,,,,,,,,,,,,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d\n",
+        ",,,,,,,,,,,,,,,,,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,,,,,,,,,,,,,,,,,,,,\n",
         WorldPref::getTickCount(), WorldPref::getWorldTime(),
         static_cast<unsigned long long>(shot.shotId),
         shot.weaponName.c_str(), shot.shooterId, shot.shooterName.c_str(),

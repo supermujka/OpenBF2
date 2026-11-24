@@ -8,6 +8,23 @@
 #include <cstdio>
 #include <cstring>
 
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef PSAPI_VERSION
+#    define PSAPI_VERSION 2
+#  endif
+#  include <windows.h>
+#  include <psapi.h>
+#else
+#  include <sys/resource.h>
+#  include <unistd.h>
+#endif
+
 namespace dice {
 namespace hfe {
 
@@ -43,6 +60,104 @@ int                          s_windowOverruns33ms = 0;
 long long                    s_windowPacketsSent = 0;
 long long                    s_windowGhostsSent = 0;
 long long                    s_windowBytesSent = 0;
+
+// [CHOSEN, not recovered] CPU accounting for the [SV-CPU] line. Sampled on the thread that runs
+// the tick (main thread); window start is captured by the first enabled beginTick of a window.
+struct CpuSnap
+{
+    double wallSec;
+    double procCpuSec;      // user + system, whole process
+    double threadCpuSec;    // user + system, calling thread; < 0 when unavailable
+};
+
+CpuSnap s_cpuStart;
+bool    s_cpuStartValid = false;
+
+#if defined(_WIN32)
+double fileTimeSec(const FILETIME& ft)
+{
+    ULARGE_INTEGER u;
+    u.LowPart  = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return static_cast<double>(u.QuadPart) * 1e-7;
+}
+#else
+double timevalSec(const timeval& tv)
+{
+    return static_cast<double>(tv.tv_sec) + static_cast<double>(tv.tv_usec) * 1e-6;
+}
+#endif
+
+CpuSnap takeCpuSnap()
+{
+    CpuSnap s;
+    s.wallSec = std::chrono::duration<double>(
+        ServerTickProfiler::now().time_since_epoch()).count();
+    s.procCpuSec = 0.0;
+    s.threadCpuSec = -1.0;
+#if defined(_WIN32)
+    FILETIME c, e, k, u;
+    if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u))
+        s.procCpuSec = fileTimeSec(k) + fileTimeSec(u);
+    if (GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u))
+        s.threadCpuSec = fileTimeSec(k) + fileTimeSec(u);
+#else
+    rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0)
+        s.procCpuSec = timevalSec(ru.ru_utime) + timevalSec(ru.ru_stime);
+#  if defined(RUSAGE_THREAD)
+    if (getrusage(RUSAGE_THREAD, &ru) == 0)
+        s.threadCpuSec = timevalSec(ru.ru_utime) + timevalSec(ru.ru_stime);
+#  endif
+#endif
+    return s;
+}
+
+double maxRssMb()
+{
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc;
+    pmc.cb = sizeof(pmc);
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+        return static_cast<double>(pmc.PeakWorkingSetSize) / (1024.0 * 1024.0);
+    return 0.0;
+#else
+    rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0)
+        return static_cast<double>(ru.ru_maxrss) / 1024.0;    // Linux: KiB
+    return 0.0;
+#endif
+}
+
+int logicalCpuCount()
+{
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return static_cast<int>(si.dwNumberOfProcessors);
+#else
+    const long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? static_cast<int>(n) : 0;
+#endif
+}
+
+void emitCpuLine()
+{
+    if (!s_cpuStartValid)
+        return;
+    const CpuSnap end = takeCpuSnap();
+    const double wall = end.wallSec - s_cpuStart.wallSec;
+    if (wall <= 0.0)
+        return;
+    const double procPct = (end.procCpuSec - s_cpuStart.procCpuSec) * 100.0 / wall;
+    const double thrPct = (end.threadCpuSec >= 0.0 && s_cpuStart.threadCpuSec >= 0.0)
+        ? (end.threadCpuSec - s_cpuStart.threadCpuSec) * 100.0 / wall
+        : -1.0;
+    std::fprintf(stderr,
+                 "[SV-CPU] wall_s=%.2f proc_cpu_pct=%.1f main_thread_cpu_pct=%.1f "
+                 "max_rss_mb=%.1f logical_cpus=%d\n",
+                 wall, procPct, thrPct, maxRssMb(), logicalCpuCount());
+}
 
 int effectiveInterval()
 {
@@ -165,8 +280,10 @@ void emitWindowReport()
         p[ServerTickProfiler::PHASE_PYTHON].p95,
         p[ServerTickProfiler::PHASE_PYTHON].p99,
         p[ServerTickProfiler::PHASE_PYTHON].maxVal);
+    emitCpuLine();
     std::fflush(stderr);
 
+    s_cpuStartValid = false;
     resetWindow();
 }
 
@@ -183,6 +300,11 @@ void ServerTickProfiler::beginTick()
         return;
     }
 
+    if (!s_cpuStartValid)
+    {
+        s_cpuStart = takeCpuSnap();
+        s_cpuStartValid = true;
+    }
     s_tickOpen = true;
     s_hadServerUpdate = false;
     s_curConns = 0;

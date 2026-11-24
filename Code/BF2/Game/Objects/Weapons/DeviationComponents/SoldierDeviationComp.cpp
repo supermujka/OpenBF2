@@ -14,6 +14,7 @@
 #include "../../IObject.h"
 #include "../../IPlayer.h"
 #include "../../ObjectLayoutAccess.h"
+#include "../../../../Physics/IPhysicsNode.h"
 #include "../../../../Core/Debug.h"
 #include "../../../../Core/Ids.h"
 #include "../../../../IO/Input/PlayerInput.h"
@@ -251,6 +252,39 @@ float SoldierDeviationComp::getMaxDeviation() const
 void SoldierDeviationComp::setAIDeviation(float deviation)
 {
     m_aiDeviation = deviation;
+}
+
+// [CHOSEN, not recovered] Telemetry-only read of the deviation terms; never called unless hit-reg
+// telemetry is enabled. No gameplay state is touched.
+bool SoldierDeviationComp::getTelemetrySnapshot(TelemetrySnapshot& out) const
+{
+    out.minDev   = m_soldierTemplate->getMinDev();
+    out.speedDev = m_speedDeviation;
+    out.turnDev  = m_turnDeviation;
+    out.miscDev  = m_miscDeviation;
+    out.fireDev  = m_fireDeviation;
+    out.poseMod  = m_poseModifier;
+    out.zoomMod  = m_zoomModifier;
+    out.zoomed   = m_zoomed;
+    out.pose     = -1;
+    out.speedMs  = 0.0f;
+    out.turnRate = 0.0f;
+
+    IObject* const soldierObject = findClosestParentHavingNetworkable(m_initObject);
+    if (soldierObject && soldierObject->getTemplate()
+        && soldierObject->getTemplate()->getClassID() == CID_SoldierTemplate)
+    {
+        out.pose = static_cast<int>(static_cast<Soldier*>(soldierObject)->getPose());
+        IPhysicsNode* const node = static_cast<IPhysicsNode*>(
+            object_detail::LayoutAccess::physicsNode(soldierObject));
+        if (node)
+        {
+            const Vec3& v = node->getPositionalSpeed();
+            out.speedMs = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+            out.turnRate = node->getRotationalSpeed().y;
+        }
+    }
+    return true;
 }
 
 SoldierDeviationCompTemplate::SoldierDeviationCompTemplate()

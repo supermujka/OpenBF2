@@ -4014,6 +4014,8 @@ bool GameServer::simulatePlayerUpdate(world::IPlayer* player, float dt)
             if (world::HitregTelemetry::isEnabled())
                 world::HitregTelemetry::notePlayerSimTick(player, 0, replays + 1, true);
             buffer->m_current.get(input);
+            if (world::HitregTelemetry::isEnabled())
+                world::HitregTelemetry::notePlayerActionExecuted(player, buffer->m_currentInputIndex, true);
 
             const int current = buffer->m_currentInputIndex;
             m_currentInputIndex = (current == -1) ? 0 : current + 1;
@@ -4083,6 +4085,7 @@ bool GameServer::simulatePlayerUpdate(world::IPlayer* player, float dt)
                 player, front.m_inputIndex, WorldPref::getTickCount() - 1);
             if (world::HitregTelemetry::isEnabled())
             {
+                world::HitregTelemetry::notePlayerActionExecuted(player, front.m_inputIndex, false);
                 world::HitregTelemetry::notePlayerSimTick(
                     player, static_cast<int>(buffer->m_entries.size()), 0, false);
                 world::HitregTelemetry::notePlayerInputConsumed(

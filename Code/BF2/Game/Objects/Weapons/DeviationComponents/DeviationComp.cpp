@@ -3,6 +3,7 @@
 // the Win32 dedicated-server image.
 
 #include "DeviationComp.h"
+#include "SoldierDeviationComp.h"
 
 #include <string>
 
@@ -101,12 +102,45 @@ void DeviationComp::postFire(WeaponFireEvent& event)
         }
     }
 
+    HitregTelemetry::ShotDeviationInfo devInfo = {};
+    devInfo.tableIdx = -1;
+    devInfo.projectileIndex = event.projectileIndex;
+    devInfo.dummy = event.dummyProjectile;
+    if (game && HitregTelemetry::isEnabled())
+        devInfo.fireInputIdx = game->getCurrentInputIndex();
+
+    // [CHOSEN, not recovered] Telemetry only: capture the deviation terms BEFORE this shot's
+    // fireDevAdd is applied (m_deviation itself was fixed by the last updateDeviation).
+    if (HitregTelemetry::isEnabled() && m_template
+        && m_template->getClassID() == CID_SoldierDeviationCompTemplate)
+    {
+        SoldierDeviationComp::TelemetrySnapshot snap;
+        if (static_cast<const SoldierDeviationComp*>(this)->getTelemetrySnapshot(snap))
+        {
+            devInfo.hasComponents = true;
+            devInfo.devMin = snap.minDev;
+            devInfo.devSpeed = snap.speedDev;
+            devInfo.devTurn = snap.turnDev;
+            devInfo.devMisc = snap.miscDev;
+            devInfo.devFire = snap.fireDev;
+            devInfo.devPoseMod = snap.poseMod;
+            devInfo.devZoomMod = snap.zoomMod;
+            devInfo.shPose = snap.pose;
+            devInfo.shZoomed = snap.zoomed;
+            devInfo.shSpeedMs = snap.speedMs;
+            devInfo.shTurnRate = snap.turnRate;
+        }
+    }
+
     if (deviation > 0.01f)
     {
         const int tableIndex =
             (event.projectileIndex + game->getCurrentInputIndex()) & 0x3FF;
         float deviationX = deviation * g_normalTable[tableIndex];
         float deviationY = deviation * g_normalTable[(tableIndex + 1) & 0x3FF];
+        devInfo.tableIdx = tableIndex;
+        devInfo.sampleX = deviationX;
+        devInfo.sampleY = deviationY;
 
         if (event.dummyProjectile)
         {
@@ -138,7 +172,7 @@ void DeviationComp::postFire(WeaponFireEvent& event)
 
     node->setPositionalSpeed(speed);
     if (HitregTelemetry::isEnabled())
-        HitregTelemetry::noteShotDeviation(projectile, speed, deviation);
+        HitregTelemetry::noteShotDeviation(projectile, speed, deviation, devInfo);
 }
 
 void DeviationComp::fireComplete(unsigned int) {}

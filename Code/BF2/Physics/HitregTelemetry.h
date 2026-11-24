@@ -40,8 +40,33 @@ public:
     static void noteShotFired(const IObject* projectile, IPlayer* owner,
                               const char* weaponName, const Vec3& startPos,
                               const Vec3& launchVel);
+    // [CHOSEN, not recovered] Called by GameServer after the player's action is chosen.
+    // replayed=true: no fresh client action (clientInputIdx is the last consumed one, unused).
+    static void notePlayerActionExecuted(const IPlayer* player, int clientInputIdx, bool replayed);
+    struct ShotDeviationInfo
+    {
+        int   fireInputIdx;     // game->getCurrentInputIndex() inside DeviationComp::postFire
+        int   tableIdx;         // -1 when no table sample was drawn
+        float sampleX;
+        float sampleY;
+        int   projectileIndex;
+        bool  dummy;
+        // Deviation terms at fire time (SoldierDeviationComp only; hasComponents=false otherwise).
+        bool  hasComponents;
+        float devMin;
+        float devSpeed;
+        float devTurn;
+        float devMisc;
+        float devFire;      // m_fireDeviation before this shot's fireDevAdd
+        float devPoseMod;
+        float devZoomMod;
+        int   shPose;
+        bool  shZoomed;
+        float shSpeedMs;
+        float shTurnRate;
+    };
     static void noteShotDeviation(const IObject* projectile, const Vec3& deviatedVel,
-                                  float deviationPct);
+                                  float deviationPct, const ShotDeviationInfo& info);
     static void finalizeShotFired(const IObject* projectile);
     static void forgetProjectile(const IObject* projectile);
 

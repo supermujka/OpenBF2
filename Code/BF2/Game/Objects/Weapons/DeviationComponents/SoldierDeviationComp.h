@@ -31,6 +31,24 @@ public:
     virtual float getMaxDeviation() const;
     virtual void setAIDeviation(float deviation);
 
+    // [CHOSEN, not recovered] Read-only hit-registration telemetry snapshot of the terms that make
+    // up m_deviation. Non-virtual, no data members: no layout or vtable change.
+    struct TelemetrySnapshot
+    {
+        float minDev;
+        float speedDev;
+        float turnDev;
+        float miscDev;
+        float fireDev;     // m_fireDeviation as read (caller decides before/after this shot's add)
+        float poseMod;
+        float zoomMod;
+        int   pose;        // Soldier::getPose() as int (0 stand, 1 crouch, 2 prone, ...), -1 unknown
+        bool  zoomed;
+        float speedMs;     // |soldier physics node positional speed|
+        float turnRate;    // soldier physics node rotational speed Y (rad/s)
+    };
+    bool getTelemetrySnapshot(TelemetrySnapshot& out) const;
+
 private:
     /* +0x2C */ int m_soldierRefCount;
     /* +0x30 */ float m_turnDeviation;

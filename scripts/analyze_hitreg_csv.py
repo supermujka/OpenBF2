@@ -31,8 +31,8 @@ from pathlib import Path
 # ----------------------------------------------------------------------------
 # Thresholds / constants
 # ----------------------------------------------------------------------------
-EXPECTED_COLS = 82                    # header of this branch
-KNOWN_COL_VARIANTS = (82, 102, 127, 143)
+EXPECTED_COLS = 102                   # header of this branch (82 + 9 deviation/input-idx + 11 deviation-component columns)
+KNOWN_COL_VARIANTS = (82, 91, 102, 127, 143)
 TICK_BUDGET_US = 33333                # 30 Hz
 # tick_us measures the (paced) tick period, so ~33333 is normal; only flag overruns.
 TICK_OVER_TOL_US = 1000
@@ -307,6 +307,8 @@ def analyze(path, min_shots, md):
     section_deliver(rep, doc, deliv)
     section_damage(rep, doc, dmg, probes)
     section_funnel(rep, doc, fire, probes, deliv, dmg)
+    section_deviation_idx(rep, doc, fire, probes, hset)
+    section_deviation_components(rep, doc, fire, probes, hset)
     section_tables(rep, doc, fire, probes, dmg, min_shots)
     if BAD_NUM:
         rep.flag("INFO", "unparsable numeric values ignored: " +
@@ -837,6 +839,133 @@ def section_funnel(rep, doc, fire, probes, deliv, dmg):
 
 
 # --- 8. Per weapon / per shooter ------------------------------------------
+def section_deviation_idx(rep, doc, fire, probes, hset):
+    """Server fire_input_idx vs client action act_input_idx (needs the 9 appended FIRE columns)."""
+    doc.h(2, "7b. Deviation input-index match (fire_input_idx vs act_input_idx)")
+    need = ("fire_input_idx", "act_input_idx", "act_src")
+    if not all(c in hset for c in need):
+        doc.p("Columns %s not present in this CSV (older format); section skipped." % ", ".join(need))
+        return
+    # shot_id -> (any aim_hit==1, any act_hit==1) over PROBE rows
+    aim, act = {}, {}
+    for r in probes:
+        k = shot_key(r)
+        if not k:
+            continue
+        if b(r, "aim_hit") == 1:
+            aim[k] = True
+        if b(r, "act_hit") == 1:
+            act[k] = True
+    per = defaultdict(lambda: {"match": [0, 0, 0, 0], "mismatch": [0, 0, 0, 0], "replay": [0, 0, 0, 0], "unknown": 0})
+    for r in fire:
+        fi, ai, src = num(r, "fire_input_idx"), num(r, "act_input_idx"), num(r, "act_src")
+        who = shooter_name(r)
+        if fi is None:
+            per[who]["unknown"] += 1
+            continue
+        if src == 2:
+            grp = "replay"
+        elif ai is None:
+            per[who]["unknown"] += 1
+            continue
+        else:
+            grp = "match" if int(fi) == int(ai) else "mismatch"
+        k = shot_key(r)
+        c = per[who][grp]
+        c[0] += 1                                   # shots
+        c[1] += 1 if k in act else 0                # act hit
+        c[2] += 1 if k in aim else 0                # aim hit
+        c[3] += 1 if (k in aim and k not in act) else 0   # aim hit, no act hit
+    rows = []
+    tot = {"match": [0, 0, 0, 0], "mismatch": [0, 0, 0, 0], "replay": [0, 0, 0, 0]}
+    for who in sorted(per):
+        d = per[who]
+        for g in tot:
+            for i in range(4):
+                tot[g][i] += d[g][i]
+        n = d["match"][0] + d["mismatch"][0] + d["replay"][0]
+        rows.append(_dev_row(who, d, n))
+    if not rows:
+        doc.p("No FIRE rows with fire_input_idx.")
+        return
+    tot["unknown"] = sum(per[w]["unknown"] for w in per)
+    rows.append(_dev_row("ALL", tot, sum(tot[g][0] for g in ("match", "mismatch", "replay"))))
+    doc.p("mismatch = act_src==1 (fresh queued client action) and fire_input_idx != act_input_idx; "
+          "replay = server re-ran the previous action (no client index, act_src==2).  "
+          "hit = shot has an act_hit=1 PROBE; aim-but-miss = shot has aim_hit=1 PROBE but no act_hit=1 PROBE.")
+    doc.table(["shooter", "shots", "mismatch", "mismatch%", "replay", "unknown",
+               "hit% match", "hit% mismatch", "aimMiss% match", "aimMiss% mismatch"], rows)
+    m = tot["mismatch"][0]
+    allfresh = tot["match"][0] + m
+    if allfresh and m * 100.0 / allfresh >= 5.0:
+        rep.flag("WARN", "deviation input index differs from the client action index on %d of %d fresh-action shots (%s)"
+                 % (m, allfresh, fp(m, allfresh)))
+
+
+# --- 7c. Deviation component breakdown --------------------------------------
+DEV_COMP_COLS = ("dev_mag", "dev_min", "dev_speed", "dev_turn", "dev_misc", "dev_fire",
+                 "dev_pose_mod", "dev_zoom_mod", "sh_pose", "sh_zoomed", "sh_speed_ms",
+                 "sh_turn_rate")
+
+
+def section_deviation_components(rep, doc, fire, probes, hset):
+    """Median deviation terms per shooter x PROBE category (FIRE<->PROBE joined on shot_id)."""
+    doc.h(2, "7c. Deviation components at fire time (median per shooter x probe category)")
+    if not all(c in hset for c in DEV_COMP_COLS):
+        doc.p("Columns dev_min..sh_turn_rate not present in this CSV (older format); section skipped.")
+        return
+    rank = {"act_hit": 3, "aim_hit&!act_hit": 2, "aim_miss": 1}
+    cat = {}   # shot_id -> best category: act_hit > aim_hit&!act_hit > aim_miss
+    for r in probes:
+        k = shot_key(r)
+        if not k:
+            continue
+        if b(r, "act_hit") == 1:
+            c = "act_hit"
+        elif b(r, "aim_hit") == 1:
+            c = "aim_hit&!act_hit"
+        elif b(r, "aim_hit") == 0:
+            c = "aim_miss"
+        else:
+            continue
+        if k not in cat or rank[c] > rank[cat[k]]:
+            cat[k] = c
+    groups = defaultdict(list)   # (shooter, cat) -> FIRE rows
+    for r in fire:
+        k = shot_key(r)
+        if k in cat and num(r, "dev_min") is not None:
+            groups[(shooter_name(r), cat[k])].append(r)
+    if not groups:
+        doc.p("No FIRE rows with deviation components joined to PROBE rows.")
+        return
+
+    def med(rows, col):
+        v = sorted(vals(rows, col))
+        return f(pctile(v, 50), 3) if v else "n/a"
+    out = []
+    for (who, c) in sorted(groups, key=lambda x: (x[0], -rank[x[1]])):
+        rows = groups[(who, c)]
+        out.append([who, c, len(rows)] + [med(rows, col) for col in DEV_COMP_COLS])
+    doc.p("dev_mag = deviation used by postFire; dev_min/speed/turn/misc/fire = SoldierDeviationComp terms "
+          "(fire = accumulated before this shot's add); pose_mod/zoom_mod = multipliers; "
+          "dev_mag ~= (min+speed+turn+misc+fire)*pose_mod*zoom_mod.  sh_pose 0=stand 1=crouch 2=prone; "
+          "sh_speed_ms = server soldier speed; sh_turn_rate = rad/s.  Per-shot category = best PROBE "
+          "(act_hit > aim_hit without act_hit > aim miss).")
+    doc.table(["shooter", "probe", "shots"] + list(DEV_COMP_COLS), out)
+
+
+def _dev_row(who, d, n):
+    def hit(g):
+        return fp(d[g][1], d[g][0]) if d[g][0] else "-"
+
+    def aimmiss(g):
+        return fp(d[g][3], d[g][2]) if d[g][2] else "-"
+    mm = d["mismatch"][0]
+    fresh = d["match"][0] + mm
+    return [who, n, mm, fp(mm, fresh) if fresh else "-", d["replay"][0], d.get("unknown", 0),
+            hit("match"), hit("mismatch"), aimmiss("match"), aimmiss("mismatch")]
+
+
 def section_tables(rep, doc, fire, probes, dmg, min_shots):
     doc.h(2, "8. Per weapon / per shooter (>= %d shots)" % min_shots)
 
