@@ -72,7 +72,8 @@ Sažetak jedne duge sesije. Novi agent: pročitaj ovo, pa `AGENTS.md`.
 
 ## Otvoreno
 
-1. Provjeriti da je udaljeni server gore nakon `-j1` builda i deploya (screen `bf2server`, port 16567).
+1. Udaljeni server je gore od 2026-11-24 21:03 s buildom `de6bdb4` (screen `bf2server`, UDP 16567 i
+   29900, Karkand učitan). Dodati `@reboot` autostart ako treba; testirati igru s klijentom.
 2. Odlučiti trajno: `queueDelay 0`, `queueDrainMaxTarget` (1 ili 2), eventualno `phy-latencyComp-max` 0.20–0.25.
 3. Prikupiti CSV s pravog gathera i napraviti "duel" analizu (zadnje 3 s prije svake smrti).
 4. Popraviti yaw skaliranje loadbota, zatim noćni soak 31v31 (`scripts/live-test/soak.sh`).
