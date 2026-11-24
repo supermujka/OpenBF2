@@ -28,6 +28,11 @@ Sažetak jedne duge sesije. Novi agent: pročitaj ovo, pa `AGENTS.md`.
 5. **`queueDelay`**: default `phy-latencyComp-queueDelay 1` dodaje ~45–70 ms rewinda; na metama koje
    trče Active gubi vs Vanilla. `queueDelay 0` (C) izjednačava. Pri pingu ~25 ms nijedna opcija nije
    statistički bolja od vanile; prava razlika se vidi tek na 80–150 ms.
+   **Ali na pravom internetu (Oracle, 2 prava igrača, 8.6 min, default qDelay=1)** red je bio 2–3,
+   i live (v1) je registrovao više od vanile: Mujka 43 vs 26, SYNKRONIZED 38 vs 25 (v1-only vs
+   van-only). Zaključak: lokalni test bez jittera nije reprezentativan; `queueDelay 1` ostaviti dok
+   gather CSV ne pokaže suprotno. Tamo je i `OVERRIDE_WALL` 7.7% isporuka (lokalno ~2%), kandidat
+   za "pogodak bez štete".
 6. **`queueDrainMaxTarget`**: kod stabilne veze red je uvijek 1, delay 0 → postavka nema efekta.
    Vlasnik subjektivno preferira 1; za igrače s jitterom 2 je kompromis.
 7. **Kapacitet 64 igrača (Karkand, loadbotovi)**: tik p50 ~5.7 ms / p99 ~7.5 ms od 33.3 ms, glavna nit
@@ -69,6 +74,11 @@ Sažetak jedne duge sesije. Novi agent: pročitaj ovo, pa `AGENTS.md`.
     `/home/bf2/_bf2top_removed_20261124_205534/`, backup `/home/ubuntu/bf2top-backup-*.tar.gz`),
     root auto-reboot 03:00/14:00, nginx. **Nema autostarta servera nakon reboota.**
   - Rcon lozinka je bila u čistom tekstu u `.bashrc`/profilu: promijeniti.
+  - `std_archive.md5` preimenovan u `.bak` (inače server izbacuje loadbotove na provjeri arhiva).
+  - **Kapacitet Oracle Micro**: 62 bota = bf2 ~94% CPU + ~31% steal, tik p99 do 190 ms,
+    snapshot p95 5.7 Hz (teleportovanje). 30 botova = ~28% CPU, snapshot p95 ~27 Hz, uz povremene
+    skokove. Za 32v32 treba jača mašina. `feat/hitreg` build nema `[SV-PERF]`/`[SV-CPU]`.
+  - Loadbotovi prema serveru idu iz lokalnog WSL-a (`~/bf2_loadbot`, svi USMC, `--password`).
 
 ## Otvoreno
 
