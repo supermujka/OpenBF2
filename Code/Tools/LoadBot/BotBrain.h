@@ -44,7 +44,17 @@ struct TrackedPlayer {
           name() {}
 };
 
-// Human-like aiming configuration (CLI: --aim-skill, --interp-ms, --aim-legacy).
+// One ordered frontline flag stage (e.g., Karkand Hotel -> Square).
+struct FrontlineStage {
+    Vec3 anchor;       // Approximate world position (XZ used for matching live flags)
+    float matchRadius; // Max XZ distance (m) to match a live ControlPoint / SpawnGroup
+
+    FrontlineStage() : anchor(), matchRadius(45.0f) {}
+    FrontlineStage(float x, float y, float z, float r = 45.0f)
+        : anchor(x, y, z), matchRadius(r) {}
+};
+
+// Human-like aiming and tactical objective configuration.
 struct AimConfig {
     bool legacy;       // true: old nearest-target / newest-position behaviour
     float skill;       // 0..1; scales reaction time, initial error, lead and convergence
@@ -54,10 +64,14 @@ struct AimConfig {
     bool keepRunning = false; // --keep-running: always move, alternating sprint and slow walk
     bool hasSpawnNear; // --spawn-near: spawn at the friendly spawn group closest to this point
     float spawnX, spawnY, spawnZ;
+    bool autoMapFrontline; // auto-activate map frontline plan on MapInfo (e.g. Karkand Hotel -> Square)
+    int32_t attackTeam;    // team attacking frontline stages (2 = USMC on Karkand); other team defends
+    std::vector<FrontlineStage> frontline; // ordered stages; empty = dynamic Conquest
 
     AimConfig() : legacy(false), skill(0.7f), interpMs(100), hasGoal(false),
                   goalX(0.0f), goalY(0.0f), goalZ(0.0f), hasSpawnNear(false),
-                  spawnX(0.0f), spawnY(0.0f), spawnZ(0.0f) {}
+                  spawnX(0.0f), spawnY(0.0f), spawnZ(0.0f),
+                  autoMapFrontline(true), attackTeam(2), frontline() {}
 };
 
 // One received snapshot position of a remote soldier (receive time in the bot clock).
@@ -302,6 +316,18 @@ public:
         }
     }
     int32_t assignedKit() const { return m_kit; }
+    const AimConfig& aimConfig() const { return m_aim; }
+    void setFrontlinePlan(int32_t attackTeam, const std::vector<FrontlineStage>& stages) {
+        if (attackTeam == 1 || attackTeam == 2) {
+            m_aim.attackTeam = attackTeam;
+        }
+        m_aim.frontline = stages;
+        m_hasActiveObjective = false;
+        m_hasDefendPost = false;
+        m_defendHoldUntilUs = 0;
+        m_waypoints.clear();
+        m_waypointIdx = 0;
+    }
 
     int32_t pickSpawnGroup(const std::map<uint8_t, TrackedSpawnGroup>& spawnGroups);
     int32_t pickSpawnGroup(const std::map<uint8_t, TrackedSpawnGroup>& spawnGroups,
@@ -361,6 +387,31 @@ private:
                      float& outMouseX, float& outMouseY);
     static void computeRelativeMove(float aimYawDeg, float moveYawDeg, float speedScale,
                                     float& outStrafe, float& outForward);
+
+    struct ActiveFrontlineStage {
+        size_t stageIdx;
+        uint32_t objKey;
+        Vec3 pos;
+        int32_t ownerTeam;
+        bool isNeutral;
+        bool underCapture;
+        Vec3 threatApproachPos;
+        bool hasThreatApproachPos;
+
+        ActiveFrontlineStage()
+            : stageIdx(0u), objKey(0u), pos(), ownerTeam(0),
+              isNeutral(false), underCapture(false),
+              threatApproachPos(), hasThreatApproachPos(false) {}
+    };
+
+    bool resolveActiveFrontlineStage(const std::map<uint16_t, TrackedControlPoint>* controlPoints,
+                                     const std::map<uint8_t, TrackedSpawnGroup>* spawnGroups,
+                                     ActiveFrontlineStage& outStage) const;
+    bool hasClearLineOfSight(const BotWorldView& world, const Vec3& targetPos,
+                             uint8_t targetPose) const;
+    bool pickWalkablePerimeterPoint(const Vec3& center, float minRad, float maxRad,
+                                    float biasDirX, float biasDirZ, float halfArcRad,
+                                    Vec3& outPos);
 
     bool isObjectiveStillActive(const BotWorldView& world, uint32_t objKey,
                                 bool& outStillFriendly) const;
@@ -475,12 +526,17 @@ private:
     uint64_t m_nextSpawnRequestUs;
     uint32_t m_spawnGroupRotateIdx;
 
-    // Active objective & flag capture hold
+    // Active objective, flag capture hold & defensive perimeter watch
     bool m_hasActiveObjective;
     uint32_t m_activeObjectiveKey;
     Vec3 m_activeObjectivePos;
     bool m_activeObjectiveFriendly;
     uint64_t m_objectiveHoldStartUs;
+    bool m_hasDefendPost;
+    Vec3 m_defendPostPos;
+    uint64_t m_defendHoldUntilUs;
+    bool m_hasDefendWatchPoint;
+    Vec3 m_defendWatchPoint;
     Vec3 m_lastOwnPosForDeath;
     bool m_hasLastOwnPosForDeath;
 

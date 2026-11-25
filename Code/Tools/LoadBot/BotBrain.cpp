@@ -110,6 +110,11 @@ BotBrain::BotBrain(uint32_t botIndex, uint32_t seed,
       m_activeObjectivePos(),
       m_activeObjectiveFriendly(false),
       m_objectiveHoldStartUs(0),
+      m_hasDefendPost(false),
+      m_defendPostPos(),
+      m_defendHoldUntilUs(0),
+      m_hasDefendWatchPoint(false),
+      m_defendWatchPoint(),
       m_lastOwnPosForDeath(),
       m_hasLastOwnPosForDeath(false),
       m_waypoints(),
@@ -196,6 +201,9 @@ void BotBrain::reset() {
     m_activeObjectiveKey = 0u;
     m_activeObjectiveFriendly = false;
     m_objectiveHoldStartUs = 0;
+    m_hasDefendPost = false;
+    m_defendHoldUntilUs = 0;
+    m_hasDefendWatchPoint = false;
     m_hasLastOwnPosForDeath = false;
 
     if (m_teamTactics) {
@@ -272,6 +280,9 @@ void BotBrain::onSpawned(const Vec3& spawnPos, uint64_t nowUs) {
     m_activeObjectiveKey = 0u;
     m_activeObjectiveFriendly = false;
     m_objectiveHoldStartUs = 0;
+    m_hasDefendPost = false;
+    m_defendHoldUntilUs = 0;
+    m_hasDefendWatchPoint = false;
 
     m_waypoints.clear();
     m_waypointIdx = 0;
@@ -306,6 +317,9 @@ void BotBrain::onDied(uint64_t nowUs) {
     m_hasLastKnownEnemy = false;
     m_hasCoverStep = false;
     m_hasActiveObjective = false;
+    m_hasDefendPost = false;
+    m_defendHoldUntilUs = 0;
+    m_hasDefendWatchPoint = false;
     m_underFireUntilUs = 0;
     m_waypoints.clear();
     m_waypointIdx = 0;
@@ -528,6 +542,44 @@ int32_t BotBrain::pickSpawnGroup(const std::map<uint8_t, TrackedSpawnGroup>& spa
         }
     }
 
+    // Staged frontline plan (e.g. Karkand: Hotel -> Square): both attackers and defenders
+    // spawn at their closest active spawn to the currently contested frontline flag.
+    ActiveFrontlineStage flStage;
+    if (resolveActiveFrontlineStage(controlPoints, &spawnGroups, flStage)) {
+        int32_t best = -1;
+        float bestScore = -1e30f;
+        for (size_t i = 0; i < chosen->size(); ++i) {
+            std::map<uint8_t, TrackedSpawnGroup>::const_iterator it = spawnGroups.find((*chosen)[i]);
+            if (it == spawnGroups.end() || !it->second.hasPos) {
+                continue;
+            }
+            const TrackedSpawnGroup& sg = it->second;
+            const float d = distXZ(sg.pos, flStage.pos);
+            int32_t nearbyEnemies = 0;
+            if (soldiers) {
+                for (std::map<uint16_t, TrackedSoldier>::const_iterator sit = soldiers->begin();
+                     sit != soldiers->end(); ++sit) {
+                    const TrackedSoldier& s = sit->second;
+                    if (!s.hasPos || s.isRagdoll || s.hitPointsByte == 0u) continue;
+                    if (s.team == 0 || s.team == m_team) continue;
+                    if (distXZ(sg.pos, s.pos) < 16.0f) {
+                        ++nearbyEnemies;
+                    }
+                }
+            }
+            // Prefer spawning directly at/nearest to the active frontline stage;
+            // only divert to backup spawn if heavily overrun (>=4 enemies inside 16m).
+            const float score = -d - (nearbyEnemies >= 4 ? 140.0f : 0.0f);
+            if (score > bestScore) {
+                bestScore = score;
+                best = static_cast<int32_t>(sg.spawnGroupId);
+            }
+        }
+        if (best >= 0) {
+            return best;
+        }
+    }
+
     // Frontline spawn scoring: prefer friendly flags close to enemy/neutral objectives,
     // while avoiding heavily overrun spawns when another frontline spawn is available.
     if (chosen->size() > 1u && !hostileObjectives.empty()) {
@@ -594,6 +646,192 @@ int32_t BotBrain::pickSpawnGroup(const std::map<uint8_t, TrackedSpawnGroup>& spa
     return static_cast<int32_t>((*chosen)[idx]);
 }
 
+bool BotBrain::hasClearLineOfSight(const BotWorldView& world, const Vec3& targetPos,
+                                   uint8_t targetPose) const {
+    float ownEyeH = 1.55f;
+    if (world.ownPose == 1u) ownEyeH = 1.10f;
+    else if (world.ownPose == 2u) ownEyeH = 0.42f;
+    else if (world.ownPose == 3u) ownEyeH = 0.45f;
+
+    float tgtH = 1.38f;
+    if (targetPose == 1u) tgtH = 0.95f;
+    else if (targetPose == 2u) tgtH = 0.34f;
+    else if (targetPose == 3u) tgtH = 0.38f;
+
+    const Vec3 ownEye(world.ownPos.x, world.ownPos.y + ownEyeH, world.ownPos.z);
+    const Vec3 tgtPt(targetPos.x, targetPos.y + tgtH, targetPos.z);
+
+    if (!terrainLineOfSight(m_navMesh, ownEye, tgtPt)) {
+        return false;
+    }
+
+    if (m_navMesh && m_navMesh->isLoaded()) {
+        if (!m_navMesh->raycastLineOfSight(world.ownPos.x, world.ownPos.y, world.ownPos.z,
+                                           targetPos.x, targetPos.y, targetPos.z,
+                                           ownEyeH, tgtH)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool BotBrain::resolveActiveFrontlineStage(
+    const std::map<uint16_t, TrackedControlPoint>* controlPoints,
+    const std::map<uint8_t, TrackedSpawnGroup>* spawnGroups,
+    ActiveFrontlineStage& outStage) const {
+    if (m_aim.frontline.empty()) {
+        return false;
+    }
+
+    const int32_t attackTeam = (m_aim.attackTeam == 1 || m_aim.attackTeam == 2)
+        ? m_aim.attackTeam : 2;
+
+    for (size_t s = 0; s < m_aim.frontline.size(); ++s) {
+        const FrontlineStage& st = m_aim.frontline[s];
+        const float maxR = (st.matchRadius > 5.0f) ? st.matchRadius : 45.0f;
+
+        bool matched = false;
+        ActiveFrontlineStage cand;
+        cand.stageIdx = s;
+        float bestDist = maxR;
+
+        if (controlPoints) {
+            for (std::map<uint16_t, TrackedControlPoint>::const_iterator it = controlPoints->begin();
+                 it != controlPoints->end(); ++it) {
+                const TrackedControlPoint& cp = it->second;
+                if (!cp.hasPos) continue;
+                const float d = distXZ(cp.pos, st.anchor);
+                if (d <= bestDist) {
+                    bestDist = d;
+                    matched = true;
+                    cand.objKey = 0x10000u | static_cast<uint32_t>(cp.netId);
+                    cand.pos = cp.pos;
+                    cand.ownerTeam = cp.team;
+                    cand.isNeutral = cp.isNeutral || (cp.team == 0);
+                    cand.underCapture = (cp.capturingState != 0 || cp.takeOverChangePerSecond < -0.01f);
+                }
+            }
+        }
+
+        if (!matched && spawnGroups) {
+            for (std::map<uint8_t, TrackedSpawnGroup>::const_iterator it = spawnGroups->begin();
+                 it != spawnGroups->end(); ++it) {
+                const TrackedSpawnGroup& sg = it->second;
+                if (!sg.hasPos || sg.aiOnly) continue;
+                const float d = distXZ(sg.pos, st.anchor);
+                if (d <= bestDist) {
+                    bestDist = d;
+                    matched = true;
+                    cand.objKey = 0x20000u | static_cast<uint32_t>(sg.spawnGroupId);
+                    cand.pos = sg.pos;
+                    if (std::fabs(cand.pos.y) < 0.01f && std::fabs(st.anchor.y) > 0.01f) {
+                        cand.pos.y = st.anchor.y;
+                    }
+                    cand.ownerTeam = static_cast<int32_t>(sg.team);
+                    cand.isNeutral = (sg.team == 0u);
+                    cand.underCapture = false;
+                }
+            }
+        }
+
+        if (!matched) {
+            continue;
+        }
+
+        // Advance to the next stage once attackers fully hold this flag.
+        if (!cand.isNeutral && cand.ownerTeam == attackTeam) {
+            continue;
+        }
+
+        // Compute expected attacker approach position for defender orientation.
+        if (s > 0u) {
+            cand.threatApproachPos = m_aim.frontline[s - 1u].anchor;
+            cand.hasThreatApproachPos = true;
+        } else {
+            float bestAtkD = 1e30f;
+            if (controlPoints) {
+                for (std::map<uint16_t, TrackedControlPoint>::const_iterator it = controlPoints->begin();
+                     it != controlPoints->end(); ++it) {
+                    const TrackedControlPoint& cp = it->second;
+                    if (!cp.hasPos || cp.team != attackTeam || cp.isNeutral) continue;
+                    const float d = distXZ(cp.pos, cand.pos);
+                    if (d > 5.0f && d < bestAtkD) {
+                        bestAtkD = d;
+                        cand.threatApproachPos = cp.pos;
+                        cand.hasThreatApproachPos = true;
+                    }
+                }
+            }
+            if (!cand.hasThreatApproachPos && spawnGroups) {
+                for (std::map<uint8_t, TrackedSpawnGroup>::const_iterator it = spawnGroups->begin();
+                     it != spawnGroups->end(); ++it) {
+                    const TrackedSpawnGroup& sg = it->second;
+                    if (!sg.hasPos || sg.aiOnly || static_cast<int32_t>(sg.team) != attackTeam) continue;
+                    const float d = distXZ(sg.pos, cand.pos);
+                    if (d > 5.0f && d < bestAtkD) {
+                        bestAtkD = d;
+                        cand.threatApproachPos = sg.pos;
+                        cand.hasThreatApproachPos = true;
+                    }
+                }
+            }
+        }
+
+        outStage = cand;
+        return true;
+    }
+
+    return false;
+}
+
+bool BotBrain::pickWalkablePerimeterPoint(const Vec3& center, float minRad, float maxRad,
+                                          float biasDirX, float biasDirZ, float halfArcRad,
+                                          Vec3& outPos) {
+    const bool hasBias = (biasDirX * biasDirX + biasDirZ * biasDirZ) > 0.01f &&
+                         halfArcRad < (kPi - 0.05f);
+    const float baseAng = hasBias ? std::atan2(biasDirX, biasDirZ) : 0.0f;
+
+    float refY = center.y;
+    if (m_navMesh && m_navMesh->isLoaded()) {
+        const uint32_t centerPoly = m_navMesh->findNearestPolygon(center.x, center.y, center.z, 35.0f);
+        if (centerPoly != NavMesh::INVALID_POLYGON) {
+            refY = m_navMesh->getPolygonCentroid(centerPoly).y;
+        }
+    }
+
+    for (int attempt = 0; attempt < 18; ++attempt) {
+        const float ang = hasBias
+            ? (baseAng + randFloat(-halfArcRad, halfArcRad))
+            : randFloat(0.0f, 2.0f * kPi);
+        const float rad = randFloat(minRad, maxRad);
+        const float px = center.x + std::sin(ang) * rad;
+        const float pz = center.z + std::cos(ang) * rad;
+
+        if (!m_navMesh || !m_navMesh->isLoaded()) {
+            outPos = Vec3(px, refY, pz);
+            return true;
+        }
+        const uint32_t poly = m_navMesh->findPolygonExact(px, refY, pz);
+        if (poly != NavMesh::INVALID_POLYGON) {
+            outPos = Vec3(px, m_navMesh->getPolygonHeight(poly, px, pz), pz);
+            return true;
+        }
+    }
+
+    if (m_navMesh && m_navMesh->isLoaded()) {
+        const uint32_t nearPoly = m_navMesh->findNearestPolygon(center.x, refY, center.z, maxRad + 6.0f);
+        if (nearPoly != NavMesh::INVALID_POLYGON) {
+            const NavPoint c = m_navMesh->getPolygonCentroid(nearPoly);
+            outPos = Vec3(c.x, c.y, c.z);
+            return true;
+        }
+    }
+
+    outPos = Vec3(center.x, refY, center.z);
+    return true;
+}
+
 bool BotBrain::isObjectiveStillActive(const BotWorldView& world, uint32_t objKey,
                                       bool& outStillFriendly) const {
     outStillFriendly = false;
@@ -624,8 +862,79 @@ bool BotBrain::pickObjectiveGoal(uint64_t nowUs, const BotWorldView& world, Vec3
         outGoal = Vec3(m_aim.goalX + randFloat(-8.0f, 8.0f), m_aim.goalY,
                        m_aim.goalZ + randFloat(-8.0f, 8.0f));
         m_hasActiveObjective = false;
+        m_hasDefendPost = false;
+        m_hasDefendWatchPoint = false;
         return true;
     }
+
+    // Staged frontline plan (e.g. Karkand: USMC attacks Hotel -> Square, MEC defends Hotel -> Square).
+    ActiveFrontlineStage flStage;
+    if (resolveActiveFrontlineStage(world.controlPoints, world.spawnGroups, flStage)) {
+        const int32_t attackTeam = (m_aim.attackTeam == 1 || m_aim.attackTeam == 2)
+            ? m_aim.attackTeam : 2;
+        const bool isAttacker = (m_team == attackTeam);
+
+        m_hasActiveObjective = true;
+        if (m_activeObjectiveKey != flStage.objKey) {
+            m_objectiveHoldStartUs = 0;
+            m_defendHoldUntilUs = 0;
+        }
+        m_activeObjectiveKey = flStage.objKey;
+        m_activeObjectivePos = flStage.pos;
+
+        if (m_teamTactics) {
+            m_teamTactics->claimObjective(m_team, m_botIndex, flStage.objKey, nowUs);
+        }
+
+        if (isAttacker || flStage.isNeutral || flStage.ownerTeam != m_team) {
+            // Attackers push straight into capture zone; defenders rush back onto flag if neutralized.
+            m_activeObjectiveFriendly = false;
+            m_hasDefendPost = false;
+            m_hasDefendWatchPoint = false;
+            pickWalkablePerimeterPoint(flStage.pos, 2.0f, 7.5f, 0.0f, 0.0f, kPi, outGoal);
+            return true;
+        }
+
+        // Defender holding active frontline flag (e.g. MEC defending Hotel, then Square).
+        m_activeObjectiveFriendly = true;
+
+        float biasX = 0.0f;
+        float biasZ = -1.0f;
+        if (flStage.hasThreatApproachPos) {
+            const float dx = flStage.threatApproachPos.x - flStage.pos.x;
+            const float dz = flStage.threatApproachPos.z - flStage.pos.z;
+            const float len = std::sqrt(dx * dx + dz * dz);
+            if (len > 1.0f) {
+                biasX = dx / len;
+                biasZ = dz / len;
+            }
+            m_defendWatchPoint = flStage.threatApproachPos;
+        } else {
+            m_defendWatchPoint = Vec3(flStage.pos.x, flStage.pos.y, flStage.pos.z - 60.0f);
+        }
+        m_hasDefendWatchPoint = true;
+
+        if (flStage.underCapture) {
+            // Enemy is actively burning the flag -> collapse tight into the capture radius.
+            m_hasDefendPost = false;
+            m_defendHoldUntilUs = 0;
+            pickWalkablePerimeterPoint(flStage.pos, 2.0f, 7.5f, 0.0f, 0.0f, kPi, outGoal);
+        } else if ((m_botIndex % 3u) == 0u) {
+            // Inner flag garrison (33% of defenders guard the flag courtyard itself).
+            pickWalkablePerimeterPoint(flStage.pos, 4.0f, 11.0f, 0.0f, 0.0f, kPi, outGoal);
+            m_defendPostPos = outGoal;
+            m_hasDefendPost = true;
+        } else {
+            // Forward & flank perimeter defenders facing the attacker approach lanes.
+            pickWalkablePerimeterPoint(flStage.pos, 10.0f, 23.0f, biasX, biasZ, 1.48f, outGoal);
+            m_defendPostPos = outGoal;
+            m_hasDefendPost = true;
+        }
+        return true;
+    }
+
+    m_hasDefendPost = false;
+    m_hasDefendWatchPoint = false;
 
     std::vector<TacticalObjective> candidates;
 
@@ -663,7 +972,7 @@ bool BotBrain::pickObjectiveGoal(uint64_t nowUs, const BotWorldView& world, Vec3
                 obj.kind = OBJ_NEUTRAL;
                 obj.isFriendly = false;
                 candidates.push_back(obj);
-            } else if (cp.team != m_team && (capturable || cp.team != 0)) {
+            } else if (cp.team != m_team && capturable) {
                 TacticalObjective obj;
                 obj.key = 0x10000u | static_cast<uint32_t>(cp.netId);
                 obj.pos = cp.pos;
@@ -859,6 +1168,51 @@ void BotBrain::updateNavigation(uint64_t nowUs, const BotWorldView& world,
     // Refresh TeamTactics claim heartbeat if holding an active objective.
     if (m_teamTactics && m_hasActiveObjective) {
         m_teamTactics->claimObjective(m_team, m_botIndex, m_activeObjectiveKey, nowUs);
+    }
+
+    // Monitor staged frontline transitions (e.g. Hotel captured -> shift immediately to Square)
+    // and let defenders hold their tactical perimeter angle around the active flag.
+    if (!m_aim.hasGoal && !m_aim.keepRunning && !m_aim.frontline.empty()) {
+        ActiveFrontlineStage flStage;
+        if (resolveActiveFrontlineStage(world.controlPoints, world.spawnGroups, flStage)) {
+            if (m_hasActiveObjective && m_activeObjectiveKey != flStage.objKey) {
+                // Frontline shifted (e.g. Hotel fell -> fall back / push to Square immediately!).
+                m_hasActiveObjective = false;
+                m_hasDefendPost = false;
+                m_defendHoldUntilUs = 0;
+                m_objectiveHoldStartUs = 0;
+                m_waypoints.clear();
+                m_waypointIdx = 0;
+                m_nextPathComputeUs = nowUs;
+                m_hasPatrolGoal = false;
+            } else if (m_hasActiveObjective && m_activeObjectiveFriendly) {
+                if (flStage.isNeutral || flStage.ownerTeam != m_team || flStage.underCapture) {
+                    // Defended flag is being neutralized/captured -> break hold & sprint to flagpole!
+                    m_activeObjectiveFriendly = false;
+                    m_hasDefendPost = false;
+                    m_defendHoldUntilUs = 0;
+                    m_waypoints.clear();
+                    m_waypointIdx = 0;
+                    m_nextPathComputeUs = nowUs;
+                } else if (!inCombat && m_hasDefendPost) {
+                    if (distXZ(world.ownPos, m_defendPostPos) < 3.5f) {
+                        if (m_defendHoldUntilUs == 0) {
+                            m_defendHoldUntilUs = nowUs + static_cast<uint64_t>(randInt(5000, 9000)) * 1000ULL;
+                        }
+                        if (nowUs < m_defendHoldUntilUs) {
+                            // Hold defensive cover position & scan approach lanes (handled in tickOutOfCombat).
+                            return;
+                        }
+                        // Shift to a fresh cover angle around the defended flag.
+                        m_defendHoldUntilUs = 0;
+                        m_hasDefendPost = false;
+                        m_waypoints.clear();
+                        m_waypointIdx = 0;
+                        m_nextPathComputeUs = nowUs;
+                    }
+                }
+            }
+        }
     }
 
     // Check if we are actively capturing an enemy/neutral flag: stay inside capture radius!
@@ -1217,7 +1571,6 @@ bool BotBrain::selectTarget(uint64_t nowUs, const BotWorldView& world,
 
     const uint64_t interpUs = static_cast<uint64_t>(m_aim.interpMs > 0 ? m_aim.interpMs : 0) * 1000ULL;
     const uint64_t renderUs = nowUs > interpUs ? nowUs - interpUs : 0ULL;
-    const Vec3 ownEye(world.ownPos.x, world.ownPos.y + 1.55f, world.ownPos.z);
     const float aimYaw = currentAimYaw(world);
     const bool underFire = (nowUs < m_underFireUntilUs);
 
@@ -1279,7 +1632,13 @@ bool BotBrain::selectTarget(uint64_t nowUs, const BotWorldView& world,
             continue;
         }
 
-        if (!terrainLineOfSight(m_navMesh, ownEye, Vec3(r.x, r.y + 1.4f, r.z))) {
+        // Hard wall & terrain line-of-sight gate: bots NEVER lock on or shoot through walls,
+        // buildings, compound fences, or terrain hills. Also check the enemy's latest live
+        // position so bots stop firing immediately when an enemy steps behind a wall corner.
+        if (!hasClearLineOfSight(world, r, s.pose)) {
+            continue;
+        }
+        if (dist3D(r, s.pos) > 0.30f && !hasClearLineOfSight(world, s.pos, s.pose)) {
             continue;
         }
 
@@ -1310,13 +1669,6 @@ bool BotBrain::selectTarget(uint64_t nowUs, const BotWorldView& world,
 
         if (isCurrent) {
             score += 5.5f; // hysteresis against target ping-pong
-        }
-
-        // Mild preference for unobstructed navmesh lanes over shooting past wide building voids.
-        if (m_navMesh && m_navMesh->isLoaded() && d > 22.0f &&
-            !m_navMesh->hasNavLineOfSight(world.ownPos.x, world.ownPos.y, world.ownPos.z,
-                                          r.x, r.y, r.z, 7.0f)) {
-            score -= 4.5f;
         }
 
         if (score > bestScore) {
@@ -1502,7 +1854,7 @@ bool BotBrain::tryStartUtilityAction(uint64_t nowUs, const BotWorldView& world,
             }
         }
 
-        if (shouldThrow) {
+        if (shouldThrow && hasClearLineOfSight(world, nadeTarget, 0u)) {
             m_nextGrenadeUs = nowUs + static_cast<uint64_t>(randInt(24000, 38000)) * 1000ULL;
             startUtility(UTIL_GRENADE, nowUs, nadeTarget, 0u);
             return true;
@@ -2013,13 +2365,23 @@ void BotBrain::tickOutOfCombat(uint64_t nowUs, float dtSec, const BotWorldView& 
         }
     }
 
-    // If holding a flag capture point with no move target, crouch and scan perimeter toward threats!
+    // If holding a flag capture point or defensive perimeter post, crouch and scan toward threats!
     if (!hasMoveTarget) {
         act.buttonMaskLow |= BTN_CROUCH;
         if (hasWatchPoint) {
             const Vec3 lookPt(watchPoint.x, world.ownPos.y + 1.3f, watchPoint.z);
             steerToward(world.ownPos, aimYaw, aimPitch, lookPt, mouseScale, dtSec,
                         act.axes[4], act.axes[5]);
+        } else if (m_hasDefendWatchPoint && m_hasActiveObjective && m_activeObjectiveFriendly) {
+            // Scan left-right across the expected attacker approach lane (e.g. Gas Station -> Hotel).
+            if (nowUs >= m_nextScanFlipUs) {
+                m_scanOffsetDeg = randFloat(-32.0f, 32.0f);
+                m_nextScanFlipUs = nowUs + static_cast<uint64_t>(randInt(1400, 2600)) * 1000ULL;
+            }
+            const float approachYaw = std::atan2(m_defendWatchPoint.x - world.ownPos.x,
+                                                 m_defendWatchPoint.z - world.ownPos.z) * kRadToDeg;
+            steerAngles(aimYaw, aimPitch, wrapAngleDeg(approachYaw + m_scanOffsetDeg), 0.0f,
+                        180.0f, mouseScale, dtSec, act.axes[4], act.axes[5]);
         } else {
             if (nowUs >= m_nextScanFlipUs) {
                 m_scanOffsetDeg = randFloat(-75.0f, 75.0f);
@@ -2166,14 +2528,18 @@ void BotBrain::tick(uint64_t nowUs, float dtSec, const BotWorldView& world, BotT
                 continue;
             }
             const float d = dist3D(world.ownPos, s.pos);
+            if (d >= kCombatRangeMeters) {
+                continue;
+            }
+            if (!hasClearLineOfSight(world, s.pos, s.pose)) {
+                continue;
+            }
+            ++visibleEnemies;
             if (d < bestDist) {
                 bestDist = d;
                 bestTarget = &s;
                 targetRendered = s.pos;
                 targetDist = d;
-            }
-            if (d < kCombatRangeMeters) {
-                ++visibleEnemies;
             }
         }
     }

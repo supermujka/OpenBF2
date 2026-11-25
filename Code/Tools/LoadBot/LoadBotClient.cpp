@@ -756,6 +756,28 @@ void LoadBotClient::onServerInfo(const ServerInfoData& data) {
 }
 
 void LoadBotClient::onMapInfo(const MapInfoData& data) {
+    // Auto-configure map-specific staged frontline orders unless disabled or explicitly overridden.
+    if (m_brain.aimConfig().autoMapFrontline && m_brain.aimConfig().frontline.empty()) {
+        std::string lowerMap = data.mapName;
+        for (size_t i = 0; i < lowerMap.size(); ++i) {
+            lowerMap[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(lowerMap[i])));
+        }
+        if (lowerMap.find("karkand") != std::string::npos) {
+            std::vector<FrontlineStage> stages;
+            // Strike at Karkand Assault order: Stage 1 = Hotel, Stage 2 = Square (16/32/64p).
+            stages.push_back(FrontlineStage(-194.4f, 158.2f, 11.4f, 45.0f));
+            stages.push_back(FrontlineStage(-202.4f, 155.7f, 97.7f, 45.0f));
+            m_brain.setFrontlinePlan(m_brain.aimConfig().attackTeam, stages);
+            if (m_config.verbose && m_config.botIndex == 0u) {
+                std::fprintf(stderr,
+                             "[%s] Auto frontline plan (%s): T%d attacks Hotel -> Square, T%d defends Hotel -> Square\n",
+                             m_playerName.c_str(), data.mapName.c_str(),
+                             m_brain.aimConfig().attackTeam,
+                             (m_brain.aimConfig().attackTeam == 2) ? 1 : 2);
+            }
+        }
+    }
+
     m_codec.events().queueMapLoaded();
     if (m_useContentChecking) {
         uint8_t zeroHash[16];

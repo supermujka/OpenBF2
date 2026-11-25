@@ -70,6 +70,15 @@ public:
                            float bx, float by, float bz,
                            float maxGapMeters = 4.5f) const;
 
+    // Exact polygon-corridor wall & terrain line-of-sight raycast: walks shared walkable
+    // polygon edges from A to B and returns false immediately if the ray hits a navmesh
+    // wall/building boundary (INVALID_POLYGON) or rises into a terrain crest above the
+    // eye-to-target sightline. Fails open when no navmesh is loaded.
+    bool raycastLineOfSight(float ax, float ay, float az,
+                            float bx, float by, float bz,
+                            float eyeHeightA = 1.50f,
+                            float targetHeightB = 1.35f) const;
+
     // Finds a nearby walkable cover/evasion step perpendicular or away from a threat,
     // preferring positions shielded by navmesh voids/walls or terrain bumps.
     bool findCoverStep(float ownX, float ownY, float ownZ,

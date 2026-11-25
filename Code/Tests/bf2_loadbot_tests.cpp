@@ -2795,6 +2795,82 @@ void testSmartTacticalBots()
         checkCond(!nav.hasNavLineOfSight(5.0f, 0.0f, 15.0f, 25.0f, 0.0f, 15.0f, 4.5f) &&
                   nav.hasNavLineOfSight(5.0f, 0.0f, 5.0f, 25.0f, 0.0f, 5.0f, 4.5f),
                   "smart nav: hasNavLineOfSight detects building occlusion vs clear street");
+        checkCond(nav.raycastLineOfSight(5.0f, 0.0f, 5.0f, 25.0f, 0.0f, 5.0f) &&
+                  nav.raycastLineOfSight(5.0f, 0.0f, 5.0f, 5.0f, 0.0f, 25.0f) &&
+                  !nav.raycastLineOfSight(5.0f, 0.0f, 15.0f, 25.0f, 0.0f, 15.0f) &&
+                  !nav.raycastLineOfSight(5.0f, 0.0f, 5.0f, 25.0f, 0.0f, 25.0f) &&
+                  !nav.raycastLineOfSight(9.5f, 0.0f, 15.0f, 20.5f, 0.0f, 15.0f) &&
+                  !nav.raycastLineOfSight(5.0f, 0.0f, 15.0f, 15.0f, 0.0f, 15.0f),
+                  "smart nav: raycastLineOfSight blocks orthogonal, diagonal, far-wall, and interior building shots");
+
+        // BotBrain must NEVER shoot through the center building wall (even under fire / enemy firing)
+        // in either human mode or legacy mode, yet fires cleanly once enemy enters the open street.
+        for (int legacyMode = 0; legacyMode < 2; ++legacyMode)
+        {
+            AimConfig wcfg;
+            wcfg.legacy = (legacyMode != 0);
+            wcfg.skill = 0.9f;
+            BotBrain wallBot(0u, 910u + static_cast<uint32_t>(legacyMode), &nav, nullptr, wcfg);
+            std::map<uint16_t, TrackedSoldier> wallSoldiers;
+            TrackedSoldier& en = wallSoldiers[55];
+            en.netId = 55; en.team = 2; en.hasPos = true; en.isFiring = true;
+            en.pos = Vec3(25.0f, 0.0f, 15.0f); // directly behind building [10..20]x[10..20]
+
+            BotWorldView ww;
+            ww.ownTeam = 1; ww.ownAlive = true; ww.hasOwnPos = true; ww.ownSoldierNetId = 1;
+            ww.ownPos = Vec3(5.0f, 0.0f, 15.0f);
+            ww.ownFacingDegrees = 90.0f; // staring straight at the building toward enemy
+            ww.ownHitPointsByte = 255u;
+            ww.soldiers = &wallSoldiers;
+            const uint64_t wt0 = 5000000ULL;
+            wallBot.onSpawned(ww.ownPos, wt0);
+
+            bool firedThroughWall = false;
+            for (int tick = 0; tick < 90; ++tick)
+            {
+                const uint64_t now = wt0 + static_cast<uint64_t>(tick) * 33333ULL;
+                if (tick == 10) ww.ownHitPointsByte = 170u; // simulate taking damage
+                en.lastFiredUs = now;
+                en.pushPos(now, en.pos);
+                BotTickOutput out;
+                wallBot.tick(now, 1.0f / 30.0f, ww, out);
+                if ((out.action.buttonMaskLow & BTN_FIRE) != 0u)
+                {
+                    firedThroughWall = true;
+                }
+            }
+            checkCond(!firedThroughWall,
+                      legacyMode == 0
+                          ? "wall LOS: human BotBrain never fires through building wall"
+                          : "wall LOS: legacy BotBrain never fires through building wall");
+
+            // Now place both on the clear south street (z=5): bot acquires and fires!
+            ww.ownPos = Vec3(5.0f, 0.0f, 5.0f);
+            ww.ownFacingDegrees = 90.0f;
+            ww.ownPitchDegrees = 0.0f;
+            en.pos = Vec3(25.0f, 0.0f, 5.0f);
+            en.histCount = 0;
+            bool firedInOpenStreet = false;
+            for (int tick = 0; tick < 90; ++tick)
+            {
+                const uint64_t now = wt0 + static_cast<uint64_t>(90 + tick) * 33333ULL;
+                en.pushPos(now, en.pos);
+                BotTickOutput out;
+                wallBot.tick(now, 1.0f / 30.0f, ww, out);
+                ww.ownFacingDegrees += out.action.axes[4] * 5.0f;
+                ww.ownPitchDegrees += out.action.axes[5] * 5.0f;
+                if ((out.action.buttonMaskLow & BTN_FIRE) != 0u)
+                {
+                    firedInOpenStreet = true;
+                    break;
+                }
+            }
+            checkCond(firedInOpenStreet,
+                      legacyMode == 0
+                          ? "wall LOS: human BotBrain fires cleanly down unobstructed street"
+                          : "wall LOS: legacy BotBrain fires cleanly down unobstructed street");
+        }
+
         NavPoint cov;
         const bool gotCov = nav.findCoverStep(7.0f, 0.0f, 15.0f, 25.0f, 15.0f, 5.0f, cov);
         checkCond(gotCov && nav.isPointWalkable(cov.x, cov.y, cov.z),
@@ -2926,6 +3002,92 @@ void testSmartTacticalBots()
             }
         }
         checkCond(didTacticalReload, "combat AI: performs proactive tactical reload out of combat");
+    }
+
+    // 9. Staged frontline attack/defense orders (Strike at Karkand: Hotel -> Square).
+    // USMC (team 2) attacks Hotel while MEC (team 1) defends Hotel; once Hotel falls to USMC,
+    // USMC spawns at Hotel and attacks Square while MEC spawns at / defends Square.
+    {
+        AimConfig flCfg;
+        flCfg.attackTeam = 2; // USMC attacks, MEC defends
+        flCfg.frontline.push_back(FrontlineStage(-194.4f, 158.2f, 11.4f, 45.0f));  // Hotel
+        flCfg.frontline.push_back(FrontlineStage(-202.4f, 155.7f, 97.7f, 45.0f));  // Square
+
+        std::map<uint8_t, TrackedSpawnGroup> sgs;
+        // SG 1: USMC Main (Gas Station)
+        sgs[1].spawnGroupId = 1; sgs[1].team = 2; sgs[1].active = true; sgs[1].hasSpawnPoints = true;
+        sgs[1].hasPos = true; sgs[1].pos = Vec3(-161.0f, 0.0f, -262.8f);
+        // SG 2: Hotel (MEC initially)
+        sgs[2].spawnGroupId = 2; sgs[2].team = 1; sgs[2].active = true; sgs[2].hasSpawnPoints = true;
+        sgs[2].hasPos = true; sgs[2].pos = Vec3(-194.4f, 0.0f, 11.4f);
+        // SG 3: Square (MEC initially)
+        sgs[3].spawnGroupId = 3; sgs[3].team = 1; sgs[3].active = true; sgs[3].hasSpawnPoints = true;
+        sgs[3].hasPos = true; sgs[3].pos = Vec3(-220.0f, 0.0f, 98.1f);
+        // SG 4: Market (MEC initially)
+        sgs[4].spawnGroupId = 4; sgs[4].team = 1; sgs[4].active = true; sgs[4].hasSpawnPoints = true;
+        sgs[4].hasPos = true; sgs[4].pos = Vec3(-196.0f, 0.0f, 183.6f);
+
+        TeamTactics flTactics;
+        BotBrain mecBot(0u, 1001u, nullptr, nullptr, flCfg, &flTactics);
+        mecBot.setTeam(1);
+        BotBrain usmcBot(1u, 1002u, nullptr, nullptr, flCfg, &flTactics);
+        usmcBot.setTeam(2);
+
+        const uint64_t t0 = 5000000ULL;
+
+        // Phase 1: Hotel is MEC -> MEC spawns at Hotel & defends Hotel; USMC spawns at Gas Station & attacks Hotel.
+        checkCond(mecBot.pickSpawnGroup(sgs, nullptr, nullptr) == 2,
+                  "frontline Karkand: Phase 1 MEC spawns at Hotel to defend");
+        checkCond(usmcBot.pickSpawnGroup(sgs, nullptr, nullptr) == 1,
+                  "frontline Karkand: Phase 1 USMC spawns at Gas Station");
+
+        BotWorldView mw;
+        mw.ownTeam = 1; mw.ownAlive = true; mw.hasOwnPos = true;
+        mw.ownPos = Vec3(-194.4f, 158.2f, 11.4f); // at Hotel
+        mw.spawnGroups = &sgs;
+        mecBot.onSpawned(mw.ownPos, t0);
+        BotTickOutput mOut;
+        mecBot.tick(t0, 1.0f / 30.0f, mw, mOut);
+        checkCond(flTactics.countClaimants(1, 0x20000u | 2u, 999u, t0) == 1u,
+                  "frontline Karkand: Phase 1 MEC claims Hotel defense (does not rush USMC main)");
+
+        BotWorldView uw;
+        uw.ownTeam = 2; uw.ownAlive = true; uw.hasOwnPos = true;
+        uw.ownPos = Vec3(-161.0f, 161.3f, -262.8f); // at Gas Station
+        uw.spawnGroups = &sgs;
+        usmcBot.onSpawned(uw.ownPos, t0);
+        BotTickOutput uOut;
+        usmcBot.tick(t0, 1.0f / 30.0f, uw, uOut);
+        checkCond(flTactics.countClaimants(2, 0x20000u | 2u, 999u, t0) == 1u,
+                  "frontline Karkand: Phase 1 USMC attacks Hotel (not Square/Market)");
+
+        // Phase 1b: Hotel neutralized (team=0, active=false) -> MEC spawns at Square (closest backup) to recap Hotel.
+        sgs[2].team = 0; sgs[2].active = false;
+        checkCond(mecBot.pickSpawnGroup(sgs, nullptr, nullptr) == 3,
+                  "frontline Karkand: Hotel neutral -> MEC spawns at Square to reinforce Hotel");
+
+        // Phase 2: Hotel captured by USMC (team=2, active=true) -> USMC spawns at Hotel & attacks Square;
+        // MEC immediately shifts from Hotel to defend Square!
+        sgs[2].team = 2; sgs[2].active = true;
+        checkCond(usmcBot.pickSpawnGroup(sgs, nullptr, nullptr) == 2,
+                  "frontline Karkand: Phase 2 USMC spawns forward at captured Hotel");
+        checkCond(mecBot.pickSpawnGroup(sgs, nullptr, nullptr) == 3,
+                  "frontline Karkand: Phase 2 MEC spawns at Square to defend");
+
+        const uint64_t t2 = t0 + 1000000ULL;
+        usmcBot.tick(t2, 1.0f / 30.0f, uw, uOut);
+        mecBot.tick(t2, 1.0f / 30.0f, mw, mOut);
+        checkCond(flTactics.countClaimants(2, 0x20000u | 3u, 999u, t2) == 1u,
+                  "frontline Karkand: Phase 2 USMC immediately shifts attack to Square");
+        checkCond(flTactics.countClaimants(1, 0x20000u | 3u, 999u, t2) == 1u,
+                  "frontline Karkand: Phase 2 MEC immediately falls back to defend Square");
+
+        // Phase 3: Square also captured by USMC -> seamlessly transitions to remaining Conquest flags (Market).
+        sgs[3].team = 2; sgs[3].active = true;
+        const uint64_t t3 = t2 + 1000000ULL;
+        usmcBot.tick(t3, 1.0f / 30.0f, uw, uOut);
+        checkCond(flTactics.countClaimants(2, 0x20000u | 4u, 999u, t3) == 1u,
+                  "frontline Karkand: Phase 3 after Square falls, USMC advances dynamically to Market");
     }
 }
 

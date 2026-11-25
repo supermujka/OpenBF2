@@ -1013,6 +1013,181 @@ bool NavMesh::hasNavLineOfSight(float ax, float ay, float az,
     return true;
 }
 
+bool NavMesh::raycastLineOfSight(float ax, float ay, float az,
+                                 float bx, float by, float bz,
+                                 float eyeHeightA, float targetHeightB) const {
+    if (!m_loaded) {
+        return true;
+    }
+
+    const float dx = bx - ax;
+    const float dz = bz - az;
+    const float distXZ = std::sqrt(dx * dx + dz * dz);
+    if (distXZ < 1.2f) {
+        // Point-blank: only reject if separated vertically by a solid floor/ceiling.
+        return std::fabs(by - ay) < 2.8f;
+    }
+
+    const float eyeAY = ay + eyeHeightA;
+    const float tgtBY = by + targetHeightB;
+
+    // Locate starting and target walkable polygons (tight 0.65m curb-erosion snap only so
+    // an enemy inside an un-navmeshed room behind a wall cannot snap onto the outer street).
+    uint32_t startPoly = findPolygonExact(ax, ay, az);
+    if (startPoly == INVALID_POLYGON) {
+        startPoly = findNearestPolygon(ax, ay, az, 0.65f);
+    }
+    const uint32_t exactEndPoly = findPolygonExact(bx, by, bz);
+    const bool endExact = (exactEndPoly != INVALID_POLYGON);
+    uint32_t endPoly = exactEndPoly;
+    if (endPoly == INVALID_POLYGON) {
+        endPoly = findNearestPolygon(bx, by, bz, 0.65f);
+    }
+
+    // Fallback when either soldier is off-mesh (e.g. rooftop/crate or inside un-navmeshed room):
+    // dense 0.60m probe blocks if any interior sample (>1.2m from endpoints) crosses an off-mesh
+    // building/wall footprint below roof height or a terrain crest rises above the sightline.
+    if (startPoly == INVALID_POLYGON || endPoly == INVALID_POLYGON) {
+        const float stepSize = 0.60f;
+        const int steps = static_cast<int>(distXZ / stepSize);
+        if (steps <= 1) {
+            return std::fabs(by - ay) < 2.8f;
+        }
+        for (int i = 1; i < steps; ++i) {
+            const float t = static_cast<float>(i) / static_cast<float>(steps);
+            const float sx = ax + dx * t;
+            const float sz = az + dz * t;
+            const float chordGroundY = ay + (by - ay) * t;
+            const float rayY = eyeAY + (tgtBY - eyeAY) * t;
+            const float distFromA = t * distXZ;
+            const float distFromB = (1.0f - t) * distXZ;
+
+            const uint32_t p = findPolygonExact(sx, chordGroundY, sz);
+            if (p == INVALID_POLYGON) {
+                // Allow the first/last 1.2m (roof ledge / crate edge) for off-mesh endpoints,
+                // but block any wall/building footprint in the middle below aerial roof height.
+                if (distFromA > 1.2f && distFromB > 1.2f) {
+                    const float ahmY = sampleAerialHeight(sx, sz, rayY + 10.0f);
+                    if (rayY < ahmY + 1.5f) {
+                        return false;
+                    }
+                }
+            } else {
+                const float polyY = getPolygonHeight(p, sx, sz);
+                if (polyY > rayY + 0.15f) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    if (startPoly == endPoly && endExact) {
+        return std::fabs(getPolygonHeight(startPoly, bx, bz) - by) < 2.8f;
+    }
+
+    // Exact polygon-by-polygon 2D corridor traversal along segment A -> B.
+    uint32_t curPoly = startPoly;
+    uint32_t prevPoly = INVALID_POLYGON;
+    float curT = 0.0f;
+
+    for (int step = 0; step < 192; ++step) {
+        if (endExact && curPoly == endPoly) {
+            return std::fabs(getPolygonHeight(curPoly, bx, bz) - by) < 2.8f;
+        }
+        if (curPoly >= m_polygons.size()) {
+            return false;
+        }
+
+        const NavPolygon& poly = m_polygons[curPoly];
+        int bestEdge = -1;
+        float bestTRay = -1.0f;
+        float bestTEdge = 0.5f;
+
+        for (uint8_t e = 0u; e < poly.numVertices; ++e) {
+            const uint8_t eNext = static_cast<uint8_t>((e + 1u) % poly.numVertices);
+            const NavPoint& v0 = m_vertices[m_vertexIndices[poly.firstIndex + e]];
+            const NavPoint& v1 = m_vertices[m_vertexIndices[poly.firstIndex + eNext]];
+
+            const float ex = v1.x - v0.x;
+            const float ez = v1.z - v0.z;
+
+            // Inward normal in BF2 winding is (+ez, -ex); ray exits when dot(dir, N_in) < 0.
+            const float dotIn = dx * ez - dz * ex;
+            if (dotIn >= -1e-6f) {
+                continue;
+            }
+
+            // Solve A + tRay * (dx, dz) = v0 + tEdge * (ex, ez).
+            // det = dx * ez - dz * ex = dotIn (< 0).
+            const float rx = v0.x - ax;
+            const float rz = v0.z - az;
+            const float tRay = (rx * ez - rz * ex) / dotIn;
+            const float tEdge = (rx * dz - rz * dx) / dotIn;
+
+            if (tEdge < -0.01f || tEdge > 1.01f) {
+                continue;
+            }
+            if (tRay < curT - 0.002f) {
+                continue;
+            }
+
+            // Prefer the furthest valid exit edge (handles vertex-grazing cleanly).
+            if (bestEdge < 0 || tRay > bestTRay) {
+                bestEdge = static_cast<int>(e);
+                bestTRay = tRay;
+                bestTEdge = tEdge;
+            }
+        }
+
+        if (bestEdge < 0) {
+            return false;
+        }
+
+        // Segment A -> B terminates inside curPoly before crossing its exit edge.
+        if (bestTRay >= 1.0f - 1e-4f) {
+            return std::fabs(getPolygonHeight(curPoly, bx, bz) - by) < 2.8f;
+        }
+
+        const float clampedTRay = (bestTRay < 0.0f) ? 0.0f : bestTRay;
+        const float clampedTEdge = (bestTEdge < 0.0f) ? 0.0f : ((bestTEdge > 1.0f) ? 1.0f : bestTEdge);
+
+        // Terrain crest occlusion check at the crossed polygon edge.
+        const uint8_t e0 = static_cast<uint8_t>(bestEdge);
+        const uint8_t e1 = static_cast<uint8_t>((e0 + 1u) % poly.numVertices);
+        const NavPoint& v0 = m_vertices[m_vertexIndices[poly.firstIndex + e0]];
+        const NavPoint& v1 = m_vertices[m_vertexIndices[poly.firstIndex + e1]];
+        const float edgeY = v0.y + (v1.y - v0.y) * clampedTEdge;
+        const float rayY = eyeAY + (tgtBY - eyeAY) * clampedTRay;
+        if (edgeY > rayY + 0.15f) {
+            return false; // Hill / ramp crest rises above eye-to-target sightline.
+        }
+
+        const uint32_t nextPoly = m_neighbours[poly.firstIndex + e0];
+        if (nextPoly == INVALID_POLYGON || nextPoly >= m_polygons.size() ||
+            m_polygons[nextPoly].cost < 0.0f) {
+            // Hit a solid navmesh wall / building / obstacle boundary edge!
+            // If target stands on a walkable polygon on the far side of this wall, NEVER allow.
+            // Only allow if target is off-mesh hugging the near curb face (<= 0.45m erosion margin).
+            if (endExact) {
+                return false;
+            }
+            const float remainingDist = (1.0f - clampedTRay) * distXZ;
+            return remainingDist <= 0.45f && std::fabs(edgeY - by) < 2.0f;
+        }
+
+        if (nextPoly == prevPoly) {
+            return false;
+        }
+
+        prevPoly = curPoly;
+        curPoly = nextPoly;
+        curT = clampedTRay;
+    }
+
+    return false;
+}
+
 bool NavMesh::findCoverStep(float ownX, float ownY, float ownZ,
                             float threatX, float threatZ,
                             float searchRadius,
@@ -1062,13 +1237,13 @@ bool NavMesh::findCoverStep(float ownX, float ownY, float ownZ,
             }
             const float cy = getPolygonHeight(poly, cx, cz);
             // Make sure we can walk straight there without a wall between us and the cover spot.
-            if (!hasNavLineOfSight(ownX, ownY, ownZ, cx, cy, cz, 2.5f)) {
+            if (!raycastLineOfSight(ownX, ownY, ownZ, cx, cy, cz)) {
                 continue;
             }
 
             float score = 0.0f;
             // Big bonus if a building/wall blocks direct line from threat to candidate!
-            if (!hasNavLineOfSight(cx, cy, cz, threatX, ownY, threatZ, 3.0f)) {
+            if (!raycastLineOfSight(cx, cy, cz, threatX, ownY, threatZ)) {
                 score += 12.0f;
             }
             // Bonus if candidate sits near a wall/boundary on the threat-facing side (hugging cover).

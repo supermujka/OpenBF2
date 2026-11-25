@@ -143,6 +143,9 @@ void printUsage(const char* prog) {
         "  --goal <x,y,z>           Every bot moves on this world position instead of choosing flags\n"
         "  --spawn-near <x,y,z>     Spawn at the friendly spawn group closest to this position\n"
         "  --keep-running           Never stand still; alternate sprint and slow walk every 2-4 s\n"
+        "  --frontline <spec>       Ordered flag stages: 'karkand' (Hotel->Square) or 'x1,z1;x2,z2;...'\n"
+        "  --attack-team <1|2>      Team attacking frontline stages (default: 2 = USMC; other team defends)\n"
+        "  --no-frontline           Disable automatic map frontline plan (e.g. Karkand Hotel->Square)\n"
         "  --no-team-tactics        Disable shared team objective balancing and spotted enemy callouts\n"
         "  --report-sec <int>      Periodic telemetry report interval in seconds (default: 10)\n"
         "  --verbose                Enable verbose per-bot handshake/disconnect logging\n"
@@ -185,6 +188,48 @@ bool parseArgs(int argc, char** argv, RunnerOptions& opt, bool& showHelp) {
         }
         if (arg == "--no-team-tactics") {
             opt.teamTactics = false;
+            continue;
+        }
+        if (arg == "--no-frontline") {
+            opt.aim.autoMapFrontline = false;
+            opt.aim.frontline.clear();
+            continue;
+        }
+        if (arg == "--attack-team" && i + 1 < argc) {
+            const int32_t atk = static_cast<int32_t>(std::strtol(argv[++i], nullptr, 10));
+            if (atk != 1 && atk != 2) {
+                std::fprintf(stderr, "Invalid --attack-team (expected 1 or 2)\n");
+                return false;
+            }
+            opt.aim.attackTeam = atk;
+            continue;
+        }
+        if (arg == "--frontline" && i + 1 < argc) {
+            const std::string spec = argv[++i];
+            opt.aim.frontline.clear();
+            if (spec == "karkand" || spec == "Karkand" || spec == "KARKAND") {
+                opt.aim.frontline.push_back(bf2bot::FrontlineStage(-194.4f, 158.2f, 11.4f, 45.0f));
+                opt.aim.frontline.push_back(bf2bot::FrontlineStage(-202.4f, 155.7f, 97.7f, 45.0f));
+            } else {
+                size_t pos = 0u;
+                while (pos < spec.size()) {
+                    size_t semi = spec.find(';', pos);
+                    if (semi == std::string::npos) semi = spec.size();
+                    const std::string tok = spec.substr(pos, semi - pos);
+                    float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+                    if (std::sscanf(tok.c_str(), "%f,%f,%f", &fx, &fy, &fz) == 3) {
+                        opt.aim.frontline.push_back(bf2bot::FrontlineStage(fx, fy, fz, 45.0f));
+                    } else if (std::sscanf(tok.c_str(), "%f,%f", &fx, &fz) == 2) {
+                        opt.aim.frontline.push_back(bf2bot::FrontlineStage(fx, 0.0f, fz, 45.0f));
+                    } else {
+                        std::fprintf(stderr, "Invalid --frontline token '%s' (expected 'karkand' or 'x,z;x,z')\n",
+                                     tok.c_str());
+                        return false;
+                    }
+                    pos = (semi < spec.size()) ? (semi + 1u) : spec.size();
+                }
+            }
+            opt.aim.autoMapFrontline = false;
             continue;
         }
         if (arg == "--spawn-near" && i + 1 < argc) {
@@ -405,13 +450,22 @@ int main(int argc, char** argv) {
         }
     }
 
+    const char* losDesc = "off(no navmesh)";
+    if (navMesh.isLoaded() && navMesh.hasAerialHeightMap()) {
+        losDesc = "navmesh-wall-raycast+AHM";
+    } else if (navMesh.isLoaded()) {
+        losDesc = "navmesh-wall-raycast";
+    } else if (navMesh.hasAerialHeightMap()) {
+        losDesc = "aerial-heightmap-bilinear";
+    }
     if (opt.aim.legacy) {
-        std::printf("[LoadBot] Aim: legacy (nearest target, newest position)\n");
+        std::printf("[LoadBot] Aim: legacy (nearest target, newest position, LOS=%s)\n", losDesc);
     } else {
-        std::printf("[LoadBot] Aim: tactical human model skill=%.2f interp=%dms (LOS=%s, teamTactics=%s)\n",
+        std::printf("[LoadBot] Aim: tactical human model skill=%.2f interp=%dms (LOS=%s, teamTactics=%s, frontline=%s)\n",
                     static_cast<double>(opt.aim.skill), static_cast<int>(opt.aim.interpMs),
-                    navMesh.hasAerialHeightMap() ? "aerial-heightmap-bilinear" : "off(no AHM)",
-                    opt.teamTactics ? "on" : "off");
+                    losDesc,
+                    opt.teamTactics ? "on" : "off",
+                    !opt.aim.frontline.empty() ? "explicit" : (opt.aim.autoMapFrontline ? "auto" : "off"));
     }
 
     bf2bot::Telemetry telemetry;
