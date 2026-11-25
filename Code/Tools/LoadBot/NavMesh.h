@@ -92,6 +92,24 @@ public:
                            float sideSign, float offsetDist,
                            NavPoint& outFlank) const;
 
+    // BF2 Coop CoverPositionManager::RandomizeCoverPosAlongEdge equivalent:
+    // Picks a walkable point inside [minRadius, maxRadius] of (centerX, centerZ) that hugs a
+    // NavMesh wall/building edge (and shields against threatX/threatZ when possible).
+    bool findWallHuggingPoint(float centerX, float centerY, float centerZ,
+                              float minRadius, float maxRadius,
+                              float threatX, float threatZ,
+                              uint32_t seed,
+                              NavPoint& outPt) const;
+
+    // BF2 Coop CoverPositionManager::getClosestAttackCoverPosition equivalent:
+    // Finds a walkable staging cover position [minDistToFlag, maxDistToFlag] outside an enemy
+    // flag along the bot's approach side, preferring building corners / wall edges.
+    bool findAttackStagingCover(float ownX, float ownY, float ownZ,
+                                float flagX, float flagY, float flagZ,
+                                float minDistToFlag, float maxDistToFlag,
+                                uint32_t seed,
+                                NavPoint& outCover) const;
+
     bool isWalkablePolygon(uint32_t polyIdx) const;
     float getPolygonCost(uint32_t polyIdx) const;
     NavPoint getPolygonCentroid(uint32_t polyIdx) const;

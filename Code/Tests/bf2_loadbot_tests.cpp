@@ -3089,6 +3089,116 @@ void testSmartTacticalBots()
         checkCond(flTactics.countClaimants(2, 0x20000u | 4u, 999u, t3) == 1u,
                   "frontline Karkand: Phase 3 after Square falls, USMC advances dynamically to Market");
     }
+
+    // 10. BF2 Coop tactics: StrategicAreas.ai multi-lane flanks + death-heat reroute,
+    // SquadCoordinator rally-wait / isSquadTakingFlag / bounding overwatch,
+    // friendly line-of-fire trigger hold, and Coop prone-under-fire!
+    {
+        TeamTactics coop;
+        const uint64_t tNow = 10000000ULL;
+        const Vec3 gasPos(-161.0f, 161.3f, -262.8f);
+        const Vec3 hotelPos(-194.4f, 158.2f, 11.4f);
+        const Vec3 sqPos(-220.0f, 155.8f, 98.1f);
+
+        std::vector<Vec3> lane0, lane1, lane2, laneSq;
+        const bool ok0 = coop.selectKarkandCoopWaypoints(2, 0u, gasPos, hotelPos, tNow, lane0);
+        const bool ok1 = coop.selectKarkandCoopWaypoints(2, 1u, gasPos, hotelPos, tNow, lane1);
+        const bool ok2 = coop.selectKarkandCoopWaypoints(2, 2u, gasPos, hotelPos, tNow, lane2);
+        const bool okSq = coop.selectKarkandCoopWaypoints(2, 0u, hotelPos, sqPos, tNow, laneSq);
+        checkCond(ok0 && ok1 && ok2 && !lane0.empty() && !lane1.empty() && !lane2.empty() &&
+                  std::fabs(lane0[0].x - lane2[0].x) > 50.0f && okSq && !laneSq.empty(),
+                  "coop AI: DICE StrategicAreas.ai distributes squads across left/center/right Karkand lanes");
+
+        // Report heavy casualties on Squad 0's default left flank -> Squad 0 diverts to safer lane!
+        coop.reportFriendlyDeath(2, lane0[0], tNow);
+        coop.reportFriendlyDeath(2, lane0[1], tNow);
+        std::vector<Vec3> rerouted;
+        coop.selectKarkandCoopWaypoints(2, 0u, gasPos, hotelPos, tNow, rerouted);
+        checkCond(!rerouted.empty() && std::fabs(rerouted[0].x - lane0[0].x) > 10.0f,
+                  "coop AI: squad automatically reroutes away from high-casualty assault lane");
+
+        // SquadCoordinator cohesion: pointman rally-wait, isSquadTakingFlag breach, and bounding overwatch!
+        const uint32_t objKey = 0x20000u | 2u;
+        // Bot 1 (squad 0, slot 0 on team 2) at 22m from Hotel; Bot 3 (squad 0, slot 1) trailing at 45m.
+        coop.updateSquadMember(2, 1u, Vec3(-194.4f, 158.0f, -10.6f), true, true,  objKey, false, tNow);
+        coop.updateSquadMember(2, 3u, Vec3(-194.4f, 158.0f, -33.6f), true, true,  objKey, false, tNow);
+
+        uint32_t sqFire = 0u;
+        bool sqCap = false, sqWait = false, adv0 = false, adv1 = false;
+        coop.querySquadCohesion(2, 1u, Vec3(-194.4f, 158.0f, -10.6f), objKey, hotelPos, tNow,
+                                sqFire, sqCap, sqWait, adv0);
+        bool dummyCap = false, dummyWait = false;
+        coop.querySquadCohesion(2, 3u, Vec3(-194.4f, 158.0f, -33.6f), objKey, hotelPos, tNow,
+                                sqFire, dummyCap, dummyWait, adv1);
+        checkCond(sqFire == 2u && !sqCap && sqWait && (adv0 != adv1),
+                  "coop AI: pointman rally-waits for trailing squadmate & alternates bounding overwatch");
+
+        // Squadmate breaches inside cap radius -> sqCap becomes true and rally-wait ends immediately!
+        coop.updateSquadMember(2, 3u, Vec3(-194.4f, 158.0f, 6.0f), true, false, objKey, true, tNow);
+        coop.querySquadCohesion(2, 1u, Vec3(-194.4f, 158.0f, -10.6f), objKey, hotelPos, tNow,
+                                sqFire, sqCap, sqWait, adv0);
+        checkCond(sqCap && !sqWait,
+                  "coop AI: isSquadTakingFlag cancels staging wait so whole squad breaches cap zone");
+
+        // Friendly line-of-fire safety (m_friendsInLineOfFireTime) + Coop prone drop under fire:
+        AimConfig ffCfg;
+        ffCfg.skill = 0.9f;
+        BotBrain ffBot(0u, 1105u, nullptr, nullptr, ffCfg);
+        ffBot.setTeam(1);
+
+        std::map<uint16_t, TrackedSoldier> soldiers;
+        TrackedSoldier& mate = soldiers[10];
+        mate.netId = 10; mate.team = 1; mate.hasPos = true; mate.pos = Vec3(0.0f, 0.0f, 10.0f);
+        TrackedSoldier& foe = soldiers[20];
+        foe.netId = 20; foe.team = 2; foe.hasPos = true; foe.pos = Vec3(0.0f, 0.0f, 28.0f);
+
+        BotWorldView fw;
+        fw.ownTeam = 1; fw.ownAlive = true; fw.hasOwnPos = true; fw.ownSoldierNetId = 1;
+        fw.ownPos = Vec3(0.0f, 0.0f, 0.0f);
+        fw.ownFacingDegrees = 0.0f;
+        fw.ownHitPointsByte = 255u;
+        fw.soldiers = &soldiers;
+        ffBot.onSpawned(fw.ownPos, tNow);
+
+        bool shotThroughFriend = false;
+        bool sidesteppedFriend = false;
+        for (int tick = 0; tick < 60; ++tick)
+        {
+            const uint64_t now = tNow + static_cast<uint64_t>(tick) * 33333ULL;
+            foe.pushPos(now, foe.pos);
+            BotTickOutput out;
+            ffBot.tick(now, 1.0f / 30.0f, fw, out);
+            fw.ownFacingDegrees += out.action.axes[4] * 5.0f;
+            fw.ownPitchDegrees += out.action.axes[5] * 5.0f;
+            if ((out.action.buttonMaskLow & BTN_FIRE) != 0u) shotThroughFriend = true;
+            if (std::fabs(out.action.axes[0]) > 0.5f) sidesteppedFriend = true;
+        }
+        checkCond(!shotThroughFriend && sidesteppedFriend,
+                  "coop AI: holds fire and sidesteps when a friendly blocks the line of fire");
+
+        // Friendly steps clear + bot takes damage at 28m -> bot drops prone (BTN_PRONE) & returns fire!
+        mate.pos = Vec3(8.0f, 0.0f, 10.0f);
+        fw.ownHitPointsByte = 150u;
+        bool firedAfterClear = false;
+        bool droppedProne = false;
+        for (int tick = 0; tick < 60; ++tick)
+        {
+            const uint64_t now = tNow + static_cast<uint64_t>(60 + tick) * 33333ULL;
+            foe.pushPos(now, foe.pos);
+            BotTickOutput out;
+            ffBot.tick(now, 1.0f / 30.0f, fw, out);
+            fw.ownFacingDegrees += out.action.axes[4] * 5.0f;
+            fw.ownPitchDegrees += out.action.axes[5] * 5.0f;
+            if ((out.action.buttonMaskLow & BTN_PRONE) != 0u)
+            {
+                droppedProne = true;
+                fw.ownPose = 2u;
+            }
+            if ((out.action.buttonMaskLow & BTN_FIRE) != 0u) firedAfterClear = true;
+        }
+        checkCond(droppedProne && firedAfterClear,
+                  "coop AI: drops prone under medium-range fire and opens fire once teammate clears");
+    }
 }
 
 } // anonymous namespace

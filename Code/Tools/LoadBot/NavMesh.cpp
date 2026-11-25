@@ -1314,6 +1314,176 @@ bool NavMesh::findFlankWaypoint(float startX, float startY, float startZ,
     return false;
 }
 
+bool NavMesh::findWallHuggingPoint(float centerX, float centerY, float centerZ,
+                                   float minRadius, float maxRadius,
+                                   float threatX, float threatZ,
+                                   uint32_t seed,
+                                   NavPoint& outPt) const {
+    if (!m_loaded) {
+        return false;
+    }
+
+    float refY = centerY;
+    const uint32_t centerPoly = findNearestPolygon(centerX, centerY, centerZ, 35.0f);
+    if (centerPoly != INVALID_POLYGON) {
+        refY = m_polygons[centerPoly].centroid.y;
+    }
+
+    const float tdx = threatX - centerX;
+    const float tdz = threatZ - centerZ;
+    const float tLen = std::sqrt(tdx * tdx + tdz * tdz);
+    const bool hasThreat = (tLen > 2.0f);
+    const float tDirX = hasThreat ? (tdx / tLen) : 0.0f;
+    const float tDirZ = hasThreat ? (tdz / tLen) : -1.0f;
+
+    static const float kPi = 3.14159265358979323846f;
+    const float phaseOff = static_cast<float>((seed * 2654435761u) & 0xFFFFu) / 65536.0f * (2.0f * kPi);
+    const float radii[2] = {
+        minRadius + (maxRadius - minRadius) * 0.72f,
+        minRadius + (maxRadius - minRadius) * 0.35f
+    };
+
+    bool found = false;
+    float bestScore = -1e9f;
+    NavPoint best = { centerX, refY, centerZ };
+
+    for (int rIdx = 0; rIdx < 2; ++rIdx) {
+        const float rad = radii[rIdx];
+        for (int a = 0; a < 12; ++a) {
+            const float ang = phaseOff + (static_cast<float>(a) / 12.0f) * (2.0f * kPi);
+            const float cx = centerX + std::sin(ang) * rad;
+            const float cz = centerZ + std::cos(ang) * rad;
+            const uint32_t poly = findPolygonExact(cx, refY, cz);
+            if (poly == INVALID_POLYGON) {
+                continue;
+            }
+            const float cy = getPolygonHeight(poly, cx, cz);
+
+            float score = 0.0f;
+
+            // Check 8 directions at 1.9m for an adjacent wall/building edge (RandomizeCoverPosAlongEdge).
+            bool nearWall = false;
+            for (int p = 0; p < 8; ++p) {
+                const float pang = static_cast<float>(p) * (kPi * 0.25f);
+                if (findPolygonExact(cx + std::sin(pang) * 1.9f, cy, cz + std::cos(pang) * 1.9f) == INVALID_POLYGON) {
+                    nearWall = true;
+                    break;
+                }
+            }
+            if (nearWall) {
+                score += 8.0f;
+            }
+
+            if (hasThreat) {
+                // Strong preference for walls that sit between us and the enemy approach!
+                if (findPolygonExact(cx + tDirX * 2.2f, cy, cz + tDirZ * 2.2f) == INVALID_POLYGON) {
+                    score += 7.0f;
+                }
+                if (!raycastLineOfSight(cx, cy, cz, threatX, refY, threatZ)) {
+                    score += 6.0f;
+                }
+            }
+
+            // Deterministic per-bot angular spread so squadmates pick distinct cover spots around the flag.
+            const float slotPref = std::cos(ang - phaseOff);
+            score += slotPref * 3.5f;
+
+            if (score > bestScore) {
+                bestScore = score;
+                best.x = cx;
+                best.y = cy;
+                best.z = cz;
+                found = true;
+            }
+        }
+    }
+
+    if (found) {
+        outPt = best;
+    }
+    return found;
+}
+
+bool NavMesh::findAttackStagingCover(float ownX, float ownY, float ownZ,
+                                     float flagX, float flagY, float flagZ,
+                                     float minDistToFlag, float maxDistToFlag,
+                                     uint32_t seed,
+                                     NavPoint& outCover) const {
+    if (!m_loaded) {
+        return false;
+    }
+
+    const float dx = ownX - flagX;
+    const float dz = ownZ - flagZ;
+    const float d = std::sqrt(dx * dx + dz * dz);
+    if (d < minDistToFlag + 2.0f) {
+        return false; // Already closer than staging ring!
+    }
+
+    float refY = flagY;
+    const uint32_t flagPoly = findNearestPolygon(flagX, flagY, flagZ, 35.0f);
+    if (flagPoly != INVALID_POLYGON) {
+        refY = m_polygons[flagPoly].centroid.y;
+    }
+
+    const float baseAng = std::atan2(dx, dz); // from flag toward approaching bot
+    const float slotJitter = (static_cast<float>((seed * 1597334677u) & 0xFFu) / 255.0f - 0.5f) * 0.55f;
+    static const float kOffsets[9] = { 0.0f, 0.28f, -0.28f, 0.55f, -0.55f, 0.82f, -0.82f, 1.05f, -1.05f };
+    const float dists[2] = {
+        minDistToFlag + (maxDistToFlag - minDistToFlag) * 0.45f,
+        minDistToFlag + (maxDistToFlag - minDistToFlag) * 0.85f
+    };
+
+    bool found = false;
+    float bestScore = -1e9f;
+    NavPoint best = { ownX, ownY, ownZ };
+
+    for (int di = 0; di < 2; ++di) {
+        const float rad = dists[di];
+        for (int oi = 0; oi < 9; ++oi) {
+            const float ang = baseAng + slotJitter + kOffsets[oi];
+            const float cx = flagX + std::sin(ang) * rad;
+            const float cz = flagZ + std::cos(ang) * rad;
+            const uint32_t poly = findPolygonExact(cx, refY, cz);
+            if (poly == INVALID_POLYGON) {
+                continue;
+            }
+            const float cy = getPolygonHeight(poly, cx, cz);
+
+            const float toFlagX = (flagX - cx) / rad;
+            const float toFlagZ = (flagZ - cz) / rad;
+            const float rightX = -toFlagZ;
+            const float rightZ = toFlagX;
+
+            float score = -std::fabs(kOffsets[oi]) * 2.5f;
+            // Prefer staging spots next to a building corner or wall facing the flag!
+            if (findPolygonExact(cx + toFlagX * 2.4f, cy, cz + toFlagZ * 2.4f) == INVALID_POLYGON) {
+                score += 10.0f;
+            }
+            if (findPolygonExact(cx + rightX * 2.2f, cy, cz + rightZ * 2.2f) == INVALID_POLYGON ||
+                findPolygonExact(cx - rightX * 2.2f, cy, cz - rightZ * 2.2f) == INVALID_POLYGON) {
+                score += 6.5f;
+            }
+            if (!raycastLineOfSight(cx, cy, cz, flagX, refY, flagZ)) {
+                score += 4.5f;
+            }
+
+            if (score > bestScore) {
+                bestScore = score;
+                best.x = cx;
+                best.y = cy;
+                best.z = cz;
+                found = true;
+            }
+        }
+    }
+
+    if (found) {
+        outCover = best;
+    }
+    return found;
+}
+
 bool NavMesh::isWalkablePolygon(uint32_t polyIdx) const {
     if (polyIdx >= m_polygons.size()) {
         return false;

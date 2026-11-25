@@ -115,6 +115,13 @@ BotBrain::BotBrain(uint32_t botIndex, uint32_t seed,
       m_defendHoldUntilUs(0),
       m_hasDefendWatchPoint(false),
       m_defendWatchPoint(),
+      m_isStagingAssault(false),
+      m_stagingCoverPos(),
+      m_stagingHoldUntilUs(0),
+      m_lastStagedObjKey(0u),
+      m_hasCapCoverPos(false),
+      m_capCoverPos(),
+      m_capCoverRefreshUs(0),
       m_lastOwnPosForDeath(),
       m_hasLastOwnPosForDeath(false),
       m_waypoints(),
@@ -204,6 +211,11 @@ void BotBrain::reset() {
     m_hasDefendPost = false;
     m_defendHoldUntilUs = 0;
     m_hasDefendWatchPoint = false;
+    m_isStagingAssault = false;
+    m_stagingHoldUntilUs = 0;
+    m_lastStagedObjKey = 0u;
+    m_hasCapCoverPos = false;
+    m_capCoverRefreshUs = 0;
     m_hasLastOwnPosForDeath = false;
 
     if (m_teamTactics) {
@@ -283,6 +295,11 @@ void BotBrain::onSpawned(const Vec3& spawnPos, uint64_t nowUs) {
     m_hasDefendPost = false;
     m_defendHoldUntilUs = 0;
     m_hasDefendWatchPoint = false;
+    m_isStagingAssault = false;
+    m_stagingHoldUntilUs = 0;
+    m_lastStagedObjKey = 0u;
+    m_hasCapCoverPos = false;
+    m_capCoverRefreshUs = 0;
 
     m_waypoints.clear();
     m_waypointIdx = 0;
@@ -320,6 +337,11 @@ void BotBrain::onDied(uint64_t nowUs) {
     m_hasDefendPost = false;
     m_defendHoldUntilUs = 0;
     m_hasDefendWatchPoint = false;
+    m_isStagingAssault = false;
+    m_stagingHoldUntilUs = 0;
+    m_lastStagedObjKey = 0u;
+    m_hasCapCoverPos = false;
+    m_capCoverRefreshUs = 0;
     m_underFireUntilUs = 0;
     m_waypoints.clear();
     m_waypointIdx = 0;
@@ -676,6 +698,70 @@ bool BotBrain::hasClearLineOfSight(const BotWorldView& world, const Vec3& target
     return true;
 }
 
+bool BotBrain::hasFriendInLineOfFire(const BotWorldView& world, const Vec3& targetPos) const {
+    if (!world.soldiers || !world.hasOwnPos) {
+        return false;
+    }
+    const float dx = targetPos.x - world.ownPos.x;
+    const float dz = targetPos.z - world.ownPos.z;
+    const float dist = std::sqrt(dx * dx + dz * dz);
+    if (dist < 1.5f) {
+        return false;
+    }
+    const float dirX = dx / dist;
+    const float dirZ = dz / dist;
+    const float ownEyeY = world.ownPos.y + (world.ownPose == 2u ? 0.42f : (world.ownPose == 1u ? 1.10f : 1.55f));
+    const float tgtBodyY = targetPos.y + 1.25f;
+
+    for (std::map<uint16_t, TrackedSoldier>::const_iterator it = world.soldiers->begin();
+         it != world.soldiers->end(); ++it) {
+        const TrackedSoldier& f = it->second;
+        if (f.netId == world.ownSoldierNetId || f.team != world.ownTeam) {
+            continue;
+        }
+        if (!f.hasPos || f.isRagdoll || f.hitPointsByte == 0u) {
+            continue;
+        }
+        const float fx = f.pos.x - world.ownPos.x;
+        const float fz = f.pos.z - world.ownPos.z;
+        const float proj = fx * dirX + fz * dirZ;
+        if (proj < 0.55f || proj > dist - 0.55f) {
+            continue;
+        }
+        const float perp = std::fabs(fx * dirZ - fz * dirX);
+        const float halfCorridor = 0.85f + proj * 0.035f;
+        if (perp > halfCorridor) {
+            continue;
+        }
+        const float rayY = ownEyeY + (tgtBodyY - ownEyeY) * (proj / dist);
+        const float friendTopY = f.pos.y + (f.pose == 2u ? 0.65f : (f.pose == 1u ? 1.35f : 1.85f));
+        if (rayY >= f.pos.y - 0.25f && rayY <= friendTopY) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool BotBrain::hasFriendNearBlast(const BotWorldView& world, const Vec3& blastPos, float radius) const {
+    if (!world.soldiers) {
+        return false;
+    }
+    const float rSq = radius * radius;
+    for (std::map<uint16_t, TrackedSoldier>::const_iterator it = world.soldiers->begin();
+         it != world.soldiers->end(); ++it) {
+        const TrackedSoldier& f = it->second;
+        if (f.team != world.ownTeam || !f.hasPos || f.isRagdoll || f.hitPointsByte == 0u) {
+            continue;
+        }
+        const float dx = f.pos.x - blastPos.x;
+        const float dz = f.pos.z - blastPos.z;
+        if (dx * dx + dz * dz <= rSq) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool BotBrain::resolveActiveFrontlineStage(
     const std::map<uint16_t, TrackedControlPoint>* controlPoints,
     const std::map<uint8_t, TrackedSpawnGroup>* spawnGroups,
@@ -887,11 +973,19 @@ bool BotBrain::pickObjectiveGoal(uint64_t nowUs, const BotWorldView& world, Vec3
         }
 
         if (isAttacker || flStage.isNeutral || flStage.ownerTeam != m_team) {
-            // Attackers push straight into capture zone; defenders rush back onto flag if neutralized.
+            // Attackers push into wall-hugging cover inside the capture zone; defenders rush back if neutralized.
             m_activeObjectiveFriendly = false;
             m_hasDefendPost = false;
             m_hasDefendWatchPoint = false;
-            pickWalkablePerimeterPoint(flStage.pos, 2.0f, 7.5f, 0.0f, 0.0f, kPi, outGoal);
+            NavPoint wallCap;
+            if (m_navMesh && m_navMesh->isLoaded() &&
+                m_navMesh->findWallHuggingPoint(flStage.pos.x, flStage.pos.y, flStage.pos.z,
+                                                2.2f, 8.0f, flStage.pos.x, flStage.pos.z + 40.0f,
+                                                m_botIndex + 1u, wallCap)) {
+                outGoal = Vec3(wallCap.x, wallCap.y, wallCap.z);
+            } else {
+                pickWalkablePerimeterPoint(flStage.pos, 2.0f, 7.5f, 0.0f, 0.0f, kPi, outGoal);
+            }
             return true;
         }
 
@@ -1215,25 +1309,52 @@ void BotBrain::updateNavigation(uint64_t nowUs, const BotWorldView& world,
         }
     }
 
-    // Check if we are actively capturing an enemy/neutral flag: stay inside capture radius!
+    // Check if we are actively assaulting or capturing an enemy/neutral flag (BF2 Coop two-stage
+    // flag assault: AttackStagingCover + SquadRallyWait -> Breach -> Wall-Hugging Flag Cap!).
     if (!inCombat && m_hasActiveObjective && !m_activeObjectiveFriendly &&
         !m_aim.hasGoal && !m_aim.keepRunning) {
         bool nowFriendly = false;
         const bool stillExists = isObjectiveStillActive(world, m_activeObjectiveKey, nowFriendly);
+        const float distToObj = distXZ(world.ownPos, m_activeObjectivePos);
+
         if (!stillExists || nowFriendly) {
             // Flag captured! Move on to the next frontline objective immediately.
             m_hasActiveObjective = false;
             m_objectiveHoldStartUs = 0;
+            m_isStagingAssault = false;
+            m_stagingHoldUntilUs = 0;
+            m_hasCapCoverPos = false;
             m_nextPathComputeUs = nowUs;
             m_hasPatrolGoal = false;
-        } else if (distXZ(world.ownPos, m_activeObjectivePos) < 11.0f) {
+        } else if (distToObj < 11.0f) {
+            m_isStagingAssault = false;
+            m_stagingHoldUntilUs = 0;
             if (m_objectiveHoldStartUs == 0) {
                 m_objectiveHoldStartUs = nowUs;
             }
             // Hold the capture zone for up to 22s (timeout handles uncapturable enemy mains).
             if ((nowUs - m_objectiveHoldStartUs) < 22000000ULL) {
-                // Gently reposition inside the cap perimeter if far from flag or standing still too long.
-                if (distXZ(world.ownPos, m_activeObjectivePos) > 7.5f) {
+                if (m_navMesh && m_navMesh->isLoaded()) {
+                    // BF2 Coop CoverPositionManager::RandomizeCoverPosAlongEdge:
+                    // Hug a wall/pillar inside the capture radius instead of standing in the open!
+                    if (!m_hasCapCoverPos || nowUs >= m_capCoverRefreshUs) {
+                        NavPoint capPt;
+                        const uint32_t seed = m_botIndex * 31u + static_cast<uint32_t>((nowUs / 7000000ULL) & 0xFFu);
+                        if (m_navMesh->findWallHuggingPoint(
+                                m_activeObjectivePos.x, m_activeObjectivePos.y, m_activeObjectivePos.z,
+                                2.0f, 8.2f,
+                                m_activeObjectivePos.x, m_activeObjectivePos.z + 45.0f,
+                                seed, capPt)) {
+                            m_capCoverPos = Vec3(capPt.x, capPt.y, capPt.z);
+                            m_hasCapCoverPos = true;
+                            m_capCoverRefreshUs = nowUs + static_cast<uint64_t>(randInt(6500, 9500)) * 1000ULL;
+                        }
+                    }
+                    if (m_hasCapCoverPos && distXZ(world.ownPos, m_capCoverPos) > 1.8f) {
+                        outMoveTarget = m_capCoverPos;
+                        outHasMoveTarget = true;
+                    }
+                } else if (distToObj > 7.5f) {
                     outMoveTarget = m_activeObjectivePos;
                     outHasMoveTarget = true;
                 }
@@ -1244,7 +1365,84 @@ void BotBrain::updateNavigation(uint64_t nowUs, const BotWorldView& world,
                 m_blacklistUntilUs = nowUs + 25000000ULL;
                 m_hasActiveObjective = false;
                 m_objectiveHoldStartUs = 0;
+                m_hasCapCoverPos = false;
                 m_nextPathComputeUs = nowUs;
+            }
+        } else if (m_navMesh && m_navMesh->isLoaded() && distToObj >= 14.0f && distToObj <= 34.0f &&
+                   m_lastStagedObjKey != m_activeObjectiveKey) {
+            // BF2 Coop pre-breach staging (getClosestAttackCoverPosition + updateWaitForSquadMembers):
+            // Stage briefly behind a corner 15..26m out when defenders are present or squadmates are
+            // rallying behind us, unless a squadmate is already inside the cap radius (isSquadTakingFlag)!
+            uint32_t squadFiring = 0u;
+            bool squadTakingFlag = false;
+            bool shouldRallyWait = false;
+            bool maneuverAdv = false;
+            if (m_teamTactics) {
+                m_teamTactics->querySquadCohesion(m_team, m_botIndex, world.ownPos,
+                                                  m_activeObjectiveKey, m_activeObjectivePos, nowUs,
+                                                  squadFiring, squadTakingFlag, shouldRallyWait, maneuverAdv);
+            }
+
+            int32_t defendersNear = 0;
+            if (world.soldiers) {
+                for (std::map<uint16_t, TrackedSoldier>::const_iterator sit = world.soldiers->begin();
+                     sit != world.soldiers->end(); ++sit) {
+                    const TrackedSoldier& s = sit->second;
+                    if (!s.hasPos || s.isRagdoll || s.hitPointsByte == 0u) continue;
+                    if (s.team == 0 || s.team == m_team) continue;
+                    if (distXZ(m_activeObjectivePos, s.pos) < 28.0f) {
+                        ++defendersNear;
+                    }
+                }
+            }
+            if (defendersNear == 0 && m_teamTactics) {
+                defendersNear = static_cast<int32_t>(
+                    m_teamTactics->countSpottedNear(m_team, m_activeObjectivePos, 28.0f, nowUs) +
+                    m_teamTactics->dangerHeatNear(m_team, m_activeObjectivePos, 24.0f, nowUs));
+            }
+
+            if (squadTakingFlag) {
+                // Squadmate is already capping -> commit immediately to breach!
+                m_isStagingAssault = false;
+                m_stagingHoldUntilUs = 0;
+                m_lastStagedObjKey = m_activeObjectiveKey;
+            } else if (defendersNear > 0 || shouldRallyWait) {
+                if (!m_isStagingAssault) {
+                    NavPoint stageCov;
+                    if (m_navMesh->findAttackStagingCover(
+                            world.ownPos.x, world.ownPos.y, world.ownPos.z,
+                            m_activeObjectivePos.x, m_activeObjectivePos.y, m_activeObjectivePos.z,
+                            15.0f, 26.0f, m_botIndex + 1u, stageCov)) {
+                        m_stagingCoverPos = Vec3(stageCov.x, stageCov.y, stageCov.z);
+                        m_isStagingAssault = true;
+                        m_stagingHoldUntilUs = 0;
+                    } else {
+                        m_lastStagedObjKey = m_activeObjectiveKey;
+                    }
+                }
+                if (m_isStagingAssault) {
+                    if (distXZ(world.ownPos, m_stagingCoverPos) > 2.6f) {
+                        outMoveTarget = m_stagingCoverPos;
+                        outHasMoveTarget = true;
+                        return;
+                    }
+                    if (m_stagingHoldUntilUs == 0) {
+                        m_stagingHoldUntilUs = nowUs + static_cast<uint64_t>(randInt(1800, 3100)) * 1000ULL;
+                    }
+                    if (nowUs < m_stagingHoldUntilUs) {
+                        // Hold staging corner crouched, scanning the flag defenders & letting squad rally!
+                        m_defendWatchPoint = m_activeObjectivePos;
+                        m_hasDefendWatchPoint = true;
+                        return;
+                    }
+                    // Staging complete -> breach the flag together!
+                    m_isStagingAssault = false;
+                    m_stagingHoldUntilUs = 0;
+                    m_lastStagedObjKey = m_activeObjectiveKey;
+                    m_waypoints.clear();
+                    m_waypointIdx = 0;
+                    m_nextPathComputeUs = nowUs;
+                }
             }
         }
     }
@@ -1306,8 +1504,9 @@ void BotBrain::updateNavigation(uint64_t nowUs, const BotWorldView& world,
                 hasGoal = pickRandomWalkableNavPoint(goal);
             }
             if (hasGoal) {
-                // Flankers (and squads approaching hot killzones) insert a lateral flanking waypoint.
+                // DICE Coop StrategicAreas.ai multi-lane squad corridors + flankers:
                 const uint32_t divSeed = (m_botIndex + 1u) * 17u;
+                const uint32_t squadId = TeamTactics::squadForBot(m_botIndex);
                 std::vector<NavPoint> newPath;
                 bool usedFlank = false;
 
@@ -1317,7 +1516,48 @@ void BotBrain::updateNavigation(uint64_t nowUs, const BotWorldView& world,
                         Vec3(0.5f * (world.ownPos.x + goal.x), world.ownPos.y, 0.5f * (world.ownPos.z + goal.z)),
                         28.0f, nowUs) >= 2u);
 
-                if ((m_role == ROLE_FLANKER || hotZone) && distGoal > 38.0f && !m_aim.hasGoal) {
+                // 1) Try authentic DICE Coop StrategicAreas.ai multi-street waypoints (e.g. USBASE_LEFTFLANK /
+                // USBASE_RIGHTFLANK -> Hotel, or 4-lane Hotel -> Square) with SquadFormation line spread!
+                std::vector<Vec3> coopWps;
+                if (!m_aim.hasGoal && m_teamTactics &&
+                    m_teamTactics->selectKarkandCoopWaypoints(m_team, squadId, world.ownPos, goal, nowUs, coopWps)) {
+                    static const float kSlotSpread[4] = { -3.2f, -1.1f, 1.1f, 3.2f };
+                    const float latOff = kSlotSpread[TeamTactics::slotInSquadForBot(m_botIndex) & 3u];
+                    const float dirLen = (distGoal > 1.0f) ? distGoal : 1.0f;
+                    const float perpX = -(goal.z - world.ownPos.z) / dirLen;
+                    const float perpZ =  (goal.x - world.ownPos.x) / dirLen;
+
+                    Vec3 curStart = world.ownPos;
+                    std::vector<NavPoint> chain;
+                    bool chainOk = true;
+                    for (size_t w = 0; w <= coopWps.size(); ++w) {
+                        Vec3 targetPt = (w < coopWps.size()) ? coopWps[w] : goal;
+                        if (w < coopWps.size()) {
+                            const float sx = targetPt.x + perpX * latOff;
+                            const float sz = targetPt.z + perpZ * latOff;
+                            if (m_navMesh->isPointWalkable(sx, targetPt.y, sz)) {
+                                targetPt.x = sx;
+                                targetPt.z = sz;
+                            }
+                        }
+                        std::vector<NavPoint> leg;
+                        if (!m_navMesh->findSmoothedPath(curStart.x, curStart.y, curStart.z,
+                                                         targetPt.x, targetPt.y, targetPt.z,
+                                                         leg, divSeed) || leg.empty()) {
+                            chainOk = false;
+                            break;
+                        }
+                        chain.insert(chain.end(), leg.begin(), leg.end());
+                        curStart = targetPt;
+                    }
+                    if (chainOk && !chain.empty()) {
+                        newPath.swap(chain);
+                        usedFlank = true;
+                    }
+                }
+
+                // 2) Generic dynamic lateral flank when not on a named Coop corridor:
+                if (!usedFlank && (m_role == ROLE_FLANKER || hotZone) && distGoal > 38.0f && !m_aim.hasGoal) {
                     NavPoint flankPt;
                     const float side = TeamTactics::flankSideForBot(m_botIndex);
                     const float off = randFloat(20.0f, 34.0f);
@@ -1364,7 +1604,12 @@ void BotBrain::updateNavigation(uint64_t nowUs, const BotWorldView& world,
             const NavPoint& wp = m_waypoints[m_waypointIdx];
             outMoveTarget = Vec3(wp.x, wp.y, wp.z);
             outHasMoveTarget = true;
-            if (!inCombat) {
+            // BF2 Coop m_slowDownToTarget: drop out of sprint within 24m of a hostile/contested
+            // flag so the rifle is shouldered and ready to fire around the final corner!
+            const bool approachingHostileFlag = m_hasActiveObjective && !m_activeObjectiveFriendly &&
+                                                !m_aim.keepRunning &&
+                                                distXZ(world.ownPos, m_activeObjectivePos) < 24.0f;
+            if (!inCombat && !approachingHostileFlag) {
                 outNavButtons |= BTN_SPRINT;
             }
             return;
@@ -1854,7 +2099,9 @@ bool BotBrain::tryStartUtilityAction(uint64_t nowUs, const BotWorldView& world,
             }
         }
 
-        if (shouldThrow && hasClearLineOfSight(world, nadeTarget, 0u)) {
+        if (shouldThrow && hasClearLineOfSight(world, nadeTarget, 0u) &&
+            !hasFriendNearBlast(world, nadeTarget, 6.5f) &&
+            !hasFriendInLineOfFire(world, nadeTarget)) {
             m_nextGrenadeUs = nowUs + static_cast<uint64_t>(randInt(24000, 38000)) * 1000ULL;
             startUtility(UTIL_GRENADE, nowUs, nadeTarget, 0u);
             return true;
@@ -2044,9 +2291,10 @@ bool BotBrain::tickUtilityAction(uint64_t nowUs, float dtSec, const BotWorldView
                         act.axes[4], act.axes[5]);
 
             const float off = std::fabs(wrapAngleDeg(dyaw - aimYaw));
-            // Semi-auto rapid trigger pulses for BF2 pistols!
+            // Semi-auto rapid trigger pulses for BF2 pistols (holding fire if teammate crosses muzzle)!
             const bool firePulse = ((phaseElapsed / 110000ULL) % 2ULL == 0ULL);
-            if (off < 12.0f && firePulse) {
+            const bool friendBlocked = hasFriendInLineOfFire(world, targetRendered);
+            if (off < 12.0f && firePulse && !friendBlocked) {
                 act.buttonMaskLow |= BTN_FIRE;
             } else {
                 act.axes[0] = m_strafeRight ? 0.85f : -0.85f;
@@ -2187,6 +2435,8 @@ void BotBrain::tickCombatHuman(uint64_t nowUs, float dtSec, const BotWorldView& 
     const bool reacted = (nowUs >= m_targetAcquiredUs + m_reactionDelayUs);
     const bool reloading = (nowUs < m_reloadUntilUs);
     const bool jumpLocked = (m_lastJumpUs != 0 && (nowUs - m_lastJumpUs) < 1050000ULL);
+    // BF2 Coop BotMain::m_friendsInLineOfFireTime: hold trigger if a teammate crosses our barrel!
+    const bool friendInLoF = hasFriendInLineOfFire(world, rendered);
 
     // Smart ADS zoom management (BF2 PIAltFire is a toggle!).
     if (!m_aim.keepRunning && nowUs >= m_zoomToggleCooldownUs) {
@@ -2203,7 +2453,8 @@ void BotBrain::tickCombatHuman(uint64_t nowUs, float dtSec, const BotWorldView& 
 
     // Fire state machine: tight range- and weapon-adapted bursts with deviation-recovery pauses.
     if (m_fireState == FIRE_WAIT) {
-        if (reacted && !reloading && !jumpLocked && !world.ownWeaponStowed && offTarget < fireTolerance) {
+        if (reacted && !reloading && !jumpLocked && !friendInLoF &&
+            !world.ownWeaponStowed && offTarget < fireTolerance) {
             m_fireState = FIRE_BURST;
             if (longRange) {
                 m_burstShots = (kit == 3) ? randInt(2, 3) : 1;
@@ -2223,14 +2474,20 @@ void BotBrain::tickCombatHuman(uint64_t nowUs, float dtSec, const BotWorldView& 
     }
 
     if (m_fireState == FIRE_BURST) {
-        act.buttonMaskLow |= BTN_FIRE;
-        if (nowUs >= m_fireStateEndUs) {
+        if (friendInLoF) {
+            // Immediately lift finger off trigger when a friendly crosses our muzzle!
             m_fireState = FIRE_PAUSE;
-            const float pauseMs = closeRange
-                ? randFloat(130.0f, 220.0f)
-                : (longRange ? randFloat(240.0f, 380.0f) : randFloat(190.0f, 320.0f));
-            m_fireStateEndUs = nowUs + static_cast<uint64_t>(pauseMs * 1000.0f);
-            m_strafeRight = !m_strafeRight;
+            m_fireStateEndUs = nowUs + 180000ULL;
+        } else {
+            act.buttonMaskLow |= BTN_FIRE;
+            if (nowUs >= m_fireStateEndUs) {
+                m_fireState = FIRE_PAUSE;
+                const float pauseMs = closeRange
+                    ? randFloat(130.0f, 220.0f)
+                    : (longRange ? randFloat(240.0f, 380.0f) : randFloat(190.0f, 320.0f));
+                m_fireStateEndUs = nowUs + static_cast<uint64_t>(pauseMs * 1000.0f);
+                m_strafeRight = !m_strafeRight;
+            }
         }
     } else if (m_fireState == FIRE_PAUSE) {
         if (nowUs >= m_fireStateEndUs) {
@@ -2251,11 +2508,21 @@ void BotBrain::tickCombatHuman(uint64_t nowUs, float dtSec, const BotWorldView& 
         }
     }
 
-    // Tactical combat movement & cover (counter-strafe during pauses/reloads, hold still during bursts
-    // so BF2's SoldierDeviationComp speed deviation decays to zero for razor-sharp shots).
+    // Tactical combat movement & cover (counter-strafe, Coop squad bounding overwatch, and
+    // lateral step-out when a teammate blocks our line of fire; always hold still while firing).
     const bool firingNow = ((act.buttonMaskLow & BTN_FIRE) != 0u);
     const bool lowHp = (world.ownHitPointsByte < 100u);
     const bool outnumbered = (visibleEnemies >= 2 && world.ownHitPointsByte < 165u);
+
+    bool squadManeuverAdvance = false;
+    if (m_teamTactics && !firingNow) {
+        uint32_t sqFire = 0u;
+        bool sqCap = false, sqWait = false;
+        m_teamTactics->querySquadCohesion(m_team, m_botIndex, world.ownPos,
+                                          m_hasActiveObjective ? m_activeObjectiveKey : 0u,
+                                          m_activeObjectivePos, nowUs,
+                                          sqFire, sqCap, sqWait, squadManeuverAdvance);
+    }
 
     if (!firingNow && !m_aim.keepRunning) {
         // Compute a cover/evasion step when reloading, low HP, or outnumbered.
@@ -2277,6 +2544,9 @@ void BotBrain::tickCombatHuman(uint64_t nowUs, float dtSec, const BotWorldView& 
                                                  m_coverStepPos.z - world.ownPos.z) * kRadToDeg;
                 computeRelativeMove(aimYaw, moveYaw, 1.0f, act.axes[0], act.axes[3]);
             }
+        } else if (friendInLoF) {
+            // Sidestep clear of friendly soldier blocking our line of fire!
+            act.axes[0] = m_strafeRight ? 0.90f : -0.90f;
         } else if (reloading || (m_fireState == FIRE_PAUSE && m_fireStateEndUs > nowUs + 95000ULL)) {
             // Counter-strafe during the early portion of burst pauses and during reloads;
             // stop ~95ms before next burst so speed deviation decays cleanly!
@@ -2290,19 +2560,31 @@ void BotBrain::tickCombatHuman(uint64_t nowUs, float dtSec, const BotWorldView& 
             act.axes[0] = m_strafeRight ? 0.85f : -0.85f;
             if (dist < 4.5f) {
                 act.axes[3] = -0.65f; // avoid body-clipping at point-blank
-            } else if (kit == 6 && dist > 32.0f && !lowHp) {
-                act.axes[3] = 0.6f;   // AT SMG closes distance during pauses
+            } else if ((squadManeuverAdvance && dist > 15.0f && !lowHp) ||
+                       (kit == 6 && dist > 32.0f && !lowHp)) {
+                // BF2 Coop squadManeuverAlternateFire: bound forward while squadmates suppress!
+                act.axes[3] = 0.70f;
             }
         }
     }
 
-    // Stance management: crouch while firing or at medium/long range for BF2 pose spread bonus;
-    // stand while actively evading/reloading so movement speed is full.
+    // Stance management: classic BF2 Coop prone drop under medium/long-range fire or when holding
+    // a flag against >24m threats; crouch during bursts; stand up when CQB or reloading!
+    const bool holdingFlagZone = m_hasActiveObjective &&
+                                 distXZ(world.ownPos, m_activeObjectivePos) < 12.0f;
+    const bool wantCoopProne = !reloading && !closeRange && !squadManeuverAdvance &&
+                               dist >= 22.0f && world.ownPose != 2u &&
+                               (nowUs - m_lastProneToggleUs) > 3800000ULL &&
+                               ((nowUs < m_underFireUntilUs && world.ownHitPointsByte < 190u) ||
+                                (holdingFlagZone && dist >= 24.0f));
     if (world.ownPose == 2u && (closeRange || reloading) &&
         (nowUs - m_lastProneToggleUs) > 1200000ULL) {
         act.buttonMaskLow |= BTN_PRONE; // stand up from prone
         m_lastProneToggleUs = nowUs;
-    } else if (firingNow || (!reloading && !closeRange && !lowHp)) {
+    } else if (wantCoopProne) {
+        act.buttonMaskLow |= BTN_PRONE; // drop prone for minimal hitbox & deviation!
+        m_lastProneToggleUs = nowUs;
+    } else if (world.ownPose != 2u && (firingNow || (!reloading && !closeRange && !lowHp))) {
         act.buttonMaskLow |= BTN_CROUCH;
     }
 }
@@ -2705,7 +2987,8 @@ void BotBrain::tick(uint64_t nowUs, float dtSec, const BotWorldView& world, BotT
         }
 
         const bool reacted = (nowUs >= m_targetAcquiredUs + m_reactionDelayUs);
-        if (reacted && nowUs >= m_reloadUntilUs && totalErrDeg < 15.0f) {
+        const bool friendBlocked = hasFriendInLineOfFire(world, bestTarget->pos);
+        if (reacted && nowUs >= m_reloadUntilUs && totalErrDeg < 15.0f && !friendBlocked) {
             if (m_burstTicksLeft <= 0) {
                 m_burstFiring = !m_burstFiring;
                 m_burstTicksLeft = m_burstFiring ? randInt(4, 10) : randInt(3, 6);
@@ -2721,6 +3004,16 @@ void BotBrain::tick(uint64_t nowUs, float dtSec, const BotWorldView& world, BotT
                         visibleEnemies, act);
     } else {
         tickOutOfCombat(nowUs, dtSec, world, hasMoveTarget, moveTarget, navButtons, act);
+    }
+
+    if (m_teamTactics) {
+        const bool insideCap = m_hasActiveObjective && !m_activeObjectiveFriendly &&
+                               distXZ(world.ownPos, m_activeObjectivePos) < 10.5f;
+        m_teamTactics->updateSquadMember(m_team, m_botIndex, world.ownPos,
+                                         world.ownAlive && !world.ownManDown,
+                                         ((act.buttonMaskLow & BTN_FIRE) != 0u),
+                                         m_hasActiveObjective ? m_activeObjectiveKey : 0u,
+                                         insideCap, nowUs);
     }
 
     if (m_aim.keepRunning && world.ownAlive && !world.ownManDown) {

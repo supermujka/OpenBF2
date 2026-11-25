@@ -409,6 +409,8 @@ private:
                                      ActiveFrontlineStage& outStage) const;
     bool hasClearLineOfSight(const BotWorldView& world, const Vec3& targetPos,
                              uint8_t targetPose) const;
+    bool hasFriendInLineOfFire(const BotWorldView& world, const Vec3& targetPos) const;
+    bool hasFriendNearBlast(const BotWorldView& world, const Vec3& blastPos, float radius) const;
     bool pickWalkablePerimeterPoint(const Vec3& center, float minRad, float maxRad,
                                     float biasDirX, float biasDirZ, float halfArcRad,
                                     Vec3& outPos);
@@ -537,6 +539,13 @@ private:
     uint64_t m_defendHoldUntilUs;
     bool m_hasDefendWatchPoint;
     Vec3 m_defendWatchPoint;
+    bool m_isStagingAssault;
+    Vec3 m_stagingCoverPos;
+    uint64_t m_stagingHoldUntilUs;
+    uint32_t m_lastStagedObjKey;
+    bool m_hasCapCoverPos;
+    Vec3 m_capCoverPos;
+    uint64_t m_capCoverRefreshUs;
     Vec3 m_lastOwnPosForDeath;
     bool m_hasLastOwnPosForDeath;
 
