@@ -21,8 +21,9 @@ import time
 from collections import defaultdict
 
 CACHE_NAME = '.hitreg_report_cache.json'
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 BOT_PREFIX = 'LoadBot'
+BOTS_GROUP = 'BOTS (svi loadbotovi)'
 
 
 def num(x):
@@ -73,6 +74,8 @@ def summarise_file(path):
             who = g(rec, 'shooter').strip()
             if not who:
                 continue
+            if who.startswith(BOT_PREFIX):
+                who = BOTS_GROUP   # all loadbots together: one control group per match
             s = per[who]
             if ev == 'FIRE':
                 s['fire'] += 1
@@ -108,7 +111,7 @@ def summarise_file(path):
                 s['kills'] += 1
                 victim = g(rec, 'tgt').strip()
                 if victim:
-                    per[victim]['deaths'] += 1
+                    per[BOTS_GROUP if victim.startswith(BOT_PREFIX) else victim]['deaths'] += 1
 
     out = {'minutes': ((t_max or 0) - (t_min or 0)) / 60.0, 'config': config, 'format': live,
            'tick_p99_p50': pct(ticks, .5), 'tick_p99_p95': pct(ticks, .95), 'players': {}}
@@ -137,6 +140,7 @@ def main():
     ap.add_argument('--settle', type=float, default=60.0, help='skip files modified in the last N seconds')
     ap.add_argument('--out', help='also write the report as Markdown to this file')
     ap.add_argument('--no-cache', action='store_true')
+    ap.add_argument('--no-bots', action='store_true', help='hide the aggregated loadbot row')
     a = ap.parse_args()
 
     cache_path = os.path.join(a.folder, CACHE_NAME)
@@ -180,8 +184,10 @@ def main():
     w('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
     totals = defaultdict(lambda: defaultdict(float))
     for name, r in results:
-        humans = [p for p in r['players'] if not p.startswith(BOT_PREFIX)]
-        for who in (want or sorted(humans)):
+        humans = sorted(p for p in r['players'] if p != BOTS_GROUP)
+        if not a.no_bots and BOTS_GROUP in r['players']:
+            humans.append(BOTS_GROUP)
+        for who in (want or humans):
             s = r['players'].get(who)
             if not s or s['fire'] == 0:
                 continue
